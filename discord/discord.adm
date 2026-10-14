@@ -1,0 +1,3 @@
+partial module adm.notify.discord {
+	// Discord over std.net.http: REST (messages, embeds, channels, guilds, members), webhooks, application commands and interactions with Ed25519 verification, the Gateway over std.net.http.websocket with intents, sharding and resume
+}

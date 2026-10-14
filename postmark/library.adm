@@ -1,0 +1,11 @@
+// Postmark mail send and webhooks
+@manifest(version = "0.0.1")
+library adm.notify.postmark {
+	use (
+		adm.notify.postmark
+	)
+
+	export (
+		adm.notify.postmark
+	)
+}

@@ -1,0 +1,3 @@
+partial module adm.notify.telegram {
+	// Telegram Bot API over std.net.http: send messages, media and files, keyboards, updates by long polling or webhook, inline queries, payments, a local Bot API server base URL
+}

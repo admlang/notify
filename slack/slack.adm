@@ -1,0 +1,3 @@
+partial module adm.notify.slack {
+	// Slack over std.net.http: Web API methods (messages, files, users, conversations), Block Kit builders, incoming webhooks, the Events API and interactivity with request signing, slash commands, Socket Mode over std.net.http.websocket
+}

@@ -1,0 +1,11 @@
+// Discord REST, webhooks and Gateway
+@manifest(version = "0.0.1")
+library adm.notify.discord {
+	use (
+		adm.notify.discord
+	)
+
+	export (
+		adm.notify.discord
+	)
+}

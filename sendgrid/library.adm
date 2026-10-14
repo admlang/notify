@@ -1,0 +1,11 @@
+// SendGrid mail send and event webhooks
+@manifest(version = "0.0.1")
+library adm.notify.sendgrid {
+	use (
+		adm.notify.sendgrid
+	)
+
+	export (
+		adm.notify.sendgrid
+	)
+}

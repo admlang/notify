@@ -1,0 +1,11 @@
+// Telegram Bot API
+@manifest(version = "0.0.1")
+library adm.notify.telegram {
+	use (
+		adm.notify.telegram
+	)
+
+	export (
+		adm.notify.telegram
+	)
+}

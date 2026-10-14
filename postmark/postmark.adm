@@ -1,0 +1,3 @@
+partial module adm.notify.postmark {
+	// Postmark over std.net.http: send single and batch mail from std.formats.mail messages or templates, message streams, bounces and suppressions, webhooks for delivery, bounce, open and inbound
+}

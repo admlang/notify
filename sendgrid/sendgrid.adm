@@ -1,0 +1,3 @@
+partial module adm.notify.sendgrid {
+	// SendGrid over std.net.http: mail send v3 from std.formats.mail messages or templates, personalizations, attachments, categories, suppressions, event webhooks with signature verification, inbound parse
+}
