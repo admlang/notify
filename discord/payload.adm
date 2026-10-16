@@ -1,0 +1,178 @@
+partial module adm.notify.discord {
+	use (
+		std.os
+		std.formats
+		std.data.encoding::(JSON)
+	)
+
+	// The message flags a bot sets.
+	internal const flagSuppressEmbeds = 4
+	internal const flagEphemeral = 64
+	internal const flagSilent = 4096
+	internal const flagLayout = 32768
+
+	// A file a message, a webhook or an interaction answer uploads. An
+	// embed or a component shows it as `attachment://name`.
+	struct File {
+		name        string
+		data        byte[]
+		// The alt text.
+		description string
+		// "" lets the extension decide.
+		contentType string
+		// Blurred until clicked.
+		spoiler     bool
+	}
+
+	// The file at `path`, named by its last element. Fails when it cannot
+	// be read.
+	def file(path string, description string = "", spoiler bool = false) !File {
+		let data = try os.readFile(path)
+		let parts = path.split("/")
+		let name = parts[parts.len() - 1]
+		let known = formats.typeByName(name)
+		return File{name: name, data: data, description: description, contentType: known is none ?? ("", known), spoiler: spoiler}
+	}
+
+	// Whom a message may notify. `AllowedMentions{}` notifies nobody;
+	// leaving the argument out lets every mention in the text notify.
+	struct AllowedMentions {
+		// Every mentioned user, every mentioned role, and @everyone and
+		// @here.
+		users       bool     = false
+		roles       bool     = false
+		everyone    bool     = false
+		// Just these users and roles (with `users` or `roles` off).
+		userIds     string[]
+		roleIds     string[]
+		// The author of the message replied to.
+		repliedUser bool     = false
+	}
+
+	// A poll a message asks: up to ten answers, open for `hours` (at most
+	// 768).
+	struct Poll {
+		question    string
+		answers     string[]
+		hours       int      = 24
+		multiselect bool     = false
+	}
+
+	// What a message, an edit, a webhook post or an interaction answer
+	// carries; a none field is left as it was (on an edit) or out.
+	internal struct Draft {
+		content    ?string          = none
+		embeds     ?Embed[]         = none
+		components ?Component[]     = none
+		files      File[]
+		// The attachments an edit keeps, by id; none keeps them all.
+		keep       ?string[]        = none
+		mentions   ?AllowedMentions = none
+		flags      int              = 0
+		// Whether `flags` replaces the message's (an edit sends them only
+		// when asked).
+		hasFlags   bool             = false
+		extra      map<string, any>
+	}
+
+	// The JSON of `d`, with Discord's limits checked. Fails with
+	// DiscordError Invalid for a text longer than 2000 characters, more
+	// than 10 files, an embed or component limit, or content beside a
+	// component layout.
+	internal def draftBody(d Draft) !map<string, any> {
+		let body = new map<string, any>()
+		let flags = d.flags
+		let content = d.content
+		if !(content is none) {
+			fail invalid("the text is {content.len()} characters, at most 2000") when content.len() > 2000
+			body.set("content", content)
+		}
+		let embeds = d.embeds
+		if !(embeds is none) {
+			let problem = embedProblem(embeds)
+			fail invalid(problem) when problem.len() > 0
+			let list any[] = []
+			let codec = new JSON()
+			for let (_, e) in embeds {
+				list.push(try codec.parse(codec.encode(e)))
+			}
+			body.set("embeds", list)
+		}
+		let components = d.components
+		let layout = false
+		if !(components is none) {
+			let problem = componentProblem(components)
+			fail invalid(problem) when problem.len() > 0
+			body.set("components", bodiesOf(components))
+			layout = usesLayout(components)
+		}
+		if layout {
+			let text = d.content
+			let pictures = d.embeds
+			let hasText = !(text is none) && text.len() > 0
+			let hasEmbeds = !(pictures is none) && pictures.len() > 0
+			fail invalid("a message laid out with components takes no content or embeds: use text components") when hasText || hasEmbeds
+			flags = flags | flagLayout
+		}
+		body.set("flags", flags) when d.hasFlags || flags != 0
+		fail invalid("a message takes at most 10 files, not {d.files.len()}") when d.files.len() > 10
+		let keep = d.keep
+		if d.files.len() > 0 || !(keep is none) {
+			let attachments any[] = []
+			if !(keep is none) {
+				for let (_, id) in keep {
+					attachments.push(map<string, any>{"id": id})
+				}
+			}
+			for let (k, f) in d.files {
+				let entry = map<string, any>{"id": k, "filename": fileName(f)}
+				entry.set("description", f.description) when f.description.len() > 0
+				attachments.push(entry)
+			}
+			body.set("attachments", attachments)
+		}
+		let mentions = d.mentions
+		body.set("allowed_mentions", mentionsBody(mentions)) unless mentions is none
+		for let (key, value) in d.extra {
+			body.set(key, value)
+		}
+		return body
+	}
+
+	// The name a file is uploaded under: `SPOILER_` before a spoiler's.
+	internal def fileName(f File) string {
+		return f.spoiler && !f.name.startsWith("SPOILER_") ?? ("SPOILER_" + f.name, f.name)
+	}
+
+	// The files of `d` as uploaded, spoilers renamed.
+	internal def uploads(files File[]) File[] {
+		let out File[] = []
+		for let (_, f) in files {
+			out.push(File{name: fileName(f), data: f.data, description: f.description, contentType: f.contentType})
+		}
+		return out
+	}
+
+	internal def mentionsBody(m AllowedMentions) map<string, any> {
+		let parse any[] = []
+		parse.push("users") when m.users
+		parse.push("roles") when m.roles
+		parse.push("everyone") when m.everyone
+		let out = map<string, any>{"parse": parse}
+		out.set("users", texts(m.userIds)) when m.userIds.len() > 0 && !m.users
+		out.set("roles", texts(m.roleIds)) when m.roleIds.len() > 0 && !m.roles
+		out.set("replied_user", m.repliedUser)
+		return out
+	}
+
+	internal def pollBody(p Poll) !map<string, any> {
+		fail invalid("a poll offers 1 to 10 answers, not {p.answers.len()}") when p.answers.len() == 0 || p.answers.len() > 10
+		fail invalid("a poll's question is longer than 300 characters") when p.question.len() > 300
+		let answers any[] = []
+		for let (_, a) in p.answers {
+			fail invalid("a poll answer is longer than 55 characters") when a.len() > 55
+			answers.push(map<string, any>{"poll_media": map<string, any>{"text": a}})
+		}
+		return map<string, any>{"question": map<string, any>{"text": p.question}, "answers": answers, "duration": p.hours, "allow_multiselect": p.multiselect}
+	}
+}

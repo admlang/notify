@@ -1,0 +1,207 @@
+partial module adm.notify.discord {
+	use (
+		std.net.http
+		std.data.encoding::(json)
+	)
+
+	// A channel's webhook: anything that holds its address may post
+	// through it, with no bot. `discord.webhook(address)` makes one from the
+	// address Discord shows; `Client.createWebhook` and `Client.webhooks`
+	// return them with their name and channel.
+	//
+	// ```
+	// let hook = discord.webhook(hookURL)
+	// let sent = try hook.send("Build passed", username = "CI")
+	// try hook.edit(sent.id, content = "Build passed (2 warnings)")
+	// ```
+	//
+	// Calls fail with DiscordError as the client's do: NotFound once the
+	// webhook was deleted, Invalid for an address that is not a webhook's.
+	type Webhook {
+		id string
+		// "" on webhooks the bot did not create.
+		token string
+		// 1 incoming, 2 channel follower, 3 an application's.
+		@json("type")
+		kind int
+		name string
+		avatar string
+		@json("channel_id")
+		channelId string
+		@json("guild_id")
+		guildId string
+		@json("application_id")
+		applicationId string
+		user ?User
+		url string
+		@json(ignore = true)
+		internal client ?Client = none
+		@json(ignore = true)
+		internal problem string = ""
+
+		// The webhook `id` with `token`, posted through `client` (none: a
+		// client of Discord's API with no token).
+		def new(id string = "", token string = "", client ?Client = none) {
+			self.id = id
+			self.token = token
+			self.client = client
+		}
+
+		// Posts a message as the webhook, under `username` and `avatarURL`
+		// when given; in the thread `threadId`, or in a new forum post named
+		// `threadName` (with `tags`). Returns the message posted.
+		// Fails as `Client.send` does.
+		def send(content string = "", embeds Embed[] = [], components Component[] = [], files File[] = [], username string = "", avatarURL string = "", threadId string = "", threadName string = "", tags string[] = [], mentions ?AllowedMentions = none, poll ?Poll = none, tts bool = false, silent bool = false, suppressEmbeds bool = false) !Message {
+			let draft = Draft{files: files, mentions: mentions}
+			draft.content = content when content.len() > 0
+			draft.embeds = embeds when embeds.len() > 0
+			draft.components = components when components.len() > 0
+			draft.flags = (silent ?? (flagSilent, 0)) | (suppressEmbeds ?? (flagSuppressEmbeds, 0))
+			draft.extra.set("username", username) when username.len() > 0
+			draft.extra.set("avatar_url", avatarURL) when avatarURL.len() > 0
+			draft.extra.set("thread_name", threadName) when threadName.len() > 0
+			draft.extra.set("applied_tags", texts(tags)) when tags.len() > 0
+			draft.extra.set("tts", true) when tts
+			let asked = poll
+			draft.extra.set("poll", try pollBody(asked)) unless asked is none
+			let body = try draftBody(draft)
+			let query = map<string, string>{"wait": "true", "thread_id": threadId, "with_components": components.len() > 0 ?? ("true", "")}
+			let out = Message{}
+			try decodeInto(try hookCall(self, http.Method.POST, queryOf(query), body, uploads(files)), out)
+			return out
+		}
+
+		// Changes a message the webhook posted; a none argument stays as it
+		// is. Fails as `Client.edit` does.
+		def edit(messageId string, content ?string = none, embeds ?Embed[] = none, components ?Component[] = none, files File[] = [], keep ?string[] = none, mentions ?AllowedMentions = none, threadId string = "") !Message {
+			let draft = Draft{content: content, embeds: embeds, components: components, files: files, keep: keep, mentions: mentions}
+			let shown = components
+			let query = map<string, string>{"thread_id": threadId, "with_components": shown is none ?? ("", "true")}
+			let out = Message{}
+			try decodeInto(try hookCall(self, http.Method.PATCH, "/messages/{messageId}{queryOf(query)}", try draftBody(draft), uploads(files)), out)
+			return out
+		}
+
+		// Deletes a message the webhook posted.
+		// Fails as every call does.
+		def delete(messageId string, threadId string = "") !none {
+			let query = map<string, string>{"thread_id": threadId}
+			return try discard(try hookCall(self, http.Method.DELETE, "/messages/{messageId}{queryOf(query)}"))
+		}
+
+		// A message the webhook posted.
+		// Fails as every call does.
+		def message(messageId string, threadId string = "") !Message {
+			let query = map<string, string>{"thread_id": threadId}
+			let out = Message{}
+			try decodeInto(try hookCall(self, http.Method.GET, "/messages/{messageId}{queryOf(query)}"), out)
+			return out
+		}
+
+		// Reads the webhook's name, avatar and channel into it.
+		// Fails as every call does.
+		def refresh() !none {
+			let res = try hookCall(self, http.Method.GET, "")
+			return try decodeInto(res, self)
+		}
+
+		// Renames the webhook, or gives it an avatar; "" or none keeps it.
+		// Fails as every call does.
+		def edit(name string = "", avatar ?File = none) !none {
+			let body = new map<string, any>()
+			body.set("name", name) when name.len() > 0
+			setPicture(body, "avatar", avatar)
+			return try decodeInto(try hookCall(self, http.Method.PATCH, "", body), self)
+		}
+
+		// Deletes the webhook.
+		// Fails as every call does.
+		def delete() !none {
+			return try discard(try hookCall(self, http.Method.DELETE, ""))
+		}
+	}
+
+	// The webhook of an address Discord shows
+	// (`https://discord.com/api/webhooks/<id>/<token>`); posting through one
+	// that is not a webhook's fails with Invalid.
+	def webhook(address string) Webhook {
+		let at = address.indexOf("/webhooks/")
+		let hook = new Webhook()
+		if at < 0 {
+			hook.problem = "{address} is not a webhook address"
+			return hook
+		}
+		let parts = address[at + 10:].split("?")[0].split("/")
+		if parts.len() < 2 || !isId(parts[0]) || parts[1].len() == 0 {
+			hook.problem = "{address} is not a webhook address"
+			return hook
+		}
+		hook.id = parts[0]
+		hook.token = parts[1]
+		hook.url = address
+		let base = address[:at]
+		hook.client = new Client(none, base.contains("/api/v") ?? (base, base + "/v10"))
+		return hook
+	}
+
+	// A call on the webhook's own route, `/webhooks/<id>/<token>` and
+	// `rest`, sent without the bot's token.
+	internal def hookCall(hook Webhook, method http.Method, rest string, body ?any = none, files File[] = []) !http.Response {
+		fail invalid(hook.problem) when hook.problem.len() > 0
+		fail invalid("the webhook {hook.id} has no token: Client.webhooks lists it with one only for webhooks the bot made") when hook.token.len() == 0
+		let given = hook.client
+		let client = given is none ?? (new Client(none, apiURL), given)
+		hook.client = client
+		return try deliver(client, Call{method: method, path: "/webhooks/{hook.id}/{hook.token}{rest}", body: body, files: files, bare: true})
+	}
+
+	partial type Client {
+		// A new webhook of a channel. Needs Manage Webhooks.
+		// Fails as every call does.
+		def createWebhook(channelId string, name string, avatar ?File = none, reason string = "") !Webhook {
+			let body = map<string, any>{"name": name}
+			setPicture(body, "avatar", avatar)
+			let hook = new Webhook("", "", self)
+			try decodeInto(try call(self, http.Method.POST, "/channels/{channelId}/webhooks", body, reason), hook)
+			return hook
+		}
+
+		// The webhooks of a channel, or of a whole guild with `guild`.
+		// Needs Manage Webhooks.
+		// Fails as every call does.
+		def webhooks(id string, guild bool = false) !Webhook[] {
+			let out = try listOf<Webhook>(try call(self, http.Method.GET, guild ?? ("/guilds/{id}/webhooks", "/channels/{id}/webhooks")))
+			for let (_, hook) in out {
+				hook.client = self
+			}
+			return out
+		}
+
+		// The webhook `id`, with its token when the bot made it.
+		// Fails as every call does.
+		def webhook(id string) !Webhook {
+			let hook = new Webhook("", "", self)
+			try decodeInto(try call(self, http.Method.GET, "/webhooks/{id}"), hook)
+			return hook
+		}
+
+		// Renames a webhook, gives it an avatar or moves it to `channelId`;
+		// "" or none keeps it.
+		// Fails as every call does.
+		def editWebhook(id string, name string = "", avatar ?File = none, channelId string = "", reason string = "") !Webhook {
+			let body = new map<string, any>()
+			body.set("name", name) when name.len() > 0
+			setPicture(body, "avatar", avatar)
+			body.set("channel_id", channelId) when channelId.len() > 0
+			let hook = new Webhook("", "", self)
+			try decodeInto(try call(self, http.Method.PATCH, "/webhooks/{id}", body, reason), hook)
+			return hook
+		}
+
+		// Deletes a webhook. Needs Manage Webhooks.
+		// Fails as every call does.
+		def deleteWebhook(id string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/webhooks/{id}", none, reason))
+		}
+	}
+}

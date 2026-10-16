@@ -1,0 +1,579 @@
+partial module adm.notify.discord {
+	use (
+		std.time
+		std.net.http
+		std.net.url
+		std.data.encoding::(json)
+	)
+
+	// What a guild edit sets; a none field stays as it is.
+	struct GuildChanges {
+		name                   ?string   = none
+		description            ?string   = none
+		icon                   ?File     = none
+		banner                 ?File     = none
+		splash                 ?File     = none
+		afkChannelId           ?string   = none
+		afkTimeout             ?int      = none
+		systemChannelId        ?string   = none
+		systemChannelFlags     ?int      = none
+		rulesChannelId         ?string   = none
+		publicUpdatesChannelId ?string   = none
+		safetyAlertsChannelId  ?string   = none
+		verificationLevel      ?int      = none
+		defaultNotifications   ?int      = none
+		explicitContentFilter  ?int      = none
+		preferredLocale        ?string   = none
+		features               ?string[] = none
+	}
+
+	// What a member edit sets; a none field stays as it is.
+	struct MemberChanges {
+		// "" clears the nickname.
+		nick         ?string    = none
+		roles        ?string[]  = none
+		mute         ?bool      = none
+		deaf         ?bool      = none
+		// The voice channel to move the member to; "" disconnects it.
+		channelId    ?string    = none
+		// The end of a timeout (at most 28 days ahead); `clearTimeout`
+		// ends one.
+		timeoutUntil ?time.Time = none
+		clearTimeout bool       = false
+		flags        ?int       = none
+	}
+
+	// What a role create or edit sets; a none field stays as it is (or
+	// takes Discord's default).
+	struct RoleChanges {
+		name         ?string      = none
+		permissions  ?Permissions = none
+		color        ?int         = none
+		// Shown apart in the member list.
+		hoist        ?bool        = none
+		icon         ?File        = none
+		unicodeEmoji ?string      = none
+		mentionable  ?bool        = none
+	}
+
+	// What a scheduled event edit sets; a none field stays as it is.
+	struct EventChanges {
+		name        ?string      = none
+		description ?string      = none
+		channelId   ?string      = none
+		location    ?string      = none
+		startsAt    ?time.Time   = none
+		endsAt      ?time.Time   = none
+		entity      ?EventEntity = none
+		// Starting (Active), ending (Completed) or cancelling it.
+		status      ?EventStatus = none
+		image       ?File        = none
+	}
+
+	// The users a bulk ban banned, and those it could not.
+	struct BulkBan {
+		@json("banned_users")
+		banned string[]
+		@json("failed_users")
+		failed string[]
+	}
+
+	partial type Client {
+		// The guild `id`, with approximate member and presence counts.
+		// Fails as every call does.
+		def guild(id string) !Guild {
+			let out = Guild{}
+			try decodeInto(try call(self, http.Method.GET, "/guilds/{id}?with_counts=true"), out)
+			return out
+		}
+
+		// Changes a guild's settings. Needs Manage Guild.
+		// Fails as every call does.
+		def editGuild(id string, changes GuildChanges, reason string = "") !Guild {
+			let body = new map<string, any>()
+			setText(body, "name", changes.name)
+			setText(body, "description", changes.description)
+			setPicture(body, "icon", changes.icon)
+			setPicture(body, "banner", changes.banner)
+			setPicture(body, "splash", changes.splash)
+			setText(body, "afk_channel_id", changes.afkChannelId)
+			setInt(body, "afk_timeout", changes.afkTimeout)
+			setText(body, "system_channel_id", changes.systemChannelId)
+			setInt(body, "system_channel_flags", changes.systemChannelFlags)
+			setText(body, "rules_channel_id", changes.rulesChannelId)
+			setText(body, "public_updates_channel_id", changes.publicUpdatesChannelId)
+			setText(body, "safety_alerts_channel_id", changes.safetyAlertsChannelId)
+			setInt(body, "verification_level", changes.verificationLevel)
+			setInt(body, "default_message_notifications", changes.defaultNotifications)
+			setInt(body, "explicit_content_filter", changes.explicitContentFilter)
+			setText(body, "preferred_locale", changes.preferredLocale)
+			let features = changes.features
+			body.set("features", texts(features)) unless features is none
+			let out = Guild{}
+			try decodeInto(try call(self, http.Method.PATCH, "/guilds/{id}", body, reason), out)
+			return out
+		}
+
+		// The channels of a guild, threads left out.
+		// Fails as every call does.
+		def channels(guildId string) !Channel[] {
+			return try listOf<Channel>(try call(self, http.Method.GET, "/guilds/{guildId}/channels"))
+		}
+
+		// A new channel of a guild. Needs Manage Channels.
+		// Fails as every call does.
+		def createChannel(guildId string, name string, kind ChannelType = ChannelType.GuildText, changes ChannelChanges = ChannelChanges{}, reason string = "") !Channel {
+			let body = channelBody(changes)
+			body.set("name", name)
+			body.set("type", int(kind))
+			let out = Channel{}
+			try decodeInto(try call(self, http.Method.POST, "/guilds/{guildId}/channels", body, reason), out)
+			return out
+		}
+
+		// Moves channels: their new position by id.
+		// Fails as every call does.
+		def reorderChannels(guildId string, positions map<string, int>, reason string = "") !none {
+			let list any[] = []
+			for let (id, position) in positions {
+				list.push(map<string, any>{"id": id, "position": position})
+			}
+			return try discard(try call(self, http.Method.PATCH, "/guilds/{guildId}/channels", list, reason))
+		}
+
+		// A member of a guild. Fails with NotFound when the user is not in
+		// it.
+		def member(guildId string, userId string) !Member {
+			let out = Member{}
+			try decodeInto(try call(self, http.Method.GET, "/guilds/{guildId}/members/{userId}"), out)
+			return out
+		}
+
+		// The members of a guild, by user id. Needs the Guild Members
+		// intent.
+		def members(guildId string) Pages<Member> {
+			let client = self
+			let fetch = def (cursor string) !Member[] {
+				let query = map<string, string>{"limit": "1000", "after": cursor}
+				return try listOf<Member>(try call(client, http.Method.GET, "/guilds/{guildId}/members{queryOf(query)}"))
+			}
+			let id = def (m Member) string {
+				let u = m.user
+				return u is none ?? ("", u.id)
+			}
+			return new Pages<Member>(fetch, id, 1000)
+		}
+
+		// The members whose user name or nickname starts with `query`, up
+		// to `limit` (at most 1000).
+		// Fails as every call does.
+		def searchMembers(guildId string, query string, limit int = 100) !Member[] {
+			return try listOf<Member>(try call(self, http.Method.GET, "/guilds/{guildId}/members/search?query={url.queryEscape(query)}&limit={limit.clamp(1, 1000)}"))
+		}
+
+		// Changes a member: nickname, roles, voice mute and deafen, its
+		// voice channel, a timeout. Each needs its permission (Manage
+		// Nicknames, Manage Roles, Mute Members, Deafen Members, Move
+		// Members, Moderate Members).
+		// Fails as every call does.
+		def editMember(guildId string, userId string, changes MemberChanges, reason string = "") !Member {
+			let body = new map<string, any>()
+			setText(body, "nick", changes.nick)
+			let roles = changes.roles
+			body.set("roles", texts(roles)) unless roles is none
+			let mute = changes.mute
+			body.set("mute", mute) unless mute is none
+			let deaf = changes.deaf
+			body.set("deaf", deaf) unless deaf is none
+			let channel = changes.channelId
+			body.set("channel_id", channel.len() > 0 ?? (channel, none)) unless (channel is none)
+			let until = changes.timeoutUntil
+			body.set("communication_disabled_until", until.str(time.TimeFormat.RFC3339)) unless until is none
+			body.set("communication_disabled_until", none) when changes.clearTimeout
+			setInt(body, "flags", changes.flags)
+			let out = Member{}
+			try decodeInto(try call(self, http.Method.PATCH, "/guilds/{guildId}/members/{userId}", body, reason), out)
+			return out
+		}
+
+		// Sets the bot's own nickname in a guild; "" clears it.
+		// Fails as every call does.
+		def nickname(guildId string, nick string, reason string = "") !none {
+			return try discard(try call(self, http.Method.PATCH, "/guilds/{guildId}/members/@me", map<string, any>{"nick": nick}, reason))
+		}
+
+		// Gives a member a role. Needs Manage Roles, and the role below the
+		// bot's highest.
+		// Fails as every call does.
+		def addRole(guildId string, userId string, roleId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.PUT, "/guilds/{guildId}/members/{userId}/roles/{roleId}", none, reason))
+		}
+
+		// Takes a role from a member. Needs Manage Roles.
+		// Fails as every call does.
+		def removeRole(guildId string, userId string, roleId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/guilds/{guildId}/members/{userId}/roles/{roleId}", none, reason))
+		}
+
+		// Removes a member from a guild. Needs Kick Members.
+		// Fails as every call does.
+		def kick(guildId string, userId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/guilds/{guildId}/members/{userId}", none, reason))
+		}
+
+		// Bans a user, deleting the messages of its last `deleteSeconds`
+		// (at most 604800). Needs Ban Members.
+		// Fails as every call does.
+		def ban(guildId string, userId string, deleteSeconds int = 0, reason string = "") !none {
+			let body = map<string, any>{"delete_message_seconds": deleteSeconds}
+			return try discard(try call(self, http.Method.PUT, "/guilds/{guildId}/bans/{userId}", body, reason))
+		}
+
+		// Bans up to 200 users in one call. Needs Ban Members and Manage
+		// Guild.
+		// Fails as every call does.
+		def ban(guildId string, userIds string[], deleteSeconds int = 0, reason string = "") !BulkBan {
+			fail invalid("a bulk ban takes 1 to 200 users, not {userIds.len()}") when userIds.len() == 0 || userIds.len() > 200
+			let body = map<string, any>{"user_ids": texts(userIds), "delete_message_seconds": deleteSeconds}
+			let out = BulkBan{}
+			try decodeInto(try call(self, http.Method.POST, "/guilds/{guildId}/bulk-ban", body, reason), out)
+			return out
+		}
+
+		// Lifts the ban of a user. Needs Ban Members.
+		// Fails as every call does.
+		def unban(guildId string, userId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/guilds/{guildId}/bans/{userId}", none, reason))
+		}
+
+		// The ban of a user; none when it is not banned.
+		// Fails as every call does.
+		def banned(guildId string, userId string) !?Ban {
+			let res = try found(self, "/guilds/{guildId}/bans/{userId}")
+			return none when res is none
+			let out = Ban{}
+			try decodeInto(res, out)
+			return out
+		}
+
+		// The bans of a guild, by user id. Needs Ban Members.
+		def bans(guildId string) Pages<Ban> {
+			let client = self
+			let fetch = def (cursor string) !Ban[] {
+				let query = map<string, string>{"limit": "1000", "after": cursor}
+				return try listOf<Ban>(try call(client, http.Method.GET, "/guilds/{guildId}/bans{queryOf(query)}"))
+			}
+			let id = def (b Ban) string {
+				return b.user.id
+			}
+			return new Pages<Ban>(fetch, id, 1000)
+		}
+
+		// How many members a prune of those away `days` (1 to 30) would
+		// remove; `roles` adds members with those roles. Needs Kick Members.
+		// Fails as every call does.
+		def pruneCount(guildId string, days int = 7, roles string[] = []) !int {
+			let query = map<string, string>{"days": "{days}", "include_roles": roles.join(",")}
+			let out = Pruned{}
+			try decodeInto(try call(self, http.Method.GET, "/guilds/{guildId}/prune{queryOf(query)}"), out)
+			return out.pruned
+		}
+
+		// Removes the members away `days`, returning how many went.
+		// Fails as every call does.
+		def prune(guildId string, days int = 7, roles string[] = [], reason string = "") !int {
+			let body = map<string, any>{"days": days, "compute_prune_count": true}
+			body.set("include_roles", texts(roles)) when roles.len() > 0
+			let out = Pruned{}
+			try decodeInto(try call(self, http.Method.POST, "/guilds/{guildId}/prune", body, reason), out)
+			return out.pruned
+		}
+
+		// The roles of a guild.
+		// Fails as every call does.
+		def roles(guildId string) !Role[] {
+			return try listOf<Role>(try call(self, http.Method.GET, "/guilds/{guildId}/roles"))
+		}
+
+		// One role of a guild.
+		// Fails as every call does.
+		def role(guildId string, roleId string) !Role {
+			let out = Role{}
+			try decodeInto(try call(self, http.Method.GET, "/guilds/{guildId}/roles/{roleId}"), out)
+			return out
+		}
+
+		// A new role. Needs Manage Roles.
+		// Fails as every call does.
+		def createRole(guildId string, changes RoleChanges = RoleChanges{}, reason string = "") !Role {
+			let out = Role{}
+			try decodeInto(try call(self, http.Method.POST, "/guilds/{guildId}/roles", roleBody(changes), reason), out)
+			return out
+		}
+
+		// Changes a role. Needs Manage Roles.
+		// Fails as every call does.
+		def editRole(guildId string, roleId string, changes RoleChanges, reason string = "") !Role {
+			let out = Role{}
+			try decodeInto(try call(self, http.Method.PATCH, "/guilds/{guildId}/roles/{roleId}", roleBody(changes), reason), out)
+			return out
+		}
+
+		// Deletes a role. Needs Manage Roles.
+		// Fails as every call does.
+		def deleteRole(guildId string, roleId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/guilds/{guildId}/roles/{roleId}", none, reason))
+		}
+
+		// Moves roles: their new position by id.
+		// Fails as every call does.
+		def reorderRoles(guildId string, positions map<string, int>, reason string = "") !Role[] {
+			let list any[] = []
+			for let (id, position) in positions {
+				list.push(map<string, any>{"id": id, "position": position})
+			}
+			return try listOf<Role>(try call(self, http.Method.PATCH, "/guilds/{guildId}/roles", list, reason))
+		}
+
+		// The custom emojis of a guild.
+		// Fails as every call does.
+		def emojis(guildId string) !Emoji[] {
+			return try listOf<Emoji>(try call(self, http.Method.GET, "/guilds/{guildId}/emojis"))
+		}
+
+		// One custom emoji of a guild.
+		// Fails as every call does.
+		def emoji(guildId string, emojiId string) !Emoji {
+			let out = Emoji{}
+			try decodeInto(try call(self, http.Method.GET, "/guilds/{guildId}/emojis/{emojiId}"), out)
+			return out
+		}
+
+		// A new emoji from a picture of at most 256 KiB, for everyone or
+		// the members of `roles`. Needs Create Expressions.
+		// Fails as every call does.
+		def createEmoji(guildId string, name string, image File, roles string[] = [], reason string = "") !Emoji {
+			let body = map<string, any>{"name": name, "image": dataURI(image), "roles": texts(roles)}
+			let out = Emoji{}
+			try decodeInto(try call(self, http.Method.POST, "/guilds/{guildId}/emojis", body, reason), out)
+			return out
+		}
+
+		// Renames an emoji, or limits it to `roles`; none keeps it.
+		// Fails as every call does.
+		def editEmoji(guildId string, emojiId string, name ?string = none, roles ?string[] = none, reason string = "") !Emoji {
+			let body = new map<string, any>()
+			setText(body, "name", name)
+			let only = roles
+			body.set("roles", texts(only)) unless only is none
+			let out = Emoji{}
+			try decodeInto(try call(self, http.Method.PATCH, "/guilds/{guildId}/emojis/{emojiId}", body, reason), out)
+			return out
+		}
+
+		// Deletes an emoji. Needs Manage Expressions.
+		// Fails as every call does.
+		def deleteEmoji(guildId string, emojiId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/guilds/{guildId}/emojis/{emojiId}", none, reason))
+		}
+
+		// A sticker of Discord's packs or of a guild.
+		// Fails as every call does.
+		def sticker(id string) !Sticker {
+			let out = Sticker{}
+			try decodeInto(try call(self, http.Method.GET, "/stickers/{id}"), out)
+			return out
+		}
+
+		// Discord's sticker packs.
+		// Fails as every call does.
+		def stickerPacks() !StickerPack[] {
+			let page = PackPage{}
+			try decodeInto(try call(self, http.Method.GET, "/sticker-packs"), page)
+			return page.packs
+		}
+
+		// The stickers of a guild.
+		// Fails as every call does.
+		def stickers(guildId string) !Sticker[] {
+			return try listOf<Sticker>(try call(self, http.Method.GET, "/guilds/{guildId}/stickers"))
+		}
+
+		// A new sticker from a PNG, APNG, GIF or Lottie JSON file of at most
+		// 512 KiB; `tags` is the name of a Unicode emoji it stands for.
+		// Needs Create Expressions.
+		// Fails as every call does.
+		def createSticker(guildId string, name string, file File, tags string, description string = "", reason string = "") !Sticker {
+			let out = Sticker{}
+			let form = map<string, string>{"name": name, "description": description, "tags": tags}
+			try decodeInto(try deliver(self, Call{method: http.Method.POST, path: "/guilds/{guildId}/stickers", files: [file], field: "file", form: form, reason: reason}), out)
+			return out
+		}
+
+		// Changes a sticker; none keeps a field as it is.
+		// Fails as every call does.
+		def editSticker(guildId string, stickerId string, name ?string = none, description ?string = none, tags ?string = none, reason string = "") !Sticker {
+			let body = new map<string, any>()
+			setText(body, "name", name)
+			setText(body, "description", description)
+			setText(body, "tags", tags)
+			let out = Sticker{}
+			try decodeInto(try call(self, http.Method.PATCH, "/guilds/{guildId}/stickers/{stickerId}", body, reason), out)
+			return out
+		}
+
+		// Deletes a sticker. Needs Manage Expressions.
+		// Fails as every call does.
+		def deleteSticker(guildId string, stickerId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/guilds/{guildId}/stickers/{stickerId}", none, reason))
+		}
+
+		// The scheduled events of a guild, with how many users are
+		// interested.
+		// Fails as every call does.
+		def events(guildId string) !ScheduledEvent[] {
+			return try listOf<ScheduledEvent>(try call(self, http.Method.GET, "/guilds/{guildId}/scheduled-events?with_user_count=true"))
+		}
+
+		// One scheduled event of a guild.
+		// Fails as every call does.
+		def event(guildId string, eventId string) !ScheduledEvent {
+			let out = ScheduledEvent{}
+			try decodeInto(try call(self, http.Method.GET, "/guilds/{guildId}/scheduled-events/{eventId}?with_user_count=true"), out)
+			return out
+		}
+
+		// A new scheduled event: in a stage or voice channel (`channelId`),
+		// or External at `location` with an end. Needs Create Events.
+		// Fails with Invalid for an External event with no location or end.
+		def createEvent(guildId string, name string, startsAt time.Time, entity EventEntity = EventEntity.Voice, channelId string = "", location string = "", endsAt ?time.Time = none, description string = "", image ?File = none, reason string = "") !ScheduledEvent {
+			let external = entity == EventEntity.External
+			fail invalid("an external event needs a location and an end") when external && (location.len() == 0 || endsAt is none)
+			let body = map<string, any>{"name": name, "privacy_level": 2, "scheduled_start_time": startsAt.str(time.TimeFormat.RFC3339), "entity_type": int(entity)}
+			body.set("channel_id", channelId) when channelId.len() > 0
+			body.set("entity_metadata", map<string, any>{"location": location}) when location.len() > 0
+			let end = endsAt
+			body.set("scheduled_end_time", end.str(time.TimeFormat.RFC3339)) unless end is none
+			body.set("description", description) when description.len() > 0
+			setPicture(body, "image", image)
+			let out = ScheduledEvent{}
+			try decodeInto(try call(self, http.Method.POST, "/guilds/{guildId}/scheduled-events", body, reason), out)
+			return out
+		}
+
+		// Changes a scheduled event, or starts, ends or cancels it (`status`).
+		// Fails as every call does.
+		def editEvent(guildId string, eventId string, changes EventChanges, reason string = "") !ScheduledEvent {
+			let body = new map<string, any>()
+			setText(body, "name", changes.name)
+			setText(body, "description", changes.description)
+			setText(body, "channel_id", changes.channelId)
+			let location = changes.location
+			body.set("entity_metadata", map<string, any>{"location": location}) unless location is none
+			let start = changes.startsAt
+			body.set("scheduled_start_time", start.str(time.TimeFormat.RFC3339)) unless start is none
+			let end = changes.endsAt
+			body.set("scheduled_end_time", end.str(time.TimeFormat.RFC3339)) unless end is none
+			let entity = changes.entity
+			body.set("entity_type", int(entity)) unless entity is none
+			let status = changes.status
+			body.set("status", int(status)) unless status is none
+			setPicture(body, "image", changes.image)
+			let out = ScheduledEvent{}
+			try decodeInto(try call(self, http.Method.PATCH, "/guilds/{guildId}/scheduled-events/{eventId}", body, reason), out)
+			return out
+		}
+
+		// Deletes a scheduled event.
+		// Fails as every call does.
+		def deleteEvent(guildId string, eventId string) !none {
+			return try discard(try call(self, http.Method.DELETE, "/guilds/{guildId}/scheduled-events/{eventId}"))
+		}
+
+		// The users interested in a scheduled event, with their members.
+		def eventUsers(guildId string, eventId string) Pages<EventUser> {
+			let client = self
+			let fetch = def (cursor string) !EventUser[] {
+				let query = map<string, string>{"limit": "100", "with_member": "true", "after": cursor}
+				return try listOf<EventUser>(try call(client, http.Method.GET, "/guilds/{guildId}/scheduled-events/{eventId}/users{queryOf(query)}"))
+			}
+			let id = def (u EventUser) string {
+				return u.user.id
+			}
+			return new Pages<EventUser>(fetch, id, 100)
+		}
+
+		// The audit log of a guild, newest first: every entry, or those of
+		// `userId`, of `action`, or with `after` the ones after that entry.
+		// Needs View Audit Log.
+		def auditLog(guildId string, userId string = "", action ?AuditAction = none, before string = "", after string = "") Pages<AuditEntry> {
+			let client = self
+			let forward = after.len() > 0
+			let kind = action is none ?? ("", "{int(action)}")
+			let fetch = def (cursor string) !AuditEntry[] {
+				let page = AuditLog{}
+				let query = map<string, string>{"limit": "100", "user_id": userId, "action_type": kind}
+				query.set(forward ?? ("after", "before"), cursor)
+				try decodeInto(try call(client, http.Method.GET, "/guilds/{guildId}/audit-logs{queryOf(query)}"), page)
+				page.entries.reverse() when forward
+				return page.entries
+			}
+			let id = def (e AuditEntry) string {
+				return e.id
+			}
+			return new Pages<AuditEntry>(fetch, id, 100, forward ?? (after, before))
+		}
+	}
+
+	internal struct Pruned {
+		pruned int
+	}
+
+	internal struct PackPage {
+		@json("sticker_packs")
+		packs StickerPack[]
+	}
+
+	// A GET that answers none for NotFound. Fails as every call does
+	// otherwise.
+	internal def found(client Client, path string) !?http.Response {
+		let missing = false
+		let res = asked(client, path) onerror (err error) {
+			missing = err is DiscordError && err.kind == ErrorKind.NotFound
+			fail err unless missing
+			recover none
+		}
+		return res
+	}
+
+	internal def asked(client Client, path string) !?http.Response {
+		return try call(client, http.Method.GET, path)
+	}
+
+	internal def setText(body map<string, any>, key string, value ?string) {
+		body.set(key, value) unless value is none
+	}
+
+	internal def setInt(body map<string, any>, key string, value ?int) {
+		body.set(key, value) unless value is none
+	}
+
+	internal def setPicture(body map<string, any>, key string, value ?File) {
+		body.set(key, dataURI(value)) unless value is none
+	}
+
+	internal def roleBody(c RoleChanges) map<string, any> {
+		let body = new map<string, any>()
+		setText(body, "name", c.name)
+		let perms = c.permissions
+		body.set("permissions", perms.str()) unless perms is none
+		setInt(body, "color", c.color)
+		let hoist = c.hoist
+		body.set("hoist", hoist) unless hoist is none
+		setPicture(body, "icon", c.icon)
+		setText(body, "unicode_emoji", c.unicodeEmoji)
+		let mentionable = c.mentionable
+		body.set("mentionable", mentionable) unless mentionable is none
+		return body
+	}
+}

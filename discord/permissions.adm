@@ -1,0 +1,121 @@
+partial module adm.notify.discord {
+	// A permission of a role, a member or a channel overwrite; its value
+	// is its bit in the permission set.
+	enum Permission {
+		CreateInstantInvite    = 0,
+		KickMembers            = 1,
+		BanMembers             = 2,
+		// Every permission, and past every channel overwrite.
+		Administrator          = 3,
+		ManageChannels         = 4,
+		ManageGuild            = 5,
+		AddReactions           = 6,
+		ViewAuditLog           = 7,
+		PrioritySpeaker        = 8,
+		Stream                 = 9,
+		ViewChannel            = 10,
+		SendMessages           = 11,
+		SendTTSMessages        = 12,
+		ManageMessages         = 13,
+		EmbedLinks             = 14,
+		AttachFiles            = 15,
+		ReadMessageHistory     = 16,
+		MentionEveryone        = 17,
+		UseExternalEmojis      = 18,
+		ViewGuildInsights      = 19,
+		Connect                = 20,
+		Speak                  = 21,
+		MuteMembers            = 22,
+		DeafenMembers          = 23,
+		MoveMembers            = 24,
+		UseVoiceActivity       = 25,
+		ChangeNickname         = 26,
+		ManageNicknames        = 27,
+		ManageRoles            = 28,
+		ManageWebhooks         = 29,
+		ManageGuildExpressions = 30,
+		UseApplicationCommands = 31,
+		RequestToSpeak         = 32,
+		ManageEvents           = 33,
+		ManageThreads          = 34,
+		CreatePublicThreads    = 35,
+		CreatePrivateThreads   = 36,
+		UseExternalStickers    = 37,
+		SendMessagesInThreads  = 38,
+		UseEmbeddedActivities  = 39,
+		ModerateMembers        = 40,
+		ViewMonetization       = 41,
+		UseSoundboard          = 42,
+		CreateGuildExpressions = 43,
+		CreateEvents           = 44,
+		UseExternalSounds      = 45,
+		SendVoiceMessages      = 46,
+		SendPolls              = 49,
+		UseExternalApps        = 50,
+		PinMessages            = 51,
+		BypassSlowMode         = 52,
+	}
+
+	// A set of permissions, as Discord writes it: the bits as decimal
+	// text (`Role.permissions`, `Overwrite.allow`, `Member.permissions`).
+	//
+	// ```
+	// let perms = new discord.Permissions(role.permissions)
+	// if perms.has(discord.Permission.ManageMessages) { ... }
+	// let text = new discord.Permissions(Permission.ViewChannel, Permission.SendMessages).str()
+	// ```
+	type Permissions {
+		bits int64
+
+		// The set Discord's text names; empty for text that is not a
+		// number.
+		def new(text string) {
+			bits = text.isNumeric() ?? (int64(text.toInt<uint64>()), int64(0))
+		}
+
+		// The set of `list`.
+		def new(list ...Permission) {
+			for let (_, p) in list {
+				bits = bits | (int64(1) << int64(int(p)))
+			}
+		}
+
+		// Whether the set holds `p` (Administrator not counted as every
+		// permission: ask for it too when that matters).
+		def has(p Permission) bool {
+			return (bits & (int64(1) << int64(int(p)))) != 0
+		}
+
+		// The set with `list` added.
+		def add(list ...Permission) Permissions {
+			let out = new Permissions(str())
+			for let (_, p) in list {
+				out.bits = out.bits | (int64(1) << int64(int(p)))
+			}
+			return out
+		}
+
+		// The set with `list` taken out.
+		def remove(list ...Permission) Permissions {
+			let out = new Permissions(str())
+			for let (_, p) in list {
+				out.bits = out.bits & ~(int64(1) << int64(int(p)))
+			}
+			return out
+		}
+
+		// The permissions in the set, lowest bit first.
+		def list() Permission[] {
+			let out Permission[]
+			for let (_, bit) in Permission.values() {
+				out.push(Permission(bit)) when (bits & (int64(1) << int64(bit))) != 0
+			}
+			return out
+		}
+
+		// The decimal text Discord takes.
+		def str() string {
+			return "{bits}"
+		}
+	}
+}

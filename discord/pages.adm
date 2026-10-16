@@ -1,0 +1,50 @@
+partial module adm.notify.discord {
+	// A list Discord hands out a page at a time (messages, members, bans,
+	// reactions, guilds, archived threads, the audit log): `next` fetches
+	// the next page, `all` the rest in one array. Each page waits for its
+	// route's rate limit like any call.
+	//
+	// ```
+	// let recent = bot.messages(channelId)
+	// let page = try recent.next()          // ?Message[], newest first
+	// let everyone = try bot.members(guildId).all()
+	// ```
+	type Pages<T> {
+		internal fetch  def (string) !T[]
+		internal cursor def (T) string
+		internal size   int
+		internal at     string
+		internal ended  bool              = false
+
+		// Pages of `size` that `fetch` returns for a cursor ("" for the
+		// first), each next cursor read from a page's last item.
+		def new(fetch def (string) !T[], cursor def (T) string, size int, start string = "") {
+			self.fetch = fetch
+			self.cursor = cursor
+			self.size = size
+			at = start
+		}
+
+		// The next page; none after the last. Fails as the call behind the
+		// list does.
+		def next() !?T[] {
+			return none when ended
+			let page = try fetch(at)
+			ended = page.len() < size || page.len() == 0
+			at = cursor(page[page.len() - 1]) when page.len() > 0
+			return none when page.len() == 0
+			return page
+		}
+
+		// Every item left, in one array. Fails as `next` does.
+		def all() !T[] {
+			let out T[] = []
+			for {
+				let page = try next()
+				break when page is none
+				out.push(...page)
+			}
+			return out
+		}
+	}
+}

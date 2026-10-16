@@ -1,0 +1,664 @@
+partial module adm.notify.discord {
+	use (
+		std.time
+		std.testing
+		std.bytes
+		std.crypto
+		std.net.http
+		std.net.http.httptest
+		std.net.http.websocket
+		std.net.multipart
+		std.data.compress.zlib
+		std.data.encoding::(JSON, hexencode)
+	)
+
+	// A bot token and a channel for the live test, which posts, edits,
+	// reacts to and deletes a message there and opens a Gateway session.
+	@env("ADM_TEST_DISCORD_TOKEN")
+	internal const liveToken string
+
+	@env("ADM_TEST_DISCORD_CHANNEL")
+	internal const liveChannel string
+
+	// What the loopback server was asked.
+	internal type Seen {
+		requests string[]
+		bodies   map<string, any>[]
+		auth     string[]
+		agents   string[]
+		forms    string[]
+		hits     map<string, int>
+		// The Gateway payloads received, by connection.
+		payloads map<string, any>[]
+		dials    int                = 0
+		// The Gateway's address.
+		base     string             = ""
+
+		def new() {}
+	}
+
+	// `value` as JSON text.
+	internal def json(value ?any) string {
+		return value is none ?? ("null", string((new JSON()).encode(value)))
+	}
+
+	internal def messageJSON(id string, channelId string, content string) string {
+		return json(map<string, any>{"id": id, "channel_id": channelId, "content": content, "author": map<string, any>{"id": "42", "username": "adm", "bot": true}, "type": 0, "timestamp": "2026-10-16T10:00:00.000000+00:00"})
+	}
+
+	internal def discordServer(seen Seen) !httptest.Server {
+		let mux = new http.ServeMux()
+		let keep = def (ctx http.Context) !map<string, any> {
+			seen.requests.push("{ctx.method().value} {ctx.path()}{ctx.request.url.rawQuery.len() > 0 ?? ("?" + ctx.request.url.rawQuery, "")}")
+			seen.auth.push(ctx.header("Authorization"))
+			seen.agents.push(ctx.header("User-Agent"))
+			let body = new map<string, any>()
+			let kind = ctx.header("Content-Type")
+			if kind.startsWith("application/json") {
+				let parsed = try (new JSON()).parse(try ctx.text())
+				body = parsed when parsed is map<string, any>
+				body.set("_list", parsed) when parsed is any[]
+			} else if kind.startsWith("multipart/") {
+				let reader = try multipart.readerFor(new bytes.Buffer(try ctx.bytes()), kind)
+				for {
+					let part = try reader.nextPart()
+					break when part is none
+					let text = try part.text()
+					if part.formName() == "payload_json" {
+						let parsed = try (new JSON()).parse(text)
+						body = parsed when parsed is map<string, any>
+					} else {
+						seen.forms.push("{part.formName()}={part.fileName()}:{text}")
+					}
+				}
+			}
+			seen.bodies.push(body)
+			return body
+		}
+		try mux.handle("POST /api/v10/channels/\{id}/messages", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			return ctx.text(messageJSON("900", ctx.request.param("id"), "{body.get("content")}"))
+		})
+		try mux.handle("PATCH /api/v10/channels/\{id}/messages/\{mid}", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			return ctx.text(messageJSON(ctx.request.param("mid"), ctx.request.param("id"), "{body.get("content")}"))
+		})
+		try mux.handle("GET /api/v10/channels/\{id}/messages/\{mid}", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text(404, "\{\"message\": \"Unknown Message\", \"code\": 10008}") when ctx.request.param("mid") == "404"
+			return ctx.text(messageJSON(ctx.request.param("mid"), ctx.request.param("id"), "found"))
+		})
+		// Pages of two messages, newest first, below the cursor.
+		try mux.handle("GET /api/v10/channels/\{id}/messages", def (ctx http.Context) !none {
+			try keep(ctx)
+			let before = ctx.query("before", "6")
+			let top = before.toInt<int>() - 1
+			let list string[]
+			for let k = top; k >= 1 && k > top - 2; k-- {
+				list.push(messageJSON("{k}", "1", "m{k}"))
+			}
+			return ctx.text("[" + list.join(",") + "]")
+		})
+		try mux.handle("PUT /api/v10/channels/\{id}/messages/\{mid}/reactions/\{emoji}/@me", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.noContent()
+		})
+		// Refuses the first call with a 429, then answers with a bucket
+		// that has nothing left for 300 ms.
+		try mux.handle("POST /api/v10/channels/\{id}/typing", def (ctx http.Context) !none {
+			try keep(ctx)
+			let n = seen.hits.get("typing")
+			let count = n is none ?? (0, n)
+			seen.hits.set("typing", count + 1)
+			if count == 0 {
+				ctx.setHeader("Retry-After", "1")
+				return ctx.text(429, "\{\"message\": \"You are being rate limited.\", \"retry_after\": 0.05, \"global\": false}")
+			}
+			ctx.setHeader("X-RateLimit-Bucket", "typingbucket")
+			ctx.setHeader("X-RateLimit-Limit", "1")
+			ctx.setHeader("X-RateLimit-Remaining", "0")
+			ctx.setHeader("X-RateLimit-Reset-After", "0.3")
+			return ctx.noContent()
+		})
+		try mux.handle("PATCH /api/v10/guilds/\{id}", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text(400, "\{\"code\": 50035, \"message\": \"Invalid Form Body\", \"errors\": \{\"name\": \{\"_errors\": [\{\"code\": \"BASE_TYPE_BAD_LENGTH\", \"message\": \"Must be between 2 and 100 in length.\"}]}}}")
+		})
+		try mux.handle("GET /api/v10/guilds/\{id}/members", def (ctx http.Context) !none {
+			try keep(ctx)
+			let after = ctx.query("after", "")
+			return ctx.text("[]") when after.len() > 0
+			return ctx.text("[\{\"user\": \{\"id\": \"7\", \"username\": \"ada\"}, \"roles\": [\"5\"], \"nick\": \"Ada\"}]")
+		})
+		try mux.handle("GET /api/v10/guilds/\{id}/bans/\{user}", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text(404, "\{\"message\": \"Unknown Ban\", \"code\": 10026}") when ctx.request.param("user") == "1"
+			return ctx.text("\{\"reason\": \"spam\", \"user\": \{\"id\": \"2\", \"username\": \"spammer\"}}")
+		})
+		try mux.handle("POST /api/v10/webhooks/\{id}/\{token}", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			return ctx.text(messageJSON("901", "3", "{body.get("content")}"))
+		})
+		try mux.handle("PATCH /api/v10/webhooks/\{id}/\{token}/messages/\{mid}", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			return ctx.text(messageJSON(ctx.request.param("mid"), "3", "{body.get("content")}"))
+		})
+		try mux.handle("POST /api/v10/interactions/\{id}/\{token}/callback", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.noContent()
+		})
+		try mux.handle("GET /api/v10/oauth2/applications/@me", def (ctx http.Context) !none {
+			try keep(ctx)
+			return ctx.text("\{\"id\": \"555\", \"name\": \"adm\"}")
+		})
+		try mux.handle("PUT /api/v10/applications/\{app}/commands", def (ctx http.Context) !none {
+			let body = try keep(ctx)
+			let list = body.get("_list")
+			let out any[] = []
+			if list is any[] {
+				for let (k, c) in list {
+					if c is map<string, any> {
+						c.set("id", "{100 + k}")
+						c.set("application_id", ctx.request.param("app"))
+						out.push(c)
+					}
+				}
+			}
+			return ctx.text(json(out))
+		})
+		try mux.handle("GET /api/v10/gateway/bot", def (ctx http.Context) !none {
+			try keep(ctx)
+			let address = "ws://{ctx.request.host}/gateway"
+			return ctx.text(json(map<string, any>{"url": address, "shards": 1, "session_start_limit": map<string, any>{"total": 1000, "remaining": 999, "reset_after": 0, "max_concurrency": 2}}))
+		})
+		try mux.handle("GET /gateway/", websocket.handler(def (conn websocket.Conn) !none {
+			seen.dials++
+			return try gatewaySession(seen, conn, seen.dials)
+		}))
+		let server = new httptest.Server(mux)
+		try server.start()
+		seen.base = "ws://{server.address().str()}/gateway"
+		return server
+	}
+
+	// A Gateway as Discord runs one, compressed as zlib-stream. The first
+	// connection identifies, gets READY and a message, has its heartbeat
+	// acknowledged and is asked to reconnect; the second resumes and gets
+	// RESUMED, an interaction and an event with no struct; the third is
+	// refused with 4014.
+	internal def gatewaySession(seen Seen, conn websocket.Conn, dial int) !none {
+		let sink = new bytes.Buffer()
+		let deflate = new zlib.Writer(sink)
+		let push = def (payload map<string, any>) !none {
+			try deflate.write(json(payload).bytes())
+			try deflate.flush()
+			let data = sink.bytes().clone()
+			sink.reset()
+			// The message split in two frames' worth of messages, as Discord
+			// may send a long one.
+			let half = data.len() / 2
+			try conn.writeMessage(websocket.MessageType.Binary, data[:half].clone())
+			return try conn.writeMessage(websocket.MessageType.Binary, data[half:].clone())
+		}
+		let read = def () !map<string, any> {
+			let text = try conn.readText()
+			let parsed = try (new JSON()).parse(text)
+			fail "not an object" unless parsed is map<string, any>
+			seen.payloads.push(parsed)
+			return parsed
+		}
+		try push(map<string, any>{"op": 10, "d": map<string, any>{"heartbeat_interval": 150}})
+		let first = try read()
+		let asked = first.get("d")
+		if asked is map<string, any> && asked.hasKey("shard") {
+			let shard = asked["shard"]
+			try push(map<string, any>{"op": 0, "s": 1, "t": "READY", "d": map<string, any>{"v": 10, "user": map<string, any>{"id": "42", "username": "adm"}, "session_id": "shard-{dial}", "resume_gateway_url": seen.base, "shard": shard}})
+			let _ = conn.readText() onerror recover ""
+			return none
+		}
+		return try conn.closeWith(4014, "Disallowed intent(s)") when dial == 3
+		if dial == 1 {
+			try push(map<string, any>{"op": 0, "s": 1, "t": "READY", "d": map<string, any>{"v": 10, "user": map<string, any>{"id": "42", "username": "adm", "bot": true}, "guilds": any[map<string, any>{"id": "77", "unavailable": true}], "session_id": "sess-1", "resume_gateway_url": seen.base, "shard": any[0, 1]}})
+			try push(map<string, any>{"op": 0, "s": 2, "t": "MESSAGE_CREATE", "d": map<string, any>{"id": "9", "channel_id": "1", "guild_id": "77", "content": "!ping", "author": map<string, any>{"id": "7", "username": "ada"}, "member": map<string, any>{"roles": any["5"], "nick": "Ada"}, "type": 0}})
+			// The heartbeat, then the ask to reconnect.
+			for {
+				let beat = try read()
+				if "{beat.get("op")}" == "1" {
+					try push(map<string, any>{"op": 11})
+					break
+				}
+			}
+			try push(map<string, any>{"op": 7, "d": none})
+			let _ = conn.readText() onerror recover ""
+			return none
+		}
+		try push(map<string, any>{"op": 0, "s": 3, "t": "RESUMED", "d": none})
+		try push(map<string, any>{"op": 0, "s": 4, "t": "INTERACTION_CREATE", "d": map<string, any>{"id": "61", "application_id": "555", "type": 2, "token": "tok61", "data": map<string, any>{"id": "100", "name": "roll", "type": 1, "options": any[map<string, any>{"name": "sides", "type": 4, "value": 20}]}, "member": map<string, any>{"user": map<string, any>{"id": "7", "username": "ada"}}}})
+		try push(map<string, any>{"op": 0, "s": 5, "t": "AUTO_MODERATION_ACTION_EXECUTION", "d": map<string, any>{"guild_id": "77", "rule_id": "3"}})
+		let _ = conn.readText() onerror recover ""
+		return none
+	}
+
+	internal def caught(run def () !none) DiscordError {
+		let out = DiscordError{message: "no failure", kind: ErrorKind.Server}
+		run() onerror (err error) {
+			out = err when err is DiscordError
+			out.message = "not a DiscordError: {err.message}" unless err is DiscordError
+			recover none
+		}
+		return out
+	}
+
+	internal def clientOf(server httptest.Server) Client {
+		return new Client("tok", "http://{server.address().str()}/api/v10")
+	}
+
+	internal def signedPost(server httptest.Server, key crypto.Ed25519PrivateKey, body string, good bool = true) !http.Response {
+		let stamp = "1760000000"
+		let signature = key.sign(stamp.bytes() + body.bytes())
+		signature[0] = signature[0] ^ 1 unless good
+		let client = new http.Client()
+		let req = try client.request(http.Method.POST, "http://{server.address().str()}/interactions")
+		req.headers.set("X-Signature-Ed25519", hexencode(signature))
+		req.headers.set("X-Signature-Timestamp", stamp)
+		req.headers.set("Content-Type", "application/json")
+		req.replaceBody(body.bytes())
+		return try client.do(req)
+	}
+
+	check "Discord" {
+		// A message with an embed, a button row and a file goes out as
+		// multipart with payload_json, the token and the User-Agent
+		// Discord asks for.
+		@test()
+		def TestSendMessage() !none {
+			let seen = new Seen()
+			let server = try discordServer(seen)
+			let bot = clientOf(server)
+			let embed = new Embed("Release 1.4", "Now available")
+			embed.field("Downloads", "https://example.com/1.4").field("Size", "12 MB", inline = true)
+			embed.color = 0x5865F2
+			let sent = try bot.send("12", "Release 1.4 is out", embeds = [embed], components = [row(button("Notes", "notes"), link("Site", "https://example.com"))], files = [File{name: "notes.txt", data: "hello".bytes(), description: "notes"}], replyTo = "8", mentions = AllowedMentions{users: true})
+			assert sent.id == "900" && sent.channelId == "12" && sent.content == "Release 1.4 is out" && sent.author.bot
+			assert seen.auth[0] == "Bot tok" && seen.agents[0].startsWith("DiscordBot (")
+			let body = seen.bodies[0]
+			let embeds = body.get("embeds")
+			fail "no embeds" unless embeds is any[] && embeds.len() == 1
+			let first = embeds[0]
+			fail "no embed" unless first is map<string, any>
+			assert "{first.get("title")}" == "Release 1.4" && "{first.get("color")}" == "5793266"
+			let fields = first.get("fields")
+			fail "no fields" unless fields is any[] && fields.len() == 2
+			let rows = body.get("components")
+			fail "no rows" unless rows is any[] && rows.len() == 1
+			let attachments = body.get("attachments")
+			fail "no attachments" unless attachments is any[] && attachments.len() == 1
+			assert seen.forms.join("|") == "files[0]=notes.txt:hello"
+			let reference = body.get("message_reference")
+			fail "no reference" unless reference is map<string, any>
+			assert "{reference.get("message_id")}" == "8"
+			let mentions = body.get("allowed_mentions")
+			fail "no mentions" unless mentions is map<string, any>
+			assert json(mentions.get("parse")) == "[\"users\"]"
+
+			try bot.react("12", "900", "👍")
+			assert seen.requests[1] == "PUT /api/v10/channels/12/messages/900/reactions/👍/@me"
+			let edited = try bot.edit("12", "900", content = "Release 1.4.1 is out")
+			assert edited.content == "Release 1.4.1 is out" && seen.bodies[2].len() == 1
+			try server.close()
+			return none
+		}
+
+		// Discord's limits fail before anything is sent.
+		@test()
+		def TestLimitsBeforeSending() !none {
+			let seen = new Seen()
+			let server = try discordServer(seen)
+			let bot = clientOf(server)
+			let long = new Embed("x".repeat(257))
+			assert caught(def () !none {
+				try bot.send("1", embeds = [long])
+				return none
+			}).kind == ErrorKind.Invalid
+			let six Component[] = []
+			for let k = 0; k < 6; k++ {
+				six.push(row(button("b", "b{k}")))
+			}
+			let tooMany = caught(def () !none {
+				try bot.send("1", components = six)
+				return none
+			})
+			assert tooMany.kind == ErrorKind.Invalid && tooMany.message.contains("5 action rows")
+			let mixed = caught(def () !none {
+				try bot.send("1", "text", components = [text("**layout**")])
+				return none
+			})
+			assert mixed.kind == ErrorKind.Invalid && mixed.message.contains("no content")
+			assert caught(def () !none {
+				try bot.send("1")
+				return none
+			}).kind == ErrorKind.Invalid
+			assert seen.requests.len() == 0
+
+			// A layout goes with the IS_COMPONENTS_V2 flag.
+			try bot.send("1", components = [container([text("# Deploy"), separator(), section(button("Open", "open"), "web-1 is up")], accentColor = 0x00ff00)])
+			let body = seen.bodies[0]
+			assert "{body.get("flags")}" == "32768" && !body.hasKey("content")
+			try server.close()
+			return none
+		}
+
+		// A 429 is waited out and sent again; a bucket with nothing left
+		// holds the next call back until it resets. Failures carry
+		// Discord's code and field errors.
+		@test()
+		def TestRateLimitsAndErrors() !none {
+			let seen = new Seen()
+			let server = try discordServer(seen)
+			let bot = clientOf(server)
+			let started = time.now()
+			try bot.typing("5")
+			assert seen.requests.len() == 2
+			let second = time.now()
+			try bot.typing("5")
+			assert time.since(second) >= 250ms && time.since(started) >= 290ms
+
+			let missing = caught(def () !none {
+				try bot.message("5", "404")
+				return none
+			})
+			assert missing.kind == ErrorKind.NotFound && missing.discordCode == 10008 && missing.status == 404
+			let refused = caught(def () !none {
+				try bot.editGuild("77", GuildChanges{name: "x"})
+				return none
+			})
+			assert refused.kind == ErrorKind.Invalid && refused.discordCode == 50035 && refused.details.join("|") == "name: Must be between 2 and 100 in length."
+			let ban = try bot.banned("77", "2")
+			fail "no ban" when ban is none
+			assert ban.reason == "spam"
+			let none1 = try bot.banned("77", "1")
+			assert none1 is none
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestPages() !none {
+			let seen = new Seen()
+			let server = try discordServer(seen)
+			let bot = clientOf(server)
+			let pages = bot.messages("1", pageSize = 2)
+			let first = try pages.next()
+			fail "no page" when first is none
+			assert first.len() == 2 && first[0].id == "5" && first[1].id == "4"
+			let rest = try pages.all()
+			let ids string[]
+			for let (_, m) in rest {
+				ids.push(m.id)
+			}
+			assert ids.join("|") == "3|2|1"
+			assert seen.requests[1] == "GET /api/v10/channels/1/messages?limit=2&before=4"
+			let members = try bot.members("77").all()
+			assert members.len() == 1 && members[0].nick == "Ada" && members[0].roles.join("|") == "5"
+			try server.close()
+			return none
+		}
+
+		// A webhook posts without the bot's token and waits for the
+		// message; an address that is not a webhook's fails.
+		@test()
+		def TestWebhook() !none {
+			let seen = new Seen()
+			let server = try discordServer(seen)
+			let hook = webhook("http://{server.address().str()}/api/webhooks/31/secret-token")
+			let sent = try hook.send("Build passed", username = "CI", threadId = "44")
+			assert sent.id == "901" && seen.auth[0] == ""
+			assert seen.requests[0] == "POST /api/v10/webhooks/31/secret-token?thread_id=44&wait=true" || seen.requests[0] == "POST /api/v10/webhooks/31/secret-token?wait=true&thread_id=44"
+			assert "{seen.bodies[0].get("username")}" == "CI"
+			let edited = try hook.edit(sent.id, content = "Build passed (2 warnings)")
+			assert edited.content == "Build passed (2 warnings)"
+			assert caught(def () !none {
+				try webhook("https://example.com/nothing").send("x")
+				return none
+			}).kind == ErrorKind.Invalid
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestRegisterCommands() !none {
+			let seen = new Seen()
+			let server = try discordServer(seen)
+			let bot = clientOf(server)
+			let roll = new Command("roll", "Roll dice")
+			roll.option(OptionType.Integer, "sides", "How many sides", required = true, min = 2.0, max = 100.0)
+			let admin = new Command("admin", "Admin tools").permissions(Permission.ManageGuild)
+			let purge = new Command("purge", "Delete messages")
+			purge.option(OptionType.Integer, "count", "How many", choices = [choice("ten", 10), choice("all", 100)])
+			admin.subcommand(purge)
+			let menu = new Command("Report", kind = CommandType.Message)
+			let saved = try bot.registerCommands([roll, admin, menu])
+			assert saved.len() == 3 && saved[0].id == "100" && saved[0].applicationId == "555" && saved[2].kind == CommandType.Message
+			assert seen.requests[1] == "PUT /api/v10/applications/555/commands"
+			let list = seen.bodies[1].get("_list")
+			fail "no list" unless list is any[]
+			let sent = list[0]
+			fail "no command" unless sent is map<string, any>
+			assert json(sent.get("options")) == "[\{\"type\":4,\"name\":\"sides\",\"description\":\"How many sides\",\"required\":true,\"min_value\":2,\"max_value\":100}]"
+			let tools = list[1]
+			fail "no admin" unless tools is map<string, any>
+			assert "{tools.get("default_member_permissions")}" == "32"
+			let report = list[2]
+			fail "no menu" unless report is map<string, any>
+			assert !report.hasKey("description") && "{report.get("type")}" == "3"
+			try server.close()
+			return none
+		}
+
+		// Signed interactions: a bad signature gets 401, a ping its pong, a
+		// command its answer as the HTTP response; a slow one is deferred
+		// and filled in through the interaction's webhook.
+		@test()
+		def TestInteractionHandler() !none {
+			let seen = new Seen()
+			let api = try discordServer(seen)
+			let bot = clientOf(api)
+			let key = try crypto.generateEd25519Key()
+			let handled string[]
+			let handler = bot.interactions(def (i Interaction) !none {
+				handled.push("{i.data.name}{i.data.customId}")
+				return i.reply("Thanks: {i.field("what")}", ephemeral = true) when i.kind == InteractionType.ModalSubmit
+				return i.update(content = "Picked {i.values().join(",")}") when i.kind == InteractionType.Component
+				if i.data.name == "slow" {
+					time.sleep(300ms)
+					return i.reply("Done slowly")
+				}
+				let sub = i.subcommand()
+				let who = i.userOption("who")
+				let name = who is none ?? ("nobody", who.username)
+				return i.reply("{sub}: {i.integer("sides")} for {name} by {i.author().username}")
+			}, publicKey = hexencode(key.public.bytes), deferAfter = 100ms)
+			let mux = new http.ServeMux()
+			try mux.handle("POST /interactions", handler)
+			let server = new httptest.Server(mux)
+			try server.start()
+
+			// An unsigned request, served directly.
+			let rec = new httptest.ResponseRecorder()
+			try handler.serve(rec.context(try httptest.newRequest(http.Method.POST, "/interactions", "\{}")))
+			assert rec.status == 401
+
+			let ping = "\{\"id\": \"1\", \"application_id\": \"555\", \"type\": 1, \"token\": \"t\"}"
+			let refused = try signedPost(server, key, ping, false)
+			assert refused.status == 401
+			let pong = try signedPost(server, key, ping)
+			assert pong.status == 200 && (try pong.text()).contains("\"type\":1")
+
+			let command = json(map<string, any>{"id": "2", "application_id": "555", "type": 2, "token": "t2", "member": map<string, any>{"user": map<string, any>{"id": "7", "username": "ada"}}, "data": map<string, any>{"id": "100", "name": "dice", "type": 1, "options": any[map<string, any>{"name": "throw", "type": 1, "options": any[map<string, any>{"name": "sides", "type": 4, "value": 20}, map<string, any>{"name": "who", "type": 6, "value": "8"}]}], "resolved": map<string, any>{"users": map<string, any>{"8": map<string, any>{"id": "8", "username": "bob"}}}}})
+			let answered = try signedPost(server, key, command)
+			let reply = try (new JSON()).parse(try answered.text())
+			fail "no reply" unless reply is map<string, any>
+			let data = reply.get("data")
+			fail "no data" unless data is map<string, any>
+			assert "{reply.get("type")}" == "4" && "{data.get("content")}" == "throw: 20 for bob by ada"
+
+			let slow = json(map<string, any>{"id": "3", "application_id": "555", "type": 2, "token": "t3", "user": map<string, any>{"id": "7", "username": "ada"}, "data": map<string, any>{"id": "101", "name": "slow", "type": 1}})
+			let deferred = try signedPost(server, key, slow)
+			assert (try deferred.text()) == "\{\"type\":5}"
+			time.sleep(400ms)
+			assert seen.requests.includes("PATCH /api/v10/webhooks/555/t3/messages/@original")
+
+			let picked = json(map<string, any>{"id": "4", "application_id": "555", "type": 3, "token": "t4", "user": map<string, any>{"id": "7"}, "data": map<string, any>{"custom_id": "color", "component_type": 3, "values": any["red", "blue"]}})
+			let update = try (new JSON()).parse(try (try signedPost(server, key, picked)).text())
+			fail "no update" unless update is map<string, any>
+			assert "{update.get("type")}" == "7"
+
+			let submitted = json(map<string, any>{"id": "5", "application_id": "555", "type": 5, "token": "t5", "user": map<string, any>{"id": "7"}, "data": map<string, any>{"custom_id": "feedback", "components": any[map<string, any>{"type": 18, "component": map<string, any>{"type": 4, "custom_id": "what", "value": "it broke"}}]}})
+			let thanks = try (new JSON()).parse(try (try signedPost(server, key, submitted)).text())
+			fail "no answer" unless thanks is map<string, any>
+			let thanked = thanks.get("data")
+			fail "no data" unless thanked is map<string, any>
+			assert "{thanked.get("content")}" == "Thanks: it broke" && "{thanked.get("flags")}" == "64"
+			assert handled.join("|") == "dice|slow|color|feedback"
+			try server.close()
+			try api.close()
+			return none
+		}
+
+		// A Gateway session over zlib-stream: READY and a message, the
+		// heartbeat acknowledged, a reconnect Discord asks for resumed
+		// with the session and sequence, an interaction answered through
+		// the callback, an event with no struct, and a close code that ends
+		// the session.
+		@test()
+		def TestGatewaySession() !none {
+			let seen = new Seen()
+			let server = try discordServer(seen)
+			let bot = clientOf(server)
+			let gw = bot.gateway(Intent.Guilds, Intent.GuildMessages, Intent.MessageContent)
+			let ready = try gw.next()
+			fail "not READY" unless ready is Ready
+			assert ready.sessionId == "sess-1" && gw.user.id == "42" && ready.guilds.len() == 1
+			let message = try gw.next()
+			fail "not a message" unless message is MessageCreate
+			let author = message.message.member
+			fail "no member" when author is none
+			assert message.message.content == "!ping" && message.message.guildId == "77" && author.nick == "Ada"
+			let resumed = try gw.next()
+			fail "not RESUMED" unless resumed is Resumed
+			let identify = seen.payloads[0]
+			let d = identify.get("d")
+			fail "no identify" unless d is map<string, any>
+			try testing.expectEqual("2", "{identify.get("op")}", "identify op")
+			try testing.expectEqual("tok", "{d.get("token")}", "identify token")
+			try testing.expectEqual("{(1 << 0) | (1 << 9) | (1 << 15)}", "{d.get("intents")}", "identify intents")
+			let resume = seen.payloads[seen.payloads.len() - 1]
+			let r = resume.get("d")
+			fail "no resume" unless r is map<string, any>
+			assert "{resume.get("op")}" == "6" && "{r.get("session_id")}" == "sess-1" && "{r.get("seq")}" == "2"
+			assert gw.latency > 0s
+
+			let interaction = try gw.next()
+			fail "not an interaction" unless interaction is InteractionCreate
+			let i = interaction.interaction
+			assert i.integer("sides") == 20 && i.author().username == "ada"
+			try i.reply("You rolled 7")
+			assert seen.requests.includes("POST /api/v10/interactions/61/tok61/callback")
+			let raw = try gw.next()
+			fail "not raw" unless raw is RawEvent
+			assert raw.name == "AUTO_MODERATION_ACTION_EXECUTION"
+
+			try gw.close()
+			// A new session on the third connection is refused for its
+			// intents.
+			let other = bot.gateway(Intent.GuildPresences)
+			let refused = caught(def () !none {
+				try other.next()
+				return none
+			})
+			assert refused.kind == ErrorKind.Invalid && refused.status == 4014
+			try server.close()
+			return none
+		}
+
+		// Every shard identifies with its id and the count, and their events
+		// come as one stream.
+		@test()
+		def TestShardGroup() !none {
+			let seen = new Seen()
+			let server = try discordServer(seen)
+			let bot = clientOf(server)
+			let group = try bot.shards([Intent.Guilds], count = 2)
+			let shards string[]
+			for let k = 0; k < 2; k++ {
+				let item = try group.next()
+				let event = item.event
+				fail "not READY" unless event is Ready
+				shards.push("{item.shard}:{event.shard.len() == 2 ?? (event.shard[0], -1)}/{item.gateway.shards}")
+			}
+			assert shards.includes("0:0/2") && shards.includes("1:1/2")
+			try group.close()
+			try server.close()
+			return none
+		}
+
+		// The README's loop: events matched by struct until the bot stops.
+		@test()
+		def TestEventLoop() !none {
+			let seen = new Seen()
+			let server = try discordServer(seen)
+			let bot = clientOf(server)
+			let gw = bot.gateway(Intent.GuildMessages, Intent.MessageContent)
+			let replied = 0
+			for let event in gw {
+				match event {
+					case MessageCreate:
+						if event.message.content == "!ping" {
+							try bot.send(event.message.channelId, "pong")
+							replied++
+							try gw.close()
+						}
+					default:
+				}
+			}
+			assert replied == 1 && gw.lastError is none && seen.requests.includes("POST /api/v10/channels/1/messages")
+			try server.close()
+			return none
+		}
+
+		@test()
+		def TestPermissionsAndSnowflakes() {
+			let perms = new Permissions(Permission.ViewChannel, Permission.SendMessages)
+			assert perms.str() == "3072" && perms.has(Permission.SendMessages) && !perms.has(Permission.Administrator)
+			let more = perms.add(Permission.PinMessages)
+			assert more.has(Permission.PinMessages) && more.list().len() == 3
+			assert new Permissions("8").has(Permission.Administrator)
+			assert createdAt("175928847299117063").unixNs() == 1462015105796 * 1000000
+			assert routeOf(http.Method.DELETE, "/channels/1/messages/2/reactions/%F0%9F%91%8D/@me") == "DELETE /channels/1/messages/:id/reactions/:emoji/@me"
+			assert routeOf(http.Method.POST, "/webhooks/3/tok") == "POST /webhooks/3/tok"
+			assert emojiPath("👍") == "%F0%9F%91%8D" && emojiPath("<a:party:123>") == "party:123"
+			assert routeOf(http.Method.POST, "/interactions/9/tok/callback") == "POST /interactions/:id/:id/callback"
+		}
+
+		// Posts to a real channel and opens a session with a real token.
+		@test()
+		def TestLive() !none {
+			return none when liveToken.len() == 0 || liveChannel.len() == 0
+			let bot = new Client(liveToken)
+			let embed = new Embed("adm.notify.discord", "live test")
+			embed.field("Library", "0.1.0", inline = true)
+			let sent = try bot.send(liveChannel, "adm test", embeds = [embed], components = [row(button("Ok", "ok"))])
+			try bot.react(liveChannel, sent.id, "✅")
+			let edited = try bot.edit(liveChannel, sent.id, content = "adm test (edited)")
+			assert edited.content == "adm test (edited)"
+			let found = try bot.message(liveChannel, sent.id)
+			assert found.reactions.len() == 1
+			try bot.delete(liveChannel, sent.id)
+			let gw = bot.gateway(Intent.Guilds)
+			let first = try gw.next()
+			fail "the session did not open with READY" unless first is Ready
+			try gw.close()
+			return none
+		}
+	}
+}

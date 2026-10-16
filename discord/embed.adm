@@ -1,0 +1,142 @@
+partial module adm.notify.discord {
+	use std.data.encoding::(json)
+
+	// The line under an embed.
+	struct EmbedFooter {
+		@json(omitempty = true)
+		text string
+		@json("icon_url", omitempty = true)
+		iconURL string
+	}
+
+	// A picture, thumbnail or video of an embed: an `https://` address or
+	// `attachment://name` of a file sent with the message.
+	struct EmbedMedia {
+		@json(omitempty = true)
+		url string
+		@json(omitempty = true)
+		height int
+		@json(omitempty = true)
+		width int
+	}
+
+	// Who an embed is by.
+	struct EmbedAuthor {
+		@json(omitempty = true)
+		name string
+		@json(omitempty = true)
+		url string
+		@json("icon_url", omitempty = true)
+		iconURL string
+	}
+
+	// The site a link's embed came from.
+	struct EmbedProvider {
+		@json(omitempty = true)
+		name string
+		@json(omitempty = true)
+		url string
+	}
+
+	// A name and a value in an embed; inline fields share a row, up to
+	// three.
+	struct EmbedField {
+		name string
+		value string
+		@json(omitempty = true)
+		inline bool
+	}
+
+	// A rich block of a message: a title, text, fields, pictures. Discord's
+	// limits are checked before the message goes out (a title of 256
+	// characters, a description of 4096, 25 fields of 256 and 1024, a
+	// footer of 2048, an author of 256, 6000 in all the embeds of a
+	// message, 10 embeds).
+	//
+	// ```
+	// let embed = new discord.Embed("Release 1.4", "Now available")
+	// embed.color = 0x5865F2
+	// embed.field("Downloads", "https://example.com/1.4")
+	// embed.image = discord.EmbedMedia{url: "attachment://chart.png"}
+	// ```
+	type Embed {
+		@json(omitempty = true)
+		title string
+		// "rich" for the embeds a bot sends; Discord fills it on what it
+		// returns.
+		@json("type", omitempty = true)
+		kind string
+		@json(omitempty = true)
+		description string
+		// Where the title links to.
+		@json(omitempty = true)
+		url string
+		// The time the footer shows, ISO 8601 (`time.Time.str()`).
+		@json(omitempty = true)
+		timestamp string
+		// 0xRRGGBB of the bar on the left.
+		@json(omitempty = true)
+		color int
+		@json(omitempty = true)
+		footer ?EmbedFooter
+		@json(omitempty = true)
+		image ?EmbedMedia
+		@json(omitempty = true)
+		thumbnail ?EmbedMedia
+		@json(omitempty = true)
+		video ?EmbedMedia
+		@json(omitempty = true)
+		provider ?EmbedProvider
+		@json(omitempty = true)
+		author ?EmbedAuthor
+		@json(omitempty = true)
+		fields EmbedField[]
+
+		def new(title string = "", description string = "") {
+			self.title = title
+			self.description = description
+		}
+
+		// Adds a field and returns the embed, so fields chain.
+		def field(name string, value string, inline bool = false) Embed {
+			fields.push(EmbedField{name: name, value: value, inline: inline})
+			return self
+		}
+
+		// The characters of the embed that count towards the 6000 of a
+		// message.
+		def size() int {
+			let n = title.len() + description.len()
+			let foot = footer
+			n += foot.text.len() unless foot is none
+			let by = author
+			n += by.name.len() unless by is none
+			for let (_, f) in fields {
+				n += f.name.len() + f.value.len()
+			}
+			return n
+		}
+	}
+
+	// The first limit of Discord's that `embeds` break, "" when none.
+	internal def embedProblem(embeds Embed[]) string {
+		return "a message takes at most 10 embeds, not {embeds.len()}" when embeds.len() > 10
+		let total = 0
+		for let (k, e) in embeds {
+			return "embed {k}: the title is longer than 256 characters" when e.title.len() > 256
+			return "embed {k}: the description is longer than 4096 characters" when e.description.len() > 4096
+			return "embed {k}: {e.fields.len()} fields, at most 25" when e.fields.len() > 25
+			for let (j, f) in e.fields {
+				return "embed {k}, field {j}: the name is empty or longer than 256 characters" when f.name.len() == 0 || f.name.len() > 256
+				return "embed {k}, field {j}: the value is empty or longer than 1024 characters" when f.value.len() == 0 || f.value.len() > 1024
+			}
+			let foot = e.footer
+			return "embed {k}: the footer is longer than 2048 characters" when !(foot is none) && foot.text.len() > 2048
+			let by = e.author
+			return "embed {k}: the author's name is longer than 256 characters" when !(by is none) && by.name.len() > 256
+			total += e.size()
+		}
+		return "the embeds hold {total} characters, at most 6000" when total > 6000
+		return ""
+	}
+}

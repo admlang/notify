@@ -1,0 +1,563 @@
+partial module adm.notify.discord {
+	use (
+		std.net.http
+		std.net.url
+		std.data.encoding::(base64encode, json)
+	)
+
+	// What a channel edit or create sets; a none field stays as it is (or
+	// takes Discord's default). Threads take `archived`, `locked`,
+	// `invitable`, `autoArchive` and `appliedTags`.
+	struct ChannelChanges {
+		name                  ?string      = none
+		kind                  ?ChannelType = none
+		topic                 ?string      = none
+		nsfw                  ?bool        = none
+		position              ?int         = none
+		// Seconds between a member's messages, 0 to 21600.
+		slowMode              ?int         = none
+		bitrate               ?int         = none
+		userLimit             ?int         = none
+		parentId              ?string      = none
+		overwrites            ?Overwrite[] = none
+		rtcRegion             ?string      = none
+		videoQualityMode      ?int         = none
+		defaultAutoArchive    ?int         = none
+		archived              ?bool        = none
+		locked                ?bool        = none
+		invitable             ?bool        = none
+		autoArchive           ?int         = none
+		appliedTags           ?string[]    = none
+		availableTags         ?ForumTag[]  = none
+		defaultThreadSlowMode ?int         = none
+		defaultSortOrder      ?int         = none
+		defaultForumLayout    ?int         = none
+		flags                 ?int         = none
+	}
+
+	// A pinned message and when it was pinned.
+	struct Pin {
+		@json("pinned_at")
+		pinnedAt string
+		message Message
+	}
+
+	partial type Client {
+		// The channel or thread `id`. Fails with NotFound for an unknown
+		// one, Auth when the bot cannot see it.
+		def channel(id string) !Channel {
+			let out = Channel{}
+			try decodeInto(try call(self, http.Method.GET, "/channels/{id}"), out)
+			return out
+		}
+
+		// Changes a channel or a thread. Fails with Invalid for a change
+		// Discord refuses, Auth without Manage Channels (or Manage
+		// Threads).
+		def editChannel(id string, changes ChannelChanges, reason string = "") !Channel {
+			let out = Channel{}
+			try decodeInto(try call(self, http.Method.PATCH, "/channels/{id}", channelBody(changes), reason), out)
+			return out
+		}
+
+		// Deletes a guild channel or a thread, or closes a direct message.
+		// Fails with Auth without Manage Channels.
+		def deleteChannel(id string, reason string = "") !Channel {
+			let out = Channel{}
+			try decodeInto(try call(self, http.Method.DELETE, "/channels/{id}", none, reason), out)
+			return out
+		}
+
+		// Sets what a channel allows and denies a role or a member
+		// (`overwriteId`). Fails with Auth without Manage Roles.
+		def setPermissions(channelId string, overwriteId string, kind OverwriteType, allow Permissions, deny Permissions, reason string = "") !none {
+			let body = map<string, any>{"type": int(kind), "allow": allow.str(), "deny": deny.str()}
+			return try discard(try call(self, http.Method.PUT, "/channels/{channelId}/permissions/{overwriteId}", body, reason))
+		}
+
+		// Drops a channel's overwrite of a role or a member.
+		// Fails as every call does.
+		def removePermissions(channelId string, overwriteId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/channels/{channelId}/permissions/{overwriteId}", none, reason))
+		}
+
+		// The invites of a channel. Fails with Auth without Manage Channels.
+		def invites(channelId string) !Invite[] {
+			return try listOf<Invite>(try call(self, http.Method.GET, "/channels/{channelId}/invites"))
+		}
+
+		// A new invite to a channel: `maxAge` seconds (0 for ever),
+		// `maxUses` (0 for any), `temporary` membership, `unique` for a new
+		// code even when a like one exists.
+		// Fails as every call does.
+		def createInvite(channelId string, maxAge int = 86400, maxUses int = 0, temporary bool = false, unique bool = false, reason string = "") !Invite {
+			let out = Invite{}
+			let body = map<string, any>{"max_age": maxAge, "max_uses": maxUses, "temporary": temporary, "unique": unique}
+			try decodeInto(try call(self, http.Method.POST, "/channels/{channelId}/invites", body, reason), out)
+			return out
+		}
+
+		// The invite of `code`, with its member counts.
+		// Fails as every call does.
+		def invite(code string) !Invite {
+			let out = Invite{}
+			try decodeInto(try call(self, http.Method.GET, "/invites/{url.pathEscape(code)}?with_counts=true"), out)
+			return out
+		}
+
+		// Revokes an invite. Needs Manage Channels.
+		// Fails as every call does.
+		def deleteInvite(code string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/invites/{url.pathEscape(code)}", none, reason))
+		}
+
+		// Shows the bot typing in a channel for ten seconds, or until it
+		// sends.
+		// Fails as every call does.
+		def typing(channelId string) !none {
+			return try discard(try call(self, http.Method.POST, "/channels/{channelId}/typing"))
+		}
+
+		// Has the announcements of `channelId` posted in `targetId` too.
+		// Fails as every call does.
+		def follow(channelId string, targetId string) !none {
+			return try discard(try call(self, http.Method.POST, "/channels/{channelId}/followers", map<string, any>{"webhook_channel_id": targetId}))
+		}
+
+		// The messages of a channel, newest first, or with `after` the ones
+		// after that message, oldest first. Needs Read Message History.
+		def messages(channelId string, before string = "", after string = "", pageSize int = 100) Pages<Message> {
+			let client = self
+			let size = pageSize.clamp(1, 100)
+			let forward = after.len() > 0
+			let fetch = def (cursor string) !Message[] {
+				let query = map<string, string>{"limit": "{size}"}
+				query.set(forward ?? ("after", "before"), cursor)
+				let out = try listOf<Message>(try call(client, http.Method.GET, "/channels/{channelId}/messages{queryOf(query)}"))
+				out.reverse() when forward
+				return out
+			}
+			let id = def (m Message) string {
+				return m.id
+			}
+			return new Pages<Message>(fetch, id, size, forward ?? (after, before))
+		}
+
+		// The messages around `messageId`, up to `limit` (at most 100).
+		// Fails as every call does.
+		def messagesAround(channelId string, messageId string, limit int = 50) !Message[] {
+			return try listOf<Message>(try call(self, http.Method.GET, "/channels/{channelId}/messages?around={messageId}&limit={limit.clamp(1, 100)}"))
+		}
+
+		// One message of a channel. Fails with NotFound for an unknown one.
+		def message(channelId string, messageId string) !Message {
+			let out = Message{}
+			try decodeInto(try call(self, http.Method.GET, "/channels/{channelId}/messages/{messageId}"), out)
+			return out
+		}
+
+		// Sends a message: text (2000 characters), embeds, components
+		// (action rows of buttons and selects, or a layout of text, media
+		// and containers), files, as a reply to `replyTo`, with stickers or
+		// a poll. `silent` sends no push notification; `mentions` limits
+		// whom the text notifies.
+		// Fails with Invalid for a limit the message breaks (checked before
+		// sending), Auth without Send Messages, NotFound for an unknown
+		// channel.
+		def send(channelId string, content string = "", embeds Embed[] = [], components Component[] = [], files File[] = [], replyTo string = "", mentions ?AllowedMentions = none, stickers string[] = [], poll ?Poll = none, tts bool = false, silent bool = false, suppressEmbeds bool = false) !Message {
+			let draft = Draft{files: files, mentions: mentions}
+			draft.content = content when content.len() > 0
+			draft.embeds = embeds when embeds.len() > 0
+			draft.components = components when components.len() > 0
+			draft.flags = (silent ?? (flagSilent, 0)) | (suppressEmbeds ?? (flagSuppressEmbeds, 0))
+			draft.extra.set("tts", true) when tts
+			draft.extra.set("message_reference", map<string, any>{"message_id": replyTo, "fail_if_not_exists": false}) when replyTo.len() > 0
+			draft.extra.set("sticker_ids", texts(stickers)) when stickers.len() > 0
+			let asked = poll
+			draft.extra.set("poll", try pollBody(asked)) unless asked is none
+			let body = try draftBody(draft)
+			fail invalid("a message needs text, an embed, a component, a file, a sticker or a poll") when body.len() == 0 || body.len() == 1 && body.hasKey("allowed_mentions")
+			let out = Message{}
+			try decodeInto(try deliver(self, Call{method: http.Method.POST, path: "/channels/{channelId}/messages", body: body, files: uploads(files)}), out)
+			return out
+		}
+
+		// Forwards a message to `channelId`.
+		// Fails as every call does.
+		def forward(channelId string, fromChannelId string, messageId string) !Message {
+			let body = map<string, any>{"message_reference": map<string, any>{"type": 1, "message_id": messageId, "channel_id": fromChannelId}}
+			let out = Message{}
+			try decodeInto(try call(self, http.Method.POST, "/channels/{channelId}/messages", body), out)
+			return out
+		}
+
+		// Changes a message the bot sent; a none argument stays as it is.
+		// `keep` names the attachments that stay (none: all of them) beside
+		// the new `files`. Fails as `send` does, and with Auth for
+		// another's message.
+		def edit(channelId string, messageId string, content ?string = none, embeds ?Embed[] = none, components ?Component[] = none, files File[] = [], keep ?string[] = none, mentions ?AllowedMentions = none, suppressEmbeds ?bool = none) !Message {
+			let draft = Draft{content: content, embeds: embeds, components: components, files: files, keep: keep, mentions: mentions}
+			let suppress = suppressEmbeds
+			if !(suppress is none) {
+				draft.flags = suppress ?? (flagSuppressEmbeds, 0)
+				draft.hasFlags = true
+			}
+			let out = Message{}
+			try decodeInto(try deliver(self, Call{method: http.Method.PATCH, path: "/channels/{channelId}/messages/{messageId}", body: try draftBody(draft), files: uploads(files)}), out)
+			return out
+		}
+
+		// Deletes a message. Fails with Auth for another's message without
+		// Manage Messages.
+		def delete(channelId string, messageId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/channels/{channelId}/messages/{messageId}", none, reason))
+		}
+
+		// Deletes 2 to 100 messages younger than two weeks in one call.
+		// Fails with Invalid for fewer, more or older ones.
+		def delete(channelId string, messageIds string[], reason string = "") !none {
+			fail invalid("a bulk delete takes 2 to 100 messages, not {messageIds.len()}") when messageIds.len() < 2 || messageIds.len() > 100
+			return try discard(try call(self, http.Method.POST, "/channels/{channelId}/messages/bulk-delete", map<string, any>{"messages": texts(messageIds)}, reason))
+		}
+
+		// Publishes a message of an announcement channel to the channels
+		// that follow it.
+		// Fails as every call does.
+		def crosspost(channelId string, messageId string) !Message {
+			let out = Message{}
+			try decodeInto(try call(self, http.Method.POST, "/channels/{channelId}/messages/{messageId}/crosspost"), out)
+			return out
+		}
+
+		// Reacts to a message with `emoji`: a Unicode emoji, or `name:id` of
+		// a custom one.
+		// Fails as every call does.
+		def react(channelId string, messageId string, emoji string) !none {
+			return try discard(try call(self, http.Method.PUT, "/channels/{channelId}/messages/{messageId}/reactions/{emojiPath(emoji)}/@me"))
+		}
+
+		// Takes back the bot's reaction, or with `userId` another user's
+		// (which needs Manage Messages).
+		// Fails as every call does.
+		def unreact(channelId string, messageId string, emoji string, userId string = "@me") !none {
+			return try discard(try call(self, http.Method.DELETE, "/channels/{channelId}/messages/{messageId}/reactions/{emojiPath(emoji)}/{userId}"))
+		}
+
+		// The users who reacted with `emoji` (super reactions with `burst`).
+		def reactions(channelId string, messageId string, emoji string, burst bool = false) Pages<User> {
+			let client = self
+			let fetch = def (cursor string) !User[] {
+				let query = map<string, string>{"limit": "100", "type": burst ?? ("1", "0"), "after": cursor}
+				return try listOf<User>(try call(client, http.Method.GET, "/channels/{channelId}/messages/{messageId}/reactions/{emojiPath(emoji)}{queryOf(query)}"))
+			}
+			let id = def (u User) string {
+				return u.id
+			}
+			return new Pages<User>(fetch, id, 100)
+		}
+
+		// Removes every reaction of a message, or those of one `emoji`.
+		// Fails as every call does.
+		def clearReactions(channelId string, messageId string, emoji string = "") !none {
+			let path = "/channels/{channelId}/messages/{messageId}/reactions"
+			path += "/" + emojiPath(emoji) when emoji.len() > 0
+			return try discard(try call(self, http.Method.DELETE, path))
+		}
+
+		// Pins a message (at most 250 a channel). Needs Pin Messages.
+		// Fails as every call does.
+		def pin(channelId string, messageId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.PUT, "/channels/{channelId}/messages/pins/{messageId}", none, reason))
+		}
+
+		// Unpins a message. Needs Pin Messages.
+		// Fails as every call does.
+		def unpin(channelId string, messageId string, reason string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, "/channels/{channelId}/messages/pins/{messageId}", none, reason))
+		}
+
+		// The pinned messages of a channel, the latest pin first.
+		def pins(channelId string) Pages<Pin> {
+			let client = self
+			let fetch = def (cursor string) !Pin[] {
+				let page = PinPage{}
+				let query = map<string, string>{"limit": "50", "before": cursor}
+				try decodeInto(try call(client, http.Method.GET, "/channels/{channelId}/messages/pins{queryOf(query)}"), page)
+				return page.items
+			}
+			let at = def (p Pin) string {
+				return p.pinnedAt
+			}
+			return new Pages<Pin>(fetch, at, 50)
+		}
+
+		// Starts a thread from a message: `autoArchive` minutes of quiet
+		// before it archives (60, 1440, 4320, 10080; 0 for the channel's
+		// default).
+		// Fails as every call does.
+		def startThread(channelId string, messageId string, name string, autoArchive int = 0, slowMode int = 0, reason string = "") !Channel {
+			let body = map<string, any>{"name": name}
+			body.set("auto_archive_duration", autoArchive) when autoArchive > 0
+			body.set("rate_limit_per_user", slowMode) when slowMode > 0
+			let out = Channel{}
+			try decodeInto(try call(self, http.Method.POST, "/channels/{channelId}/messages/{messageId}/threads", body, reason), out)
+			return out
+		}
+
+		// Starts a thread with no message behind it: public, private
+		// (members join by invite, or by `invitable` members) or an
+		// announcement thread.
+		// Fails as every call does.
+		def startThread(channelId string, name string, kind ChannelType = ChannelType.PublicThread, autoArchive int = 0, invitable bool = true, slowMode int = 0, reason string = "") !Channel {
+			let body = map<string, any>{"name": name, "type": int(kind)}
+			body.set("auto_archive_duration", autoArchive) when autoArchive > 0
+			body.set("invitable", invitable) when kind == ChannelType.PrivateThread
+			body.set("rate_limit_per_user", slowMode) when slowMode > 0
+			let out = Channel{}
+			try decodeInto(try call(self, http.Method.POST, "/channels/{channelId}/threads", body, reason), out)
+			return out
+		}
+
+		// Starts a post of a forum or media channel: a thread opened by a
+		// message, with the channel's tags `tags`. Fails as `send` does.
+		def post(channelId string, name string, content string = "", embeds Embed[] = [], components Component[] = [], files File[] = [], tags string[] = [], autoArchive int = 0, slowMode int = 0, reason string = "") !Channel {
+			let draft = Draft{files: files}
+			draft.content = content when content.len() > 0
+			draft.embeds = embeds when embeds.len() > 0
+			draft.components = components when components.len() > 0
+			let body = map<string, any>{"name": name, "message": try draftBody(draft)}
+			body.set("applied_tags", texts(tags)) when tags.len() > 0
+			body.set("auto_archive_duration", autoArchive) when autoArchive > 0
+			body.set("rate_limit_per_user", slowMode) when slowMode > 0
+			let out = Channel{}
+			try decodeInto(try deliver(self, Call{method: http.Method.POST, path: "/channels/{channelId}/threads", body: body, files: uploads(files), reason: reason}), out)
+			return out
+		}
+
+		// Adds the bot to a thread.
+		// Fails as every call does.
+		def joinThread(threadId string) !none {
+			return try discard(try call(self, http.Method.PUT, "/channels/{threadId}/thread-members/@me"))
+		}
+
+		// Takes the bot out of a thread.
+		// Fails as every call does.
+		def leaveThread(threadId string) !none {
+			return try discard(try call(self, http.Method.DELETE, "/channels/{threadId}/thread-members/@me"))
+		}
+
+		// Adds a member to a thread. Needs the bot in the thread.
+		// Fails as every call does.
+		def addToThread(threadId string, userId string) !none {
+			return try discard(try call(self, http.Method.PUT, "/channels/{threadId}/thread-members/{userId}"))
+		}
+
+		// Takes a member out of a thread.
+		// Fails as every call does.
+		def removeFromThread(threadId string, userId string) !none {
+			return try discard(try call(self, http.Method.DELETE, "/channels/{threadId}/thread-members/{userId}"))
+		}
+
+		// A member of a thread, with its guild member.
+		// Fails as every call does.
+		def threadMember(threadId string, userId string) !ThreadMember {
+			let out = ThreadMember{}
+			try decodeInto(try call(self, http.Method.GET, "/channels/{threadId}/thread-members/{userId}?with_member=true"), out)
+			return out
+		}
+
+		// The members of a thread. Needs the Guild Members intent.
+		def threadMembers(threadId string) Pages<ThreadMember> {
+			let client = self
+			let fetch = def (cursor string) !ThreadMember[] {
+				let query = map<string, string>{"with_member": "true", "limit": "100", "after": cursor}
+				return try listOf<ThreadMember>(try call(client, http.Method.GET, "/channels/{threadId}/thread-members{queryOf(query)}"))
+			}
+			let id = def (m ThreadMember) string {
+				return m.userId
+			}
+			return new Pages<ThreadMember>(fetch, id, 100)
+		}
+
+		// The archived threads of a channel, the latest archived first:
+		// public ones, `private` ones (Manage Threads), or with `joined` the
+		// private ones the bot is in.
+		def archivedThreads(channelId string, private bool = false, joined bool = false) Pages<Channel> {
+			let client = self
+			let path = joined ?? ("/channels/{channelId}/users/@me/threads/archived/private", "/channels/{channelId}/threads/archived/{private ?? ("private", "public")}")
+			let fetch = def (cursor string) !Channel[] {
+				let page = ThreadPage{}
+				let query = map<string, string>{"limit": "100", "before": cursor}
+				try decodeInto(try call(client, http.Method.GET, path + queryOf(query)), page)
+				return page.threads
+			}
+			let at = def (c Channel) string {
+				let state = c.thread
+				return joined ?? (c.id, state is none ?? ("", state.archivedAt))
+			}
+			return new Pages<Channel>(fetch, at, 100)
+		}
+
+		// The active threads of a guild.
+		// Fails as every call does.
+		def activeThreads(guildId string) !Channel[] {
+			let page = ThreadPage{}
+			try decodeInto(try call(self, http.Method.GET, "/guilds/{guildId}/threads/active"), page)
+			return page.threads
+		}
+
+		// The bot's own user.
+		// Fails as every call does.
+		def me() !User {
+			let out = User{}
+			try decodeInto(try call(self, http.Method.GET, "/users/@me"), out)
+			return out
+		}
+
+		// The user `id`. Fails with NotFound for an unknown one.
+		def user(id string) !User {
+			let out = User{}
+			try decodeInto(try call(self, http.Method.GET, "/users/{id}"), out)
+			return out
+		}
+
+		// Changes the bot's user name, avatar or banner; "" or none keeps
+		// it.
+		// Fails as every call does.
+		def editMe(username string = "", avatar ?File = none, banner ?File = none) !User {
+			let body = new map<string, any>()
+			body.set("username", username) when username.len() > 0
+			let picture = avatar
+			body.set("avatar", dataURI(picture)) unless picture is none
+			let wide = banner
+			body.set("banner", dataURI(wide)) unless wide is none
+			let out = User{}
+			try decodeInto(try call(self, http.Method.PATCH, "/users/@me", body), out)
+			return out
+		}
+
+		// The direct-message channel with a user, opened when there is
+		// none; `send` to its id.
+		// Fails as every call does.
+		def dm(userId string) !Channel {
+			let out = Channel{}
+			try decodeInto(try call(self, http.Method.POST, "/users/@me/channels", map<string, any>{"recipient_id": userId}), out)
+			return out
+		}
+
+		// The guilds the bot is in (id, name, icon, owner, permissions,
+		// features, and approximate counts).
+		def guilds() Pages<Guild> {
+			let client = self
+			let fetch = def (cursor string) !Guild[] {
+				let query = map<string, string>{"limit": "200", "with_counts": "true", "after": cursor}
+				return try listOf<Guild>(try call(client, http.Method.GET, "/users/@me/guilds{queryOf(query)}"))
+			}
+			let id = def (g Guild) string {
+				return g.id
+			}
+			return new Pages<Guild>(fetch, id, 200)
+		}
+
+		// Takes the bot out of a guild.
+		// Fails as every call does.
+		def leaveGuild(guildId string) !none {
+			return try discard(try call(self, http.Method.DELETE, "/users/@me/guilds/{guildId}"))
+		}
+	}
+
+	internal struct PinPage {
+		items Pin[]
+		@json("has_more")
+		more bool
+	}
+
+	internal struct ThreadPage {
+		threads Channel[]
+		members ThreadMember[]
+		@json("has_more")
+		more bool
+	}
+
+	// An emoji as a path segment: the Unicode emoji escaped, or `name:id`.
+	internal def emojiPath(emoji string) string {
+		let bare = emoji.startsWith("<") && emoji.endsWith(">") ?? (emoji[1:emoji.len() - 1], emoji)
+		bare = bare[2:] when bare.startsWith("a:")
+		return url.pathEscape(bare)
+	}
+
+	// A picture as the data URI Discord takes for avatars, banners, icons
+	// and emojis.
+	internal def dataURI(f File) string {
+		let kind = f.contentType.len() > 0 ?? (f.contentType, "image/png")
+		return "data:{kind};base64,{base64encode(f.data)}"
+	}
+
+	// The JSON of a channel edit: the fields that are set.
+	internal def channelBody(c ChannelChanges) map<string, any> {
+		let body = new map<string, any>()
+		let name = c.name
+		body.set("name", name) unless name is none
+		let kind = c.kind
+		body.set("type", int(kind)) unless kind is none
+		let topic = c.topic
+		body.set("topic", topic) unless topic is none
+		let nsfw = c.nsfw
+		body.set("nsfw", nsfw) unless nsfw is none
+		let position = c.position
+		body.set("position", position) unless position is none
+		let slow = c.slowMode
+		body.set("rate_limit_per_user", slow) unless slow is none
+		let bitrate = c.bitrate
+		body.set("bitrate", bitrate) unless bitrate is none
+		let users = c.userLimit
+		body.set("user_limit", users) unless users is none
+		let parent = c.parentId
+		body.set("parent_id", parent) unless parent is none
+		let overwrites = c.overwrites
+		if !(overwrites is none) {
+			let list any[] = []
+			for let (_, o) in overwrites {
+				list.push(map<string, any>{"id": o.id, "type": int(o.kind), "allow": o.allow, "deny": o.deny})
+			}
+			body.set("permission_overwrites", list)
+		}
+		let region = c.rtcRegion
+		body.set("rtc_region", region) unless region is none
+		let quality = c.videoQualityMode
+		body.set("video_quality_mode", quality) unless quality is none
+		let archive = c.defaultAutoArchive
+		body.set("default_auto_archive_duration", archive) unless archive is none
+		let archived = c.archived
+		body.set("archived", archived) unless archived is none
+		let locked = c.locked
+		body.set("locked", locked) unless locked is none
+		let invitable = c.invitable
+		body.set("invitable", invitable) unless invitable is none
+		let auto = c.autoArchive
+		body.set("auto_archive_duration", auto) unless auto is none
+		let applied = c.appliedTags
+		body.set("applied_tags", texts(applied)) unless applied is none
+		let tags = c.availableTags
+		if !(tags is none) {
+			let list any[] = []
+			for let (_, t) in tags {
+				let tag = map<string, any>{"name": t.name, "moderated": t.moderated}
+				tag.set("id", t.id) when t.id.len() > 0
+				tag.set("emoji_id", t.emojiId) when t.emojiId.len() > 0
+				tag.set("emoji_name", t.emojiName) when t.emojiName.len() > 0
+				list.push(tag)
+			}
+			body.set("available_tags", list)
+		}
+		let threadSlow = c.defaultThreadSlowMode
+		body.set("default_thread_rate_limit_per_user", threadSlow) unless threadSlow is none
+		let order = c.defaultSortOrder
+		body.set("default_sort_order", order) unless order is none
+		let layout = c.defaultForumLayout
+		body.set("default_forum_layout", layout) unless layout is none
+		let flags = c.flags
+		body.set("flags", flags) unless flags is none
+		return body
+	}
+}

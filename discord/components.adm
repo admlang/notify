@@ -1,0 +1,474 @@
+partial module adm.notify.discord {
+	use std.data.encoding::(json)
+
+	// What a component is. Action rows hold buttons and selects (the
+	// classic layout); the rest (sections, text, media, separators,
+	// containers) lay out a whole message, which then carries no content
+	// or embeds; labels hold the inputs of a modal.
+	enum ComponentType {
+		ActionRow         = 1,
+		Button            = 2,
+		StringSelect      = 3,
+		TextInput         = 4,
+		UserSelect        = 5,
+		RoleSelect        = 6,
+		MentionableSelect = 7,
+		ChannelSelect     = 8,
+		Section           = 9,
+		TextDisplay       = 10,
+		Thumbnail         = 11,
+		MediaGallery      = 12,
+		File              = 13,
+		Separator         = 14,
+		Container         = 17,
+		Label             = 18,
+		FileUpload        = 19,
+	}
+
+	// How a button looks: Link opens `url`, Premium buys `skuId`, the rest
+	// send an interaction with the button's custom id.
+	enum ButtonStyle {
+		Primary   = 1,
+		Secondary = 2,
+		Success   = 3,
+		Danger    = 4,
+		Link      = 5,
+		Premium   = 6,
+	}
+
+	// One line or several, for a text input.
+	enum TextInputStyle {
+		Short     = 1,
+		Paragraph = 2,
+	}
+
+	// An emoji on a button or a select option: a Unicode one by `name`, a
+	// custom one by `id` (and its name).
+	struct ComponentEmoji {
+		@json(omitempty = true)
+		id string
+		@json(omitempty = true)
+		name string
+		@json(omitempty = true)
+		animated bool
+	}
+
+	// A choice of a string select.
+	struct SelectOption {
+		label string
+		value string
+		description string
+		emoji ?ComponentEmoji
+		// Chosen before the user picks.
+		@json("default")
+		selected bool
+	}
+
+	// A picture of a media gallery or a thumbnail: an `https://` address or
+	// `attachment://name`.
+	struct MediaItem {
+		url         string
+		description string
+		spoiler     bool
+	}
+
+	// The media a component shows, as Discord resolves it.
+	struct UnfurledMedia {
+		url string
+		@json("proxy_url")
+		proxyURL string
+		height int
+		width int
+		@json("content_type")
+		contentType string
+	}
+
+	// An item of a received media gallery.
+	struct GalleryItem {
+		media       UnfurledMedia
+		description string
+		spoiler     bool
+	}
+
+	// A component of a message or a modal, as built by `row`, `button`,
+	// `menu`, `input`, `text`, `section`, `container` and the other
+	// builders here, or as Discord returns it on a message or a modal
+	// submit (`value`, `values`).
+	struct Component {
+		@json("type")
+		kind ComponentType
+		// A number unique in the message; 0 lets Discord choose.
+		id int
+		@json("custom_id")
+		customId string
+		// A ButtonStyle, or a TextInputStyle.
+		@json("style")
+		variant int
+		label string
+		emoji ?ComponentEmoji
+		url string
+		@json("sku_id")
+		skuId string
+		disabled bool
+		options SelectOption[]
+		placeholder string
+		@json("min_values")
+		minValues int
+		@json("max_values")
+		maxValues int
+		@json("channel_types")
+		channelTypes int[]
+		// Users, roles or channels a select starts with: `id` and `type`
+		// ("user", "role", "channel").
+		@json("default_values")
+		defaults any[]
+		required bool
+		// What a text input holds (prefilled, or as submitted).
+		value string
+		// What a select or file upload submitted.
+		values string[]
+		@json("min_length")
+		minLength int
+		@json("max_length")
+		maxLength int
+		components Component[]
+		// The Markdown of a text display.
+		content string
+		accessory ?Component
+		media ?UnfurledMedia
+		description string
+		spoiler bool
+		items GalleryItem[]
+		file ?UnfurledMedia
+		divider bool
+		// 1 small, 2 large.
+		spacing int
+		@json("accent_color")
+		accentColor int
+		// The input a label holds.
+		@json("component")
+		child ?Component
+	}
+
+	// A modal the user fills in, answering an interaction
+	// (`Interaction.modal`): up to five labels holding text inputs,
+	// selects or file uploads, and text displays.
+	//
+	// ```
+	// let form = new discord.Modal("feedback", "Feedback")
+	// form.add(discord.label("What went wrong?", discord.input("what", variant = discord.TextInputStyle.Paragraph)))
+	// try interaction.modal(form)
+	// ```
+	type Modal {
+		customId   string
+		title      string
+		components Component[]
+
+		def new(customId string, title string, components ...Component) {
+			self.customId = customId
+			self.title = title
+			self.components = components
+		}
+
+		// Adds a component and returns the modal.
+		def add(c Component) Modal {
+			components.push(c)
+			return self
+		}
+	}
+
+	// A row of up to five buttons, or one select.
+	def row(items ...Component) Component {
+		return Component{kind: ComponentType.ActionRow, components: items}
+	}
+
+	// A button that sends an interaction with `customId` when clicked.
+	def button(label string, customId string, variant ButtonStyle = ButtonStyle.Primary, emoji string = "", disabled bool = false) Component {
+		return Component{kind: ComponentType.Button, label: label, customId: customId, variant: int(variant), emoji: emojiOf(emoji), disabled: disabled}
+	}
+
+	// A button that opens `url`.
+	def link(label string, url string, emoji string = "", disabled bool = false) Component {
+		return Component{kind: ComponentType.Button, label: label, url: url, variant: int(ButtonStyle.Link), emoji: emojiOf(emoji), disabled: disabled}
+	}
+
+	// A button that buys the SKU `skuId` of the application.
+	def purchase(skuId string, disabled bool = false) Component {
+		return Component{kind: ComponentType.Button, skuId: skuId, variant: int(ButtonStyle.Premium), disabled: disabled}
+	}
+
+	// A choice of a string select. `emoji` is a Unicode emoji, or
+	// `name:id` of a custom one.
+	def option(label string, value string, description string = "", emoji string = "", selected bool = false) SelectOption {
+		return SelectOption{label: label, value: value, description: description, emoji: emojiOf(emoji), selected: selected}
+	}
+
+	// A select of up to 25 choices, of which the user picks `min` to
+	// `max`.
+	def menu(customId string, options SelectOption[], placeholder string = "", min int = 1, max int = 1, disabled bool = false, required bool = true) Component {
+		return Component{kind: ComponentType.StringSelect, customId: customId, options: options, placeholder: placeholder, minValues: min, maxValues: max, disabled: disabled, required: required}
+	}
+
+	// A select Discord fills: users, roles, both (MentionableSelect) or
+	// channels (of `channelTypes`, all when empty). `defaults` are the ids
+	// chosen before the user picks.
+	def menu(kind ComponentType, customId string, placeholder string = "", min int = 1, max int = 1, channelTypes ChannelType[] = [], defaults string[] = [], disabled bool = false, required bool = true) Component {
+		let c = Component{kind: kind, customId: customId, placeholder: placeholder, minValues: min, maxValues: max, disabled: disabled, required: required}
+		for let (_, t) in channelTypes {
+			c.channelTypes.push(int(t))
+		}
+		let of = kind == ComponentType.RoleSelect ?? ("role", kind == ComponentType.ChannelSelect ?? ("channel", "user"))
+		for let (_, id) in defaults {
+			c.defaults.push(map<string, any>{"id": id, "type": of})
+		}
+		return c
+	}
+
+	// A text input of a modal; `max` 0 for Discord's 4000.
+	def input(customId string, variant TextInputStyle = TextInputStyle.Short, placeholder string = "", value string = "", required bool = true, min int = 0, max int = 0) Component {
+		return Component{kind: ComponentType.TextInput, customId: customId, variant: int(variant), placeholder: placeholder, value: value, required: required, minLength: min, maxLength: max}
+	}
+
+	// A file upload of a modal: `min` to `max` files (at most 10).
+	def upload(customId string, min int = 1, max int = 1, required bool = true) Component {
+		return Component{kind: ComponentType.FileUpload, customId: customId, minValues: min, maxValues: max, required: required}
+	}
+
+	// A label over the input, select or upload of a modal.
+	def label(title string, child Component, description string = "") Component {
+		return Component{kind: ComponentType.Label, label: title, description: description, child: child}
+	}
+
+	// Markdown text.
+	def text(content string) Component {
+		return Component{kind: ComponentType.TextDisplay, content: content}
+	}
+
+	// One to three lines of text with a button or a thumbnail beside them.
+	def section(accessory Component, lines ...string) Component {
+		let c = Component{kind: ComponentType.Section, accessory: accessory}
+		for let (_, line) in lines {
+			c.components.push(text(line))
+		}
+		return c
+	}
+
+	// A small picture, beside a section's text.
+	def thumbnail(url string, description string = "", spoiler bool = false) Component {
+		return Component{kind: ComponentType.Thumbnail, media: UnfurledMedia{url: url}, description: description, spoiler: spoiler}
+	}
+
+	// One to ten pictures in a grid.
+	def gallery(items ...MediaItem) Component {
+		let c = Component{kind: ComponentType.MediaGallery}
+		for let (_, m) in items {
+			c.items.push(GalleryItem{media: UnfurledMedia{url: m.url}, description: m.description, spoiler: m.spoiler})
+		}
+		return c
+	}
+
+	// A file sent with the message, shown in place: `name` is its file
+	// name (`attachment://name`).
+	def attached(name string, spoiler bool = false) Component {
+		return Component{kind: ComponentType.File, file: UnfurledMedia{url: "attachment://" + name}, spoiler: spoiler}
+	}
+
+	// Space between components, with a line when `divider`.
+	def separator(divider bool = true, large bool = false) Component {
+		return Component{kind: ComponentType.Separator, divider: divider, spacing: large ?? (2, 1)}
+	}
+
+	// A box around components, with a coloured bar (0xRRGGBB; -1 for none).
+	def container(items Component[], accentColor int = -1, spoiler bool = false) Component {
+		return Component{kind: ComponentType.Container, components: items, accentColor: accentColor, spoiler: spoiler}
+	}
+
+	// A component emoji from "😀", or "name:id" (with an `a:` before it for
+	// an animated one); none for "".
+	internal def emojiOf(text string) ?ComponentEmoji {
+		return none when text.len() == 0
+		let parts = text.split(":")
+		return ComponentEmoji{name: text} when parts.len() < 2
+		return ComponentEmoji{name: parts[1], id: parts[2], animated: parts[0] == "a"} when parts.len() == 3
+		return ComponentEmoji{name: parts[0], id: parts[1]}
+	}
+
+	// Whether `list` lays the message out with the newer components
+	// (anything but action rows at the top), which needs the
+	// IS_COMPONENTS_V2 flag.
+	internal def usesLayout(list Component[]) bool {
+		for let (_, c) in list {
+			return true unless c.kind == ComponentType.ActionRow
+		}
+		return false
+	}
+
+	// The JSON Discord takes for `c`.
+	internal def componentBody(c Component) map<string, any> {
+		let out = map<string, any>{"type": int(c.kind)}
+		out.set("id", c.id) when c.id > 0
+		match c.kind {
+			case ComponentType.ActionRow:
+				out.set("components", bodiesOf(c.components))
+			case ComponentType.Button:
+				out.set("style", c.variant)
+				out.set("label", c.label) when c.label.len() > 0
+				let e = c.emoji
+				out.set("emoji", emojiBody(e)) unless e is none
+				out.set("custom_id", c.customId) when c.customId.len() > 0
+				out.set("url", c.url) when c.url.len() > 0
+				out.set("sku_id", c.skuId) when c.skuId.len() > 0
+				out.set("disabled", true) when c.disabled
+			case ComponentType.TextInput:
+				out.set("custom_id", c.customId)
+				out.set("style", c.variant)
+				out.set("label", c.label) when c.label.len() > 0
+				out.set("placeholder", c.placeholder) when c.placeholder.len() > 0
+				out.set("value", c.value) when c.value.len() > 0
+				out.set("required", c.required)
+				out.set("min_length", c.minLength) when c.minLength > 0
+				out.set("max_length", c.maxLength) when c.maxLength > 0
+			case ComponentType.FileUpload:
+				out.set("custom_id", c.customId)
+				out.set("min_values", c.minValues)
+				out.set("max_values", c.maxValues)
+				out.set("required", c.required)
+			case ComponentType.Label:
+				out.set("label", c.label)
+				out.set("description", c.description) when c.description.len() > 0
+				let child = c.child
+				out.set("component", componentBody(child)) unless child is none
+			case ComponentType.TextDisplay:
+				out.set("content", c.content)
+			case ComponentType.Section:
+				out.set("components", bodiesOf(c.components))
+				let side = c.accessory
+				out.set("accessory", componentBody(side)) unless side is none
+			case ComponentType.Thumbnail:
+				let m = c.media
+				out.set("media", map<string, any>{"url": m.url}) unless m is none
+				out.set("description", c.description) when c.description.len() > 0
+				out.set("spoiler", true) when c.spoiler
+			case ComponentType.MediaGallery:
+				let items any[] = []
+				for let (_, item) in c.items {
+					let entry = map<string, any>{"media": map<string, any>{"url": item.media.url}}
+					entry.set("description", item.description) when item.description.len() > 0
+					entry.set("spoiler", true) when item.spoiler
+					items.push(entry)
+				}
+				out.set("items", items)
+			case ComponentType.File:
+				let f = c.file
+				out.set("file", map<string, any>{"url": f.url}) unless f is none
+				out.set("spoiler", true) when c.spoiler
+			case ComponentType.Separator:
+				out.set("divider", c.divider)
+				out.set("spacing", c.spacing > 0 ?? (c.spacing, 1))
+			case ComponentType.Container:
+				out.set("components", bodiesOf(c.components))
+				out.set("accent_color", c.accentColor) when c.accentColor >= 0
+				out.set("spoiler", true) when c.spoiler
+			default:
+				// The selects.
+				out.set("custom_id", c.customId)
+				out.set("placeholder", c.placeholder) when c.placeholder.len() > 0
+				out.set("min_values", c.minValues)
+				out.set("max_values", c.maxValues)
+				out.set("disabled", true) when c.disabled
+				out.set("required", c.required) unless c.required
+				if c.kind == ComponentType.StringSelect {
+					let options any[] = []
+					for let (_, o) in c.options {
+						let entry = map<string, any>{"label": o.label, "value": o.value}
+						entry.set("description", o.description) when o.description.len() > 0
+						let e = o.emoji
+						entry.set("emoji", emojiBody(e)) unless e is none
+						entry.set("default", true) when o.selected
+						options.push(entry)
+					}
+					out.set("options", options)
+				}
+				if c.channelTypes.len() > 0 {
+					let types any[] = []
+					for let (_, t) in c.channelTypes {
+						types.push(t)
+					}
+					out.set("channel_types", types)
+				}
+				out.set("default_values", c.defaults) when c.defaults.len() > 0
+		}
+		return out
+	}
+
+	internal def bodiesOf(list Component[]) any[] {
+		let items any[] = []
+		for let (_, child) in list {
+			items.push(componentBody(child))
+		}
+		return items
+	}
+
+	internal def emojiBody(e ComponentEmoji) map<string, any> {
+		let out = new map<string, any>()
+		out.set("id", e.id) when e.id.len() > 0
+		out.set("name", e.name) when e.name.len() > 0
+		out.set("animated", true) when e.animated
+		return out
+	}
+
+	// The first of Discord's component limits that `list` breaks, "" when
+	// none: five action rows of five buttons or one select, 25 options,
+	// custom ids of 100 characters, labels of 80, 40 components in a
+	// layout.
+	internal def componentProblem(list Component[]) string {
+		let layout = usesLayout(list)
+		return "a message takes at most 5 action rows, not {list.len()}" when !layout && list.len() > 5
+		let count = countOf(list)
+		return "a message takes at most 40 components, not {count}" when count > 40
+		for let (k, c) in list {
+			let problem = oneProblem(c, "component {k}")
+			return problem when problem.len() > 0
+		}
+		return ""
+	}
+
+	internal def countOf(list Component[]) int {
+		let n = 0
+		for let (_, c) in list {
+			n += 1 + countOf(c.components)
+			let side = c.accessory
+			n += 1 unless side is none
+		}
+		return n
+	}
+
+	internal def oneProblem(c Component, at string) string {
+		return "{at}: the custom id is longer than 100 characters" when c.customId.len() > 100
+		return "{at}: the label is longer than 80 characters" when c.kind == ComponentType.Button && c.label.len() > 80
+		return "{at}: the placeholder is longer than 150 characters" when c.placeholder.len() > 150
+		if c.kind == ComponentType.ActionRow {
+			return "{at}: an action row holds 1 to 5 components, not {c.components.len()}" when c.components.len() == 0 || c.components.len() > 5
+			let selects = 0
+			for let (_, child) in c.components {
+				selects++ unless child.kind == ComponentType.Button
+			}
+			return "{at}: a select takes a row of its own" when selects > 0 && c.components.len() > 1
+		}
+		if c.kind == ComponentType.Button {
+			let linked = c.variant == int(ButtonStyle.Link)
+			return "{at}: a link button needs a url and no custom id" when linked && (c.url.len() == 0 || c.customId.len() > 0)
+			let bought = c.variant == int(ButtonStyle.Premium)
+			return "{at}: a premium button needs a SKU" when bought && c.skuId.len() == 0
+			return "{at}: a button needs a custom id" when !linked && !bought && c.customId.len() == 0
+		}
+		return "{at}: a select offers 1 to 25 options, not {c.options.len()}" when c.kind == ComponentType.StringSelect && (c.options.len() == 0 || c.options.len() > 25)
+		return "{at}: a section holds 1 to 3 texts" when c.kind == ComponentType.Section && (c.components.len() == 0 || c.components.len() > 3)
+		return "{at}: a gallery holds 1 to 10 pictures" when c.kind == ComponentType.MediaGallery && (c.items.len() == 0 || c.items.len() > 10)
+		for let (k, child) in c.components {
+			let problem = oneProblem(child, "{at}.{k}")
+			return problem when problem.len() > 0
+		}
+		return ""
+	}
+}

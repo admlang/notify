@@ -1,0 +1,741 @@
+// The objects the API hands back, as Discord's JSON names them. Ids are
+// snowflakes kept as text (`createdAt(id)` reads their time); timestamps
+// are ISO 8601 text; a field Discord leaves out holds its zero value.
+partial module adm.notify.discord {
+	use std.data.encoding::(json)
+
+	// A Discord account, a person's or a bot's.
+	struct User {
+		id string
+		username string
+		// "0" for accounts that moved to unique user names.
+		discriminator string
+		// The display name; "" when the account has none.
+		@json("global_name")
+		globalName string
+		// The avatar's hash (`avatarURL` makes its address).
+		avatar string
+		bot bool
+		system bool
+		banner string
+		@json("accent_color")
+		accentColor int
+		locale string
+		verified bool
+		email string
+		flags int
+		@json("premium_type")
+		premiumType int
+		@json("public_flags")
+		publicFlags int
+	}
+
+	// A user as a member of one guild.
+	struct Member {
+		// Missing in the member objects that ride on a message or a
+		// gateway event of the same user.
+		user ?User
+		nick string
+		avatar string
+		banner string
+		roles string[]
+		@json("joined_at")
+		joinedAt string
+		@json("premium_since")
+		premiumSince string
+		deaf bool
+		mute bool
+		flags int
+		pending bool
+		// The member's permissions in the channel of an interaction.
+		permissions string
+		// Until when the member is timed out; "" for not.
+		@json("communication_disabled_until")
+		timedOutUntil string
+	}
+
+	// A guild role. `permissions` is the bit set as decimal text;
+	// `new Permissions(role.permissions)` reads it.
+	struct Role {
+		id string
+		name string
+		color int
+		hoist bool
+		icon string
+		@json("unicode_emoji")
+		unicodeEmoji string
+		position int
+		permissions string
+		managed bool
+		mentionable bool
+		flags int
+		tags map<string, any>
+	}
+
+	// What a channel's permission overwrite applies to.
+	enum OverwriteType {
+		Role   = 0,
+		Member = 1,
+	}
+
+	// The permissions a channel allows and denies one role or member
+	// beyond the guild's.
+	struct Overwrite {
+		id string
+		@json("type")
+		kind OverwriteType
+		allow string
+		deny string
+	}
+
+	// What a channel is.
+	enum ChannelType {
+		GuildText          = 0,
+		DM                 = 1,
+		GuildVoice         = 2,
+		GroupDM            = 3,
+		GuildCategory      = 4,
+		GuildAnnouncement  = 5,
+		AnnouncementThread = 10,
+		PublicThread       = 11,
+		PrivateThread      = 12,
+		GuildStageVoice    = 13,
+		GuildDirectory     = 14,
+		GuildForum         = 15,
+		GuildMedia         = 16,
+	}
+
+	// The state of a thread.
+	struct ThreadMetadata {
+		archived bool
+		// Minutes without activity before the thread archives: 60, 1440,
+		// 4320 or 10080.
+		@json("auto_archive_duration")
+		autoArchiveDuration int
+		@json("archive_timestamp")
+		archivedAt string
+		locked bool
+		invitable bool
+		@json("create_timestamp")
+		createdAt string
+	}
+
+	// A user in a thread.
+	struct ThreadMember {
+		// The thread's id.
+		id string
+		@json("user_id")
+		userId string
+		@json("join_timestamp")
+		joinedAt string
+		flags int
+		member ?Member
+	}
+
+	// A tag a forum or media channel offers its posts.
+	struct ForumTag {
+		id string
+		name string
+		moderated bool
+		@json("emoji_id")
+		emojiId string
+		@json("emoji_name")
+		emojiName string
+	}
+
+	// A guild channel, a direct message, or a thread.
+	struct Channel {
+		id string
+		@json("type")
+		kind ChannelType
+		@json("guild_id")
+		guildId string
+		position int
+		@json("permission_overwrites")
+		overwrites Overwrite[]
+		name string
+		topic string
+		nsfw bool
+		@json("last_message_id")
+		lastMessageId string
+		bitrate int
+		@json("user_limit")
+		userLimit int
+		// Seconds a member waits between messages (slow mode).
+		@json("rate_limit_per_user")
+		slowMode int
+		recipients User[]
+		icon string
+		@json("owner_id")
+		ownerId string
+		@json("application_id")
+		applicationId string
+		// The category of a guild channel, the channel of a thread.
+		@json("parent_id")
+		parentId string
+		@json("last_pin_timestamp")
+		lastPinAt string
+		@json("rtc_region")
+		rtcRegion string
+		@json("video_quality_mode")
+		videoQualityMode int
+		@json("message_count")
+		messageCount int
+		@json("member_count")
+		memberCount int
+		@json("thread_metadata")
+		thread ?ThreadMetadata
+		// The bot's membership of a thread.
+		member ?ThreadMember
+		@json("default_auto_archive_duration")
+		defaultAutoArchive int
+		// The bot's permissions in the channel, in interactions.
+		permissions string
+		flags int
+		@json("total_message_sent")
+		totalMessages int
+		@json("available_tags")
+		availableTags ForumTag[]
+		@json("applied_tags")
+		appliedTags string[]
+		@json("default_thread_rate_limit_per_user")
+		defaultThreadSlowMode int
+		@json("default_sort_order")
+		defaultSortOrder int
+		@json("default_forum_layout")
+		defaultForumLayout int
+	}
+
+	// What a message is: a plain one, a reply, a system message.
+	enum MessageType {
+		Default                  = 0,
+		RecipientAdd             = 1,
+		RecipientRemove          = 2,
+		Call                     = 3,
+		ChannelNameChange        = 4,
+		ChannelIconChange        = 5,
+		ChannelPinnedMessage     = 6,
+		UserJoin                 = 7,
+		Boost                    = 8,
+		BoostTier1               = 9,
+		BoostTier2               = 10,
+		BoostTier3               = 11,
+		ChannelFollowAdd         = 12,
+		ThreadCreated            = 18,
+		Reply                    = 19,
+		ChatInputCommand         = 20,
+		ThreadStarterMessage     = 21,
+		GuildInviteReminder      = 22,
+		ContextMenuCommand       = 23,
+		AutoModerationAction     = 24,
+		RoleSubscriptionPurchase = 25,
+		StageStart               = 27,
+		StageEnd                 = 28,
+		StageSpeaker             = 29,
+		StageTopic               = 31,
+		PollResult               = 46,
+	}
+
+	// A file a message carries.
+	struct Attachment {
+		id string
+		filename string
+		title string
+		description string
+		@json("content_type")
+		contentType string
+		size int
+		url string
+		@json("proxy_url")
+		proxyURL string
+		height int
+		width int
+		ephemeral bool
+		// Seconds of a voice message.
+		@json("duration_secs")
+		seconds float
+		flags int
+	}
+
+	// What a message replies to or forwards.
+	struct MessageReference {
+		// 0 a reply, 1 a forward.
+		@json("type")
+		kind int
+		@json("message_id")
+		messageId string
+		@json("channel_id")
+		channelId string
+		@json("guild_id")
+		guildId string
+	}
+
+	// An emoji: a guild's own (with an id) or a Unicode one (name only).
+	struct Emoji {
+		id string
+		name string
+		roles string[]
+		user ?User
+		@json("require_colons")
+		requireColons bool
+		managed bool
+		animated bool
+		available bool
+	}
+
+	// The reactions of one emoji on a message.
+	struct Reaction {
+		count int
+		// Whether the bot is among them.
+		me bool
+		emoji Emoji
+		@json("count_details")
+		details map<string, any>
+	}
+
+	// What a sticker is drawn in: 1 PNG, 2 APNG, 3 Lottie, 4 GIF.
+	struct StickerItem {
+		id string
+		name string
+		@json("format_type")
+		format int
+	}
+
+	// A sticker: one of Discord's packs (type 1) or a guild's (type 2).
+	struct Sticker {
+		id string
+		@json("pack_id")
+		packId string
+		name string
+		description string
+		// Autocomplete words, comma separated.
+		tags string
+		@json("type")
+		kind int
+		@json("format_type")
+		format int
+		available bool
+		@json("guild_id")
+		guildId string
+		user ?User
+		@json("sort_value")
+		sortValue int
+	}
+
+	// A pack of Discord's stickers.
+	struct StickerPack {
+		id string
+		stickers Sticker[]
+		name string
+		@json("sku_id")
+		skuId string
+		@json("cover_sticker_id")
+		coverStickerId string
+		description string
+		@json("banner_asset_id")
+		bannerAssetId string
+	}
+
+	// A message.
+	struct Message {
+		id string
+		@json("channel_id")
+		channelId string
+		// Set on messages the Gateway delivers and on replies of guild
+		// channels.
+		@json("guild_id")
+		guildId string
+		author User
+		// The author as a member, on guild messages the Gateway delivers.
+		member ?Member
+		content string
+		timestamp string
+		@json("edited_timestamp")
+		editedAt string
+		tts bool
+		@json("mention_everyone")
+		mentionEveryone bool
+		mentions User[]
+		@json("mention_roles")
+		mentionRoles string[]
+		attachments Attachment[]
+		embeds Embed[]
+		reactions Reaction[]
+		pinned bool
+		@json("webhook_id")
+		webhookId string
+		@json("type")
+		kind MessageType
+		@json("application_id")
+		applicationId string
+		@json("message_reference")
+		reference ?MessageReference
+		flags int
+		@json("referenced_message")
+		referenced ?Message
+		// The thread the message started.
+		thread ?Channel
+		// The components as Discord sent them (objects of `type`,
+		// `custom_id`, ...).
+		components any[]
+		@json("sticker_items")
+		stickers StickerItem[]
+		poll map<string, any>
+		@json("interaction_metadata")
+		interaction map<string, any>
+		@json("message_snapshots")
+		snapshots any[]
+	}
+
+	// A guild. The guilds of `Client.guilds()` carry only id, name, icon,
+	// owner, permissions and features; GUILD_CREATE adds the members,
+	// channels, threads, presences and voice states the bot may see.
+	struct Guild {
+		id string
+		name string
+		icon string
+		splash string
+		@json("discovery_splash")
+		discoverySplash string
+		// Whether the bot owns it (in `Client.guilds()`).
+		owner bool
+		@json("owner_id")
+		ownerId string
+		// The bot's permissions (in `Client.guilds()`).
+		permissions string
+		@json("afk_channel_id")
+		afkChannelId string
+		@json("afk_timeout")
+		afkTimeout int
+		@json("verification_level")
+		verificationLevel int
+		@json("default_message_notifications")
+		defaultNotifications int
+		@json("explicit_content_filter")
+		explicitContentFilter int
+		roles Role[]
+		emojis Emoji[]
+		features string[]
+		@json("mfa_level")
+		mfaLevel int
+		@json("system_channel_id")
+		systemChannelId string
+		@json("system_channel_flags")
+		systemChannelFlags int
+		@json("rules_channel_id")
+		rulesChannelId string
+		@json("max_members")
+		maxMembers int
+		@json("vanity_url_code")
+		vanityCode string
+		description string
+		banner string
+		@json("premium_tier")
+		premiumTier int
+		@json("premium_subscription_count")
+		boosts int
+		@json("preferred_locale")
+		preferredLocale string
+		@json("public_updates_channel_id")
+		publicUpdatesChannelId string
+		@json("approximate_member_count")
+		approximateMembers int
+		@json("approximate_presence_count")
+		approximatePresences int
+		@json("nsfw_level")
+		nsfwLevel int
+		stickers Sticker[]
+		@json("safety_alerts_channel_id")
+		safetyAlertsChannelId string
+		@json("joined_at")
+		joinedAt string
+		large bool
+		// An outage keeps the guild from the bot.
+		unavailable bool
+		@json("member_count")
+		memberCount int
+		members Member[]
+		channels Channel[]
+		threads Channel[]
+		presences Presence[]
+		@json("voice_states")
+		voiceStates VoiceState[]
+		@json("guild_scheduled_events")
+		scheduledEvents ScheduledEvent[]
+	}
+
+	// A banned user.
+	struct Ban {
+		reason string
+		user   User
+	}
+
+	// What a scheduled event takes place in: 1 a stage, 2 a voice
+	// channel, 3 elsewhere (`location`).
+	enum EventEntity {
+		Stage    = 1,
+		Voice    = 2,
+		External = 3,
+	}
+
+	// 1 scheduled, 2 active, 3 completed, 4 canceled.
+	enum EventStatus {
+		Scheduled = 1,
+		Active    = 2,
+		Completed = 3,
+		Canceled  = 4,
+	}
+
+	// A guild's scheduled event.
+	struct ScheduledEvent {
+		id string
+		@json("guild_id")
+		guildId string
+		@json("channel_id")
+		channelId string
+		@json("creator_id")
+		creatorId string
+		name string
+		description string
+		@json("scheduled_start_time")
+		startsAt string
+		@json("scheduled_end_time")
+		endsAt string
+		@json("privacy_level")
+		privacyLevel int
+		status EventStatus
+		@json("entity_type")
+		entity EventEntity
+		@json("entity_id")
+		entityId string
+		// `location` of an External event.
+		@json("entity_metadata")
+		metadata map<string, any>
+		creator ?User
+		@json("user_count")
+		userCount int
+		image string
+		@json("recurrence_rule")
+		recurrence map<string, any>
+	}
+
+	// A user who is interested in a scheduled event.
+	struct EventUser {
+		@json("guild_scheduled_event_id")
+		eventId string
+		user User
+		member ?Member
+	}
+
+	// One change an audit-log entry records.
+	struct AuditChange {
+		key string
+		@json("new_value")
+		newValue any
+		@json("old_value")
+		oldValue any
+	}
+
+	// An action of the audit log.
+	struct AuditEntry {
+		id string
+		@json("target_id")
+		targetId string
+		changes AuditChange[]
+		@json("user_id")
+		userId string
+		// The audit log event: 1 guild update, 10–12 channels, 20–28
+		// members, 30–32 roles, 72–75 messages, ... (`AuditAction`).
+		@json("action_type")
+		action int
+		options map<string, any>
+		reason string
+	}
+
+	// The audit log events `Client.auditLog` filters by.
+	enum AuditAction {
+		GuildUpdate            = 1,
+		ChannelCreate          = 10,
+		ChannelUpdate          = 11,
+		ChannelDelete          = 12,
+		OverwriteCreate        = 13,
+		OverwriteUpdate        = 14,
+		OverwriteDelete        = 15,
+		MemberKick             = 20,
+		MemberPrune            = 21,
+		MemberBanAdd           = 22,
+		MemberBanRemove        = 23,
+		MemberUpdate           = 24,
+		MemberRoleUpdate       = 25,
+		MemberMove             = 26,
+		MemberDisconnect       = 27,
+		BotAdd                 = 28,
+		RoleCreate             = 30,
+		RoleUpdate             = 31,
+		RoleDelete             = 32,
+		InviteCreate           = 40,
+		InviteUpdate           = 41,
+		InviteDelete           = 42,
+		WebhookCreate          = 50,
+		WebhookUpdate          = 51,
+		WebhookDelete          = 52,
+		EmojiCreate            = 60,
+		EmojiUpdate            = 61,
+		EmojiDelete            = 62,
+		MessageDelete          = 72,
+		MessageBulkDelete      = 73,
+		MessagePin             = 74,
+		MessageUnpin           = 75,
+		IntegrationCreate      = 80,
+		IntegrationUpdate      = 81,
+		IntegrationDelete      = 82,
+		StageCreate            = 83,
+		StageUpdate            = 84,
+		StageDelete            = 85,
+		StickerCreate          = 90,
+		StickerUpdate          = 91,
+		StickerDelete          = 92,
+		EventCreate            = 100,
+		EventUpdate            = 101,
+		EventDelete            = 102,
+		ThreadCreate           = 110,
+		ThreadUpdate           = 111,
+		ThreadDelete           = 112,
+		CommandPermissionUpdate = 121,
+		AutoModerationRuleCreate = 140,
+		AutoModerationRuleUpdate = 141,
+		AutoModerationRuleDelete = 142,
+		AutoModerationBlock    = 143,
+	}
+
+	// A page of the audit log: its entries and the objects they name.
+	struct AuditLog {
+		@json("audit_log_entries")
+		entries AuditEntry[]
+		users User[]
+		threads Channel[]
+		@json("guild_scheduled_events")
+		events ScheduledEvent[]
+		webhooks any[]
+		integrations any[]
+	}
+
+	// An invite to a guild channel.
+	struct Invite {
+		code string
+		guild ?Guild
+		channel ?Channel
+		inviter ?User
+		@json("approximate_member_count")
+		approximateMembers int
+		@json("expires_at")
+		expiresAt string
+		uses int
+		@json("max_uses")
+		maxUses int
+		// Seconds the invite lasts; 0 for ever.
+		@json("max_age")
+		maxAge int
+		temporary bool
+		@json("created_at")
+		createdAt string
+	}
+
+	// What a user is doing: playing (0), streaming (1), listening (2),
+	// watching (3), a custom status (4), competing (5).
+	struct Activity {
+		name string
+		@json("type")
+		kind int
+		url string
+		@json("created_at")
+		createdAt int64
+		@json("application_id")
+		applicationId string
+		details string
+		state string
+		timestamps map<string, any>
+		emoji map<string, any>
+	}
+
+	// A user's presence in a guild: `status` is online, idle, dnd or
+	// offline.
+	struct Presence {
+		// Only `id` is sure to be set.
+		user User
+		@json("guild_id")
+		guildId string
+		status string
+		activities Activity[]
+		// The status per client: `desktop`, `mobile`, `web`.
+		@json("client_status")
+		clientStatus map<string, any>
+	}
+
+	// A user's voice connection state.
+	struct VoiceState {
+		@json("guild_id")
+		guildId string
+		// "" once the user left voice.
+		@json("channel_id")
+		channelId string
+		@json("user_id")
+		userId string
+		member ?Member
+		@json("session_id")
+		sessionId string
+		deaf bool
+		mute bool
+		@json("self_deaf")
+		selfDeaf bool
+		@json("self_mute")
+		selfMute bool
+		@json("self_stream")
+		selfStream bool
+		@json("self_video")
+		selfVideo bool
+		suppress bool
+		@json("request_to_speak_timestamp")
+		requestToSpeakAt string
+	}
+
+	// A bot's application.
+	struct Application {
+		id string
+		name string
+		icon string
+		description string
+		@json("bot_public")
+		botPublic bool
+		owner ?User
+		// The hex Ed25519 public key interactions are signed with.
+		@json("verify_key")
+		verifyKey string
+		flags int
+		@json("approximate_guild_count")
+		approximateGuilds int
+		@json("interactions_endpoint_url")
+		interactionsURL string
+	}
+
+	// How a bot may start sessions on the Gateway.
+	struct SessionStartLimit {
+		total int
+		remaining int
+		// Milliseconds until `remaining` fills up.
+		@json("reset_after")
+		resetAfter int
+		// Shards that may identify in the same five seconds.
+		@json("max_concurrency")
+		maxConcurrency int
+	}
+
+	// The Gateway's address for a bot, its recommended shard count and its
+	// session limits.
+	struct GatewayBot {
+		url string
+		shards int
+		@json("session_start_limit")
+		limit SessionStartLimit
+	}
+}

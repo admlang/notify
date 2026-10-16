@@ -1,0 +1,324 @@
+partial module adm.notify.discord {
+	use (
+		std.net.http
+		std.data.encoding::(json)
+	)
+
+	// Where a command shows: a slash command, or an entry of the menu of a
+	// user or a message.
+	enum CommandType {
+		ChatInput         = 1,
+		User              = 2,
+		Message           = 3,
+		// The command that launches an activity.
+		PrimaryEntryPoint = 4,
+	}
+
+	// What an option of a slash command takes.
+	enum OptionType {
+		Subcommand      = 1,
+		SubcommandGroup = 2,
+		Text            = 3,
+		Integer         = 4,
+		Boolean         = 5,
+		User            = 6,
+		Channel         = 7,
+		Role            = 8,
+		// A user or a role.
+		Mentionable     = 9,
+		Number          = 10,
+		Attachment      = 11,
+	}
+
+	// Where a command may be used: in guilds, in direct messages with the
+	// bot, in other direct messages and group chats (for user installs).
+	enum CommandContext {
+		Guild          = 0,
+		BotDM          = 1,
+		PrivateChannel = 2,
+	}
+
+	// How an application is installed: to a guild, or to a user's account.
+	enum InstallType {
+		Guild = 0,
+		User  = 1,
+	}
+
+	// A value an option offers: text, an integer or a number.
+	struct Choice {
+		name string
+		value any
+		@json("name_localizations")
+		nameLocalizations map<string, string>
+	}
+
+	// A choice of `name` for `value` (text, an integer or a number).
+	def choice(name string, value any) Choice {
+		return Choice{name: name, value: value}
+	}
+
+	// An option of a slash command, or one of its subcommands.
+	type CommandOption {
+		@json("type")
+		kind OptionType
+		name string
+		description string
+		required bool
+		choices Choice[]
+		options CommandOption[]
+		@json("channel_types")
+		channelTypes int[]
+		@json("min_value")
+		minValue ?float
+		@json("max_value")
+		maxValue ?float
+		@json("min_length")
+		minLength ?int
+		@json("max_length")
+		maxLength ?int
+		autocomplete bool
+		@json("name_localizations")
+		nameLocalizations map<string, string>
+		@json("description_localizations")
+		descriptionLocalizations map<string, string>
+
+		def new(kind OptionType = OptionType.Text, name string = "", description string = "") {
+			self.kind = kind
+			self.name = name
+			self.description = description
+		}
+	}
+
+	// An application command: a slash command (with options and
+	// subcommands), or an entry of the user or message menu. Built here and
+	// registered with `Client.registerCommands`; the registered ones come
+	// back with their `id`.
+	//
+	// ```
+	// let roll = new discord.Command("roll", "Roll dice")
+	// roll.option(discord.OptionType.Integer, "sides", "How many sides", required = true, min = 2.0, max = 100.0)
+	// try bot.registerCommands([roll])
+	// ```
+	type Command {
+		id string
+		@json("application_id")
+		applicationId string
+		// "" for a global command.
+		@json("guild_id")
+		guildId string
+		name string
+		description string
+		@json("type")
+		kind CommandType
+		options CommandOption[]
+		// Who may use it unless a guild says otherwise: the permissions as
+		// decimal text, "0" for administrators only, "" for everyone.
+		@json("default_member_permissions")
+		defaultPermissions string
+		nsfw bool
+		contexts int[]
+		@json("integration_types")
+		installTypes int[]
+		@json("name_localizations")
+		nameLocalizations map<string, string>
+		@json("description_localizations")
+		descriptionLocalizations map<string, string>
+		version string
+
+		// A command of `name` (1 to 32 lower-case characters for a slash
+		// command); a menu entry takes no description.
+		def new(name string = "", description string = "", kind CommandType = CommandType.ChatInput) {
+			self.name = name
+			self.description = description
+			self.kind = kind
+		}
+
+		// Adds an option and returns the command: `min` and `max` bound a
+		// number (Integer, Number), `minLength` and `maxLength` a text,
+		// `channelTypes` the channels a Channel option offers;
+		// `autocomplete` asks the bot for choices as the user types.
+		def option(kind OptionType, name string, description string, required bool = false, choices Choice[] = [], autocomplete bool = false, min ?float = none, max ?float = none, minLength ?int = none, maxLength ?int = none, channelTypes ChannelType[] = []) Command {
+			let o = new CommandOption(kind, name, description)
+			o.required = required
+			o.choices = choices
+			o.autocomplete = autocomplete
+			o.minValue = min
+			o.maxValue = max
+			o.minLength = minLength
+			o.maxLength = maxLength
+			for let (_, t) in channelTypes {
+				o.channelTypes.push(int(t))
+			}
+			options.push(o)
+			return self
+		}
+
+		// Adds `sub` as a subcommand, or as a group when `sub` holds
+		// subcommands itself, and returns the command.
+		def subcommand(sub Command) Command {
+			let grouped = false
+			for let (_, o) in sub.options {
+				grouped = true when o.kind == OptionType.Subcommand
+			}
+			let o = new CommandOption(grouped ?? (OptionType.SubcommandGroup, OptionType.Subcommand), sub.name, sub.description)
+			o.options = sub.options
+			o.nameLocalizations = sub.nameLocalizations
+			o.descriptionLocalizations = sub.descriptionLocalizations
+			options.push(o)
+			return self
+		}
+
+		// Lets only members with `list` use the command (none: only
+		// administrators), and returns it.
+		def permissions(list ...Permission) Command {
+			let granted = new Permissions("")
+			defaultPermissions = granted.add(...list).str()
+			return self
+		}
+
+		// Where the command may be used, and for which installs; returns the
+		// command.
+		def availability(contexts CommandContext[], installs InstallType[] = [InstallType.Guild]) Command {
+			self.contexts = int[]
+			for let (_, c) in contexts {
+				self.contexts.push(int(c))
+			}
+			installTypes = int[]
+			for let (_, i) in installs {
+				installTypes.push(int(i))
+			}
+			return self
+		}
+	}
+
+	// Who may use a command in one guild, beyond its defaults.
+	struct CommandPermissions {
+		// The command's id, or the application's for every command.
+		id string
+		@json("application_id")
+		applicationId string
+		@json("guild_id")
+		guildId string
+		// `id` (a role, a user, a channel), `type` (1, 2, 3) and
+		// `permission` (allowed or not).
+		permissions any[]
+	}
+
+	partial type Client {
+		// The commands of the application: global ones, or a guild's.
+		// Fails as every call does.
+		def commands(guildId string = "") !Command[] {
+			return try listOf<Command>(try call(self, http.Method.GET, try commandsPath(self, guildId) + "?with_localizations=true"))
+		}
+
+		// Makes `list` the application's commands (global ones, or a
+		// guild's), replacing those there were; returns them with their ids.
+		// Global commands reach every guild at once; a guild's suit
+		// development. Fails with Invalid for a command Discord refuses.
+		def registerCommands(list Command[], guildId string = "") !Command[] {
+			let body any[] = []
+			for let (_, c) in list {
+				body.push(commandBody(c))
+			}
+			return try listOf<Command>(try call(self, http.Method.PUT, try commandsPath(self, guildId), body))
+		}
+
+		// Adds a command, or replaces the one of its name.
+		// Fails as every call does.
+		def createCommand(command Command, guildId string = "") !Command {
+			let out = new Command()
+			try decodeInto(try call(self, http.Method.POST, try commandsPath(self, guildId), commandBody(command)), out)
+			return out
+		}
+
+		// Changes a registered command.
+		// Fails as every call does.
+		def editCommand(id string, command Command, guildId string = "") !Command {
+			let out = new Command()
+			try decodeInto(try call(self, http.Method.PATCH, try commandsPath(self, guildId) + "/{id}", commandBody(command)), out)
+			return out
+		}
+
+		// Removes a registered command.
+		// Fails as every call does.
+		def deleteCommand(id string, guildId string = "") !none {
+			return try discard(try call(self, http.Method.DELETE, try commandsPath(self, guildId) + "/{id}"))
+		}
+
+		// What a guild allows of the application's commands.
+		// Fails as every call does.
+		def commandPermissions(guildId string) !CommandPermissions[] {
+			return try listOf<CommandPermissions>(try call(self, http.Method.GET, try commandsPath(self, guildId) + "/permissions"))
+		}
+	}
+
+	internal def commandsPath(client Client, guildId string) !string {
+		let app = try client.applicationId()
+		return guildId.len() > 0 ?? ("/applications/{app}/guilds/{guildId}/commands", "/applications/{app}/commands")
+	}
+
+	// The JSON Discord takes for `c`.
+	internal def commandBody(c Command) map<string, any> {
+		let body = map<string, any>{"name": c.name, "type": int(c.kind)}
+		body.set("description", c.description) when c.kind == CommandType.ChatInput || c.description.len() > 0
+		body.set("options", optionsBody(c.options)) when c.options.len() > 0
+		body.set("default_member_permissions", c.defaultPermissions) when c.defaultPermissions.len() > 0
+		body.set("nsfw", true) when c.nsfw
+		if c.contexts.len() > 0 {
+			let list any[] = []
+			for let (_, x) in c.contexts {
+				list.push(x)
+			}
+			body.set("contexts", list)
+		}
+		if c.installTypes.len() > 0 {
+			let list any[] = []
+			for let (_, x) in c.installTypes {
+				list.push(x)
+			}
+			body.set("integration_types", list)
+		}
+		body.set("name_localizations", c.nameLocalizations) when c.nameLocalizations.len() > 0
+		body.set("description_localizations", c.descriptionLocalizations) when c.descriptionLocalizations.len() > 0
+		return body
+	}
+
+	internal def optionsBody(options CommandOption[]) any[] {
+		let out any[] = []
+		for let (_, o) in options {
+			let entry = map<string, any>{"type": int(o.kind), "name": o.name, "description": o.description}
+			entry.set("required", true) when o.required
+			if o.choices.len() > 0 {
+				let choices any[] = []
+				for let (_, ch) in o.choices {
+					let item = map<string, any>{"name": ch.name, "value": ch.value}
+					item.set("name_localizations", ch.nameLocalizations) when ch.nameLocalizations.len() > 0
+					choices.push(item)
+				}
+				entry.set("choices", choices)
+			}
+			entry.set("options", optionsBody(o.options)) when o.options.len() > 0
+			if o.channelTypes.len() > 0 {
+				let types any[] = []
+				for let (_, t) in o.channelTypes {
+					types.push(t)
+				}
+				entry.set("channel_types", types)
+			}
+			let min = o.minValue
+			let max = o.maxValue
+			let integer = o.kind == OptionType.Integer
+			entry.set("min_value", integer ?? (int(min), min)) unless min is none
+			entry.set("max_value", integer ?? (int(max), max)) unless max is none
+			let shortest = o.minLength
+			entry.set("min_length", shortest) unless shortest is none
+			let longest = o.maxLength
+			entry.set("max_length", longest) unless longest is none
+			entry.set("autocomplete", true) when o.autocomplete
+			entry.set("name_localizations", o.nameLocalizations) when o.nameLocalizations.len() > 0
+			entry.set("description_localizations", o.descriptionLocalizations) when o.descriptionLocalizations.len() > 0
+			out.push(entry)
+		}
+		return out
+	}
+}

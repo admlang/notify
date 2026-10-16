@@ -1,0 +1,611 @@
+// The events the Gateway dispatches, one struct each; `Event` is their
+// union and `RawEvent` holds the ones without a struct of their own.
+partial module adm.notify.discord {
+	use std.data.encoding::(JSON, json)
+
+	// The session is open: who the bot is, and the guilds it will receive
+	// a GuildCreate for (unavailable until then).
+	struct Ready {
+		@json("v")
+		version int
+		user User
+		guilds Guild[]
+		@json("session_id")
+		sessionId string
+		@json("resume_gateway_url")
+		resumeURL string
+		// The shard id and count.
+		shard int[]
+	}
+
+	// A dropped session was resumed: the events missed in between follow.
+	struct Resumed {
+		sequence int
+	}
+
+	// A guild became available: on connect, on joining, after an outage.
+	struct GuildCreate {
+		guild Guild
+	}
+
+	// A guild's settings changed.
+	struct GuildUpdate {
+		guild Guild
+	}
+
+	// The bot left the guild, or it is in an outage (`unavailable`).
+	struct GuildDelete {
+		id          string
+		unavailable bool
+	}
+
+	// A guild channel was made.
+	struct ChannelCreate {
+		channel Channel
+	}
+
+	// A channel changed.
+	struct ChannelUpdate {
+		channel Channel
+	}
+
+	// A channel was deleted.
+	struct ChannelDelete {
+		channel Channel
+	}
+
+	// A thread was made, or the bot was added to one (`newlyCreated`
+	// false).
+	struct ThreadCreate {
+		thread       Channel
+		newlyCreated bool
+	}
+
+	// A thread changed.
+	struct ThreadUpdate {
+		thread Channel
+	}
+
+	// Only the thread's id, guild, parent and type are set.
+	struct ThreadDelete {
+		thread Channel
+	}
+
+	// Members joined or left a thread (needs Guild Members for others).
+	struct ThreadMembersUpdate {
+		id string
+		@json("guild_id")
+		guildId string
+		@json("member_count")
+		memberCount int
+		@json("added_members")
+		added ThreadMember[]
+		@json("removed_member_ids")
+		removed string[]
+	}
+
+	// A message was pinned or unpinned.
+	struct PinsUpdate {
+		@json("guild_id")
+		guildId string
+		@json("channel_id")
+		channelId string
+		@json("last_pin_timestamp")
+		lastPinAt string
+	}
+
+	// A message was posted. Its text, embeds, attachments and components
+	// are empty without the Message Content intent, except in direct
+	// messages and messages that mention the bot.
+	struct MessageCreate {
+		message Message
+	}
+
+	// A message was edited: only `id` and `channelId` are sure to be set.
+	struct MessageUpdate {
+		message Message
+	}
+
+	// A message was deleted.
+	struct MessageDelete {
+		id string
+		@json("channel_id")
+		channelId string
+		@json("guild_id")
+		guildId string
+	}
+
+	// Messages were deleted at once.
+	struct MessageDeleteBulk {
+		ids string[]
+		@json("channel_id")
+		channelId string
+		@json("guild_id")
+		guildId string
+	}
+
+	// A user reacted to a message.
+	struct ReactionAdd {
+		@json("user_id")
+		userId string
+		@json("channel_id")
+		channelId string
+		@json("message_id")
+		messageId string
+		@json("guild_id")
+		guildId string
+		member ?Member
+		emoji Emoji
+		@json("message_author_id")
+		messageAuthorId string
+		// A super reaction.
+		burst bool
+	}
+
+	// A user took back a reaction.
+	struct ReactionRemove {
+		@json("user_id")
+		userId string
+		@json("channel_id")
+		channelId string
+		@json("message_id")
+		messageId string
+		@json("guild_id")
+		guildId string
+		emoji Emoji
+		burst bool
+	}
+
+	// Every reaction of a message was removed.
+	struct ReactionRemoveAll {
+		@json("channel_id")
+		channelId string
+		@json("message_id")
+		messageId string
+		@json("guild_id")
+		guildId string
+	}
+
+	// Every reaction of one emoji was removed from a message.
+	struct ReactionRemoveEmoji {
+		@json("channel_id")
+		channelId string
+		@json("message_id")
+		messageId string
+		@json("guild_id")
+		guildId string
+		emoji Emoji
+	}
+
+	// A user joined a guild (needs Guild Members).
+	struct MemberAdd {
+		guildId string
+		member  Member
+	}
+
+	// A member changed: nickname, roles, timeout.
+	struct MemberUpdate {
+		guildId string
+		member  Member
+	}
+
+	// A user left a guild, or was removed.
+	struct MemberRemove {
+		@json("guild_id")
+		guildId string
+		user User
+	}
+
+	// A part of the members `Gateway.requestMembers` asked for.
+	struct MembersChunk {
+		@json("guild_id")
+		guildId string
+		members Member[]
+		@json("chunk_index")
+		chunkIndex int
+		@json("chunk_count")
+		chunkCount int
+		// The user ids asked for that are not members.
+		@json("not_found")
+		notFound any[]
+		presences Presence[]
+		nonce string
+	}
+
+	// A role was made.
+	struct RoleCreate {
+		@json("guild_id")
+		guildId string
+		role Role
+	}
+
+	// A role changed.
+	struct RoleUpdate {
+		@json("guild_id")
+		guildId string
+		role Role
+	}
+
+	// A role was deleted.
+	struct RoleDelete {
+		@json("guild_id")
+		guildId string
+		@json("role_id")
+		roleId string
+	}
+
+	// A user was banned.
+	struct BanAdd {
+		@json("guild_id")
+		guildId string
+		user User
+	}
+
+	// A ban was lifted.
+	struct BanRemove {
+		@json("guild_id")
+		guildId string
+		user User
+	}
+
+	// A guild's emojis changed: the whole list.
+	struct EmojisUpdate {
+		@json("guild_id")
+		guildId string
+		emojis Emoji[]
+	}
+
+	// A guild's stickers changed: the whole list.
+	struct StickersUpdate {
+		@json("guild_id")
+		guildId string
+		stickers Sticker[]
+	}
+
+	// A scheduled event was made.
+	struct EventCreate {
+		event ScheduledEvent
+	}
+
+	// A scheduled event changed.
+	struct EventUpdate {
+		event ScheduledEvent
+	}
+
+	// A scheduled event was deleted.
+	struct EventDelete {
+		event ScheduledEvent
+	}
+
+	// A user is interested in a scheduled event.
+	struct EventUserAdd {
+		@json("guild_scheduled_event_id")
+		eventId string
+		@json("user_id")
+		userId string
+		@json("guild_id")
+		guildId string
+	}
+
+	// A user is no longer interested in a scheduled event.
+	struct EventUserRemove {
+		@json("guild_scheduled_event_id")
+		eventId string
+		@json("user_id")
+		userId string
+		@json("guild_id")
+		guildId string
+	}
+
+	// An invite was made.
+	struct InviteCreate {
+		@json("channel_id")
+		channelId string
+		code string
+		@json("guild_id")
+		guildId string
+		inviter ?User
+		@json("max_age")
+		maxAge int
+		@json("max_uses")
+		maxUses int
+		temporary bool
+		@json("created_at")
+		createdAt string
+		uses int
+	}
+
+	// An invite was deleted or ran out.
+	struct InviteDelete {
+		@json("channel_id")
+		channelId string
+		@json("guild_id")
+		guildId string
+		code string
+	}
+
+	// A user's presence changed (needs Guild Presences).
+	struct PresenceUpdate {
+		presence Presence
+	}
+
+	// A user started typing.
+	struct TypingStart {
+		@json("channel_id")
+		channelId string
+		@json("guild_id")
+		guildId string
+		@json("user_id")
+		userId string
+		// Unix seconds.
+		timestamp int
+		member ?Member
+	}
+
+	// The bot's own user changed.
+	struct UserUpdate {
+		user User
+	}
+
+	// Someone joined, left or moved between voice channels, or changed
+	// mute or deafen.
+	struct VoiceStateUpdate {
+		state VoiceState
+	}
+
+	// The voice server of a guild, after the bot asked to join voice.
+	struct VoiceServerUpdate {
+		token string
+		@json("guild_id")
+		guildId string
+		endpoint string
+	}
+
+	// A channel's webhooks changed.
+	struct WebhooksUpdate {
+		@json("guild_id")
+		guildId string
+		@json("channel_id")
+		channelId string
+	}
+
+	// A command, a component, a modal, an autocomplete request: answer it
+	// as the handler's interactions are answered.
+	struct InteractionCreate {
+		interaction Interaction
+	}
+
+	// An event with no struct here (auto moderation, entitlements, polls,
+	// integrations, stage instances, ...): its name and its data as
+	// `JSON.parse` builds it.
+	struct RawEvent {
+		name string
+		data any
+	}
+
+	// What `Gateway.next` hands out; `match` it by struct.
+	type Event = Ready | Resumed | GuildCreate | GuildUpdate | GuildDelete | ChannelCreate | ChannelUpdate | ChannelDelete | ThreadCreate | ThreadUpdate | ThreadDelete | ThreadMembersUpdate | PinsUpdate | MessageCreate | MessageUpdate | MessageDelete | MessageDeleteBulk | ReactionAdd | ReactionRemove | ReactionRemoveAll | ReactionRemoveEmoji | MemberAdd | MemberUpdate | MemberRemove | MembersChunk | RoleCreate | RoleUpdate | RoleDelete | BanAdd | BanRemove | EmojisUpdate | StickersUpdate | EventCreate | EventUpdate | EventDelete | EventUserAdd | EventUserRemove | InviteCreate | InviteDelete | PresenceUpdate | TypingStart | UserUpdate | VoiceStateUpdate | VoiceServerUpdate | WebhooksUpdate | InteractionCreate | RawEvent
+
+	// A Gateway payload's frame: the opcode, the sequence of a dispatch,
+	// its name.
+	internal struct Frame {
+		op int
+		s  int
+		t  string
+	}
+
+	// The data of a payload, bound as T.
+	internal struct Dispatch<T> {
+		d T
+	}
+
+	internal struct GuildRef {
+		@json("guild_id")
+		guildId string
+		@json("newly_created")
+		newlyCreated bool
+	}
+
+	// The event of the dispatch `name` whose payload is `payload`.
+	// Fails when the data is not of the shape Discord documents.
+	internal def eventOf(name string, payload byte[], client Client) !Event {
+		let codec = new JSON()
+		match name {
+			case "READY":
+				let d = Dispatch<Ready>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "RESUMED":
+				return Resumed{}
+			case "GUILD_CREATE":
+				let d = Dispatch<Guild>{}
+				try codec.decode(payload, d)
+				return GuildCreate{guild: d.d}
+			case "GUILD_UPDATE":
+				let d = Dispatch<Guild>{}
+				try codec.decode(payload, d)
+				return GuildUpdate{guild: d.d}
+			case "GUILD_DELETE":
+				let d = Dispatch<GuildDelete>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "CHANNEL_CREATE":
+				let d = Dispatch<Channel>{}
+				try codec.decode(payload, d)
+				return ChannelCreate{channel: d.d}
+			case "CHANNEL_UPDATE":
+				let d = Dispatch<Channel>{}
+				try codec.decode(payload, d)
+				return ChannelUpdate{channel: d.d}
+			case "CHANNEL_DELETE":
+				let d = Dispatch<Channel>{}
+				try codec.decode(payload, d)
+				return ChannelDelete{channel: d.d}
+			case "THREAD_CREATE":
+				let d = Dispatch<Channel>{}
+				try codec.decode(payload, d)
+				let ref = Dispatch<GuildRef>{}
+				try codec.decode(payload, ref)
+				return ThreadCreate{thread: d.d, newlyCreated: ref.d.newlyCreated}
+			case "THREAD_UPDATE":
+				let d = Dispatch<Channel>{}
+				try codec.decode(payload, d)
+				return ThreadUpdate{thread: d.d}
+			case "THREAD_DELETE":
+				let d = Dispatch<Channel>{}
+				try codec.decode(payload, d)
+				return ThreadDelete{thread: d.d}
+			case "THREAD_MEMBERS_UPDATE":
+				let d = Dispatch<ThreadMembersUpdate>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "CHANNEL_PINS_UPDATE":
+				let d = Dispatch<PinsUpdate>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "MESSAGE_CREATE":
+				let d = Dispatch<Message>{}
+				try codec.decode(payload, d)
+				return MessageCreate{message: d.d}
+			case "MESSAGE_UPDATE":
+				let d = Dispatch<Message>{}
+				try codec.decode(payload, d)
+				return MessageUpdate{message: d.d}
+			case "MESSAGE_DELETE":
+				let d = Dispatch<MessageDelete>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "MESSAGE_DELETE_BULK":
+				let d = Dispatch<MessageDeleteBulk>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "MESSAGE_REACTION_ADD":
+				let d = Dispatch<ReactionAdd>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "MESSAGE_REACTION_REMOVE":
+				let d = Dispatch<ReactionRemove>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "MESSAGE_REACTION_REMOVE_ALL":
+				let d = Dispatch<ReactionRemoveAll>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "MESSAGE_REACTION_REMOVE_EMOJI":
+				let d = Dispatch<ReactionRemoveEmoji>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_MEMBER_ADD":
+				let d = Dispatch<Member>{}
+				try codec.decode(payload, d)
+				let ref = Dispatch<GuildRef>{}
+				try codec.decode(payload, ref)
+				return MemberAdd{guildId: ref.d.guildId, member: d.d}
+			case "GUILD_MEMBER_UPDATE":
+				let d = Dispatch<Member>{}
+				try codec.decode(payload, d)
+				let ref = Dispatch<GuildRef>{}
+				try codec.decode(payload, ref)
+				return MemberUpdate{guildId: ref.d.guildId, member: d.d}
+			case "GUILD_MEMBER_REMOVE":
+				let d = Dispatch<MemberRemove>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_MEMBERS_CHUNK":
+				let d = Dispatch<MembersChunk>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_ROLE_CREATE":
+				let d = Dispatch<RoleCreate>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_ROLE_UPDATE":
+				let d = Dispatch<RoleUpdate>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_ROLE_DELETE":
+				let d = Dispatch<RoleDelete>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_BAN_ADD":
+				let d = Dispatch<BanAdd>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_BAN_REMOVE":
+				let d = Dispatch<BanRemove>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_EMOJIS_UPDATE":
+				let d = Dispatch<EmojisUpdate>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_STICKERS_UPDATE":
+				let d = Dispatch<StickersUpdate>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_SCHEDULED_EVENT_CREATE":
+				let d = Dispatch<ScheduledEvent>{}
+				try codec.decode(payload, d)
+				return EventCreate{event: d.d}
+			case "GUILD_SCHEDULED_EVENT_UPDATE":
+				let d = Dispatch<ScheduledEvent>{}
+				try codec.decode(payload, d)
+				return EventUpdate{event: d.d}
+			case "GUILD_SCHEDULED_EVENT_DELETE":
+				let d = Dispatch<ScheduledEvent>{}
+				try codec.decode(payload, d)
+				return EventDelete{event: d.d}
+			case "GUILD_SCHEDULED_EVENT_USER_ADD":
+				let d = Dispatch<EventUserAdd>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "GUILD_SCHEDULED_EVENT_USER_REMOVE":
+				let d = Dispatch<EventUserRemove>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "INVITE_CREATE":
+				let d = Dispatch<InviteCreate>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "INVITE_DELETE":
+				let d = Dispatch<InviteDelete>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "PRESENCE_UPDATE":
+				let d = Dispatch<Presence>{}
+				try codec.decode(payload, d)
+				return PresenceUpdate{presence: d.d}
+			case "TYPING_START":
+				let d = Dispatch<TypingStart>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "USER_UPDATE":
+				let d = Dispatch<User>{}
+				try codec.decode(payload, d)
+				return UserUpdate{user: d.d}
+			case "VOICE_STATE_UPDATE":
+				let d = Dispatch<VoiceState>{}
+				try codec.decode(payload, d)
+				return VoiceStateUpdate{state: d.d}
+			case "VOICE_SERVER_UPDATE":
+				let d = Dispatch<VoiceServerUpdate>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "WEBHOOKS_UPDATE":
+				let d = Dispatch<WebhooksUpdate>{}
+				try codec.decode(payload, d)
+				return d.d
+			case "INTERACTION_CREATE":
+				let d = Dispatch<Interaction>{d: new Interaction()}
+				try codec.decode(payload, d)
+				d.d.client = client
+				return InteractionCreate{interaction: d.d}
+		}
+		let whole = try codec.parse(payload)
+		if whole is map<string, any> {
+			let data = whole.get("d")
+			return RawEvent{name: name, data: data} unless data is none
+		}
+		return RawEvent{name: name}
+	}
+}

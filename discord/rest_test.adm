@@ -1,0 +1,441 @@
+partial module adm.notify.discord {
+	use (
+		std.os
+		std.time
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON)
+	)
+
+	// The last path segments of the GETs that answer with an array.
+	internal const listRoutes = ["channels", "roles", "emojis", "stickers", "webhooks", "invites", "search", "scheduled-events", "commands", "permissions", "bans", "members", "users", "thread-members", "guilds", "messages"]
+
+	// A server that records every request under /api/v10 and answers an
+	// empty array for lists and an empty object for the rest.
+	internal def recorder(seen Seen) !httptest.Server {
+		let mux = new http.ServeMux()
+		try mux.handle("/api/v10/", def (ctx http.Context) !none {
+			let query = ctx.request.url.rawQuery
+			seen.requests.push("{ctx.method().value} {ctx.path()[8:]}{query.len() > 0 ?? ("?" + query, "")}")
+			let body = try ctx.bytes()
+			let parsed = (new JSON()).parse(body) onerror recover none
+			let kept = parsed is map<string, any> ?? (parsed, new map<string, any>())
+			seen.bodies.push(kept)
+			seen.forms.push(ctx.header("Content-Type").split(";")[0])
+			let parts = ctx.path().split("?")[0].split("/")
+			let last = parts[parts.len() - 1]
+			let listed = listRoutes.includes(last) || ctx.path().contains("/reactions/")
+			let list = ctx.method() == http.Method.GET && listed || ctx.method() == http.Method.PATCH && last == "roles"
+			return ctx.text(list ?? ("[]", "\{\"id\": \"1\"}"))
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		return server
+	}
+
+	// The requests from `from` on, one a line, against `want`.
+	internal def sentSince(seen Seen, from int, want string[]) !none {
+		let got = seen.requests[from:].join("\n")
+		let expected = want.join("\n")
+		fail "requests differ:\n--- got\n{got}\n--- want\n{expected}" unless got == expected
+		return none
+	}
+
+	check "Discord REST" {
+		// Every channel, message, thread and user call goes to its route.
+		@test()
+		def TestChannelRoutes() !none {
+			let seen = new Seen()
+			let server = try recorder(seen)
+			let bot = clientOf(server)
+			try bot.channel("1")
+			try bot.editChannel("1", ChannelChanges{name: "news", slowMode: 5, overwrites: [Overwrite{id: "9", kind: OverwriteType.Role, allow: "1024", deny: "0"}]}, reason = "tidy")
+			try bot.deleteChannel("1")
+			try bot.setPermissions("1", "9", OverwriteType.Member, new Permissions(Permission.ViewChannel), new Permissions(Permission.SendMessages).remove(Permission.SendMessages))
+			try bot.removePermissions("1", "9")
+			try bot.invites("1")
+			try bot.createInvite("1", maxAge = 60)
+			try bot.invite("abc")
+			try bot.deleteInvite("abc")
+			try bot.typing("1")
+			try bot.follow("1", "2")
+			try bot.messagesAround("1", "50", limit = 10)
+			try bot.forward("2", "1", "50")
+			try bot.crosspost("1", "50")
+			try bot.unreact("1", "50", "party:123", userId = "7")
+			try bot.reactions("1", "50", "👍").all()
+			try bot.clearReactions("1", "50")
+			try bot.clearReactions("1", "50", "👍")
+			try bot.delete("1", "50")
+			try bot.delete("1", ["50", "51"])
+			try bot.pin("1", "50")
+			try bot.unpin("1", "50")
+			try bot.pins("1").next()
+			try bot.startThread("1", "50", "talk", autoArchive = 60)
+			try bot.startThread("1", "private talk", ChannelType.PrivateThread, invitable = false)
+			try bot.post("1", "Question", "How?", tags = ["4"])
+			try bot.joinThread("3")
+			try bot.leaveThread("3")
+			try bot.addToThread("3", "7")
+			try bot.removeFromThread("3", "7")
+			try bot.threadMember("3", "7")
+			try bot.threadMembers("3").all()
+			try bot.archivedThreads("1").next()
+			try bot.archivedThreads("1", joined = true).next()
+			try bot.activeThreads("77")
+			try bot.me()
+			try bot.user("7")
+			try bot.editMe(username = "adm", avatar = File{name: "a.png", data: [1, 2], contentType: "image/png"})
+			try bot.dm("7")
+			try bot.guilds().all()
+			try bot.leaveGuild("77")
+			try sentSince(seen, 0, [
+				"GET /channels/1",
+				"PATCH /channels/1",
+				"DELETE /channels/1",
+				"PUT /channels/1/permissions/9",
+				"DELETE /channels/1/permissions/9",
+				"GET /channels/1/invites",
+				"POST /channels/1/invites",
+				"GET /invites/abc?with_counts=true",
+				"DELETE /invites/abc",
+				"POST /channels/1/typing",
+				"POST /channels/1/followers",
+				"GET /channels/1/messages?around=50&limit=10",
+				"POST /channels/2/messages",
+				"POST /channels/1/messages/50/crosspost",
+				"DELETE /channels/1/messages/50/reactions/party:123/7",
+				"GET /channels/1/messages/50/reactions/👍?limit=100&type=0",
+				"DELETE /channels/1/messages/50/reactions",
+				"DELETE /channels/1/messages/50/reactions/👍",
+				"DELETE /channels/1/messages/50",
+				"POST /channels/1/messages/bulk-delete",
+				"PUT /channels/1/messages/pins/50",
+				"DELETE /channels/1/messages/pins/50",
+				"GET /channels/1/messages/pins?limit=50",
+				"POST /channels/1/messages/50/threads",
+				"POST /channels/1/threads",
+				"POST /channels/1/threads",
+				"PUT /channels/3/thread-members/@me",
+				"DELETE /channels/3/thread-members/@me",
+				"PUT /channels/3/thread-members/7",
+				"DELETE /channels/3/thread-members/7",
+				"GET /channels/3/thread-members/7?with_member=true",
+				"GET /channels/3/thread-members?with_member=true&limit=100",
+				"GET /channels/1/threads/archived/public?limit=100",
+				"GET /channels/1/users/@me/threads/archived/private?limit=100",
+				"GET /guilds/77/threads/active",
+				"GET /users/@me",
+				"GET /users/7",
+				"PATCH /users/@me",
+				"POST /users/@me/channels",
+				"GET /users/@me/guilds?limit=200&with_counts=true",
+				"DELETE /users/@me/guilds/77",
+			])
+			let edit = seen.bodies[1]
+			assert "{edit.get("name")}" == "news" && "{edit.get("rate_limit_per_user")}" == "5" && edit.hasKey("permission_overwrites")
+			let perms = seen.bodies[3]
+			assert "{perms.get("allow")}" == "1024" && "{perms.get("deny")}" == "0" && "{perms.get("type")}" == "1"
+			let thread = seen.bodies[24]
+			assert "{thread.get("type")}" == "12" && "{thread.get("invitable")}" == "false"
+			let post = seen.bodies[25]
+			let message = post.get("message")
+			fail "no message" unless message is map<string, any>
+			assert "{message.get("content")}" == "How?" && "{post.get("name")}" == "Question"
+			assert "{seen.bodies[37].get("avatar")}" == "data:image/png;base64,AQI="
+			try server.close()
+			return none
+		}
+
+		// Every guild call goes to its route.
+		@test()
+		def TestGuildRoutes() !none {
+			let seen = new Seen()
+			let server = try recorder(seen)
+			let bot = clientOf(server)
+			let at = time.parse("2026-11-01T18:00:00Z") onerror recover time.now()
+			try bot.guild("77")
+			try bot.channels("77")
+			try bot.createChannel("77", "voice", ChannelType.GuildVoice, ChannelChanges{bitrate: 64000})
+			try bot.reorderChannels("77", map<string, int>{"1": 0})
+			try bot.searchMembers("77", "ad", limit = 5)
+			try bot.editMember("77", "7", MemberChanges{nick: "Ada", roles: ["5"], timeoutUntil: at})
+			try bot.editMember("77", "7", MemberChanges{channelId: "", clearTimeout: true})
+			try bot.nickname("77", "bot")
+			try bot.addRole("77", "7", "5")
+			try bot.removeRole("77", "7", "5")
+			try bot.kick("77", "7", reason = "spam")
+			try bot.ban("77", "7", deleteSeconds = 3600)
+			try bot.ban("77", ["7", "8"])
+			try bot.unban("77", "7")
+			try bot.bans("77").all()
+			try bot.pruneCount("77", 14, ["5"])
+			try bot.prune("77", 14)
+			try bot.roles("77")
+			try bot.role("77", "5")
+			try bot.createRole("77", RoleChanges{name: "mods", permissions: new Permissions(Permission.KickMembers), color: 0xff0000})
+			try bot.editRole("77", "5", RoleChanges{hoist: true})
+			try bot.deleteRole("77", "5")
+			try bot.reorderRoles("77", map<string, int>{"5": 2})
+			try bot.emojis("77")
+			try bot.emoji("77", "6")
+			try bot.createEmoji("77", "party", File{name: "p.png", data: [1], contentType: "image/png"})
+			try bot.editEmoji("77", "6", name = "fiesta")
+			try bot.deleteEmoji("77", "6")
+			try bot.sticker("8")
+			try bot.stickerPacks()
+			try bot.stickers("77")
+			try bot.createSticker("77", "wave", File{name: "w.png", data: [1, 2, 3], contentType: "image/png"}, "wave")
+			try bot.editSticker("77", "8", description = "hello")
+			try bot.deleteSticker("77", "8")
+			try bot.events("77")
+			try bot.event("77", "9")
+			try bot.createEvent("77", "Launch", at, EventEntity.External, location = "Online", endsAt = at + 1h)
+			try bot.editEvent("77", "9", EventChanges{status: EventStatus.Active})
+			try bot.deleteEvent("77", "9")
+			try bot.eventUsers("77", "9").all()
+			try bot.auditLog("77", action = AuditAction.MemberKick).next()
+			try bot.gatewayBot()
+			let missing = caught(def () !none {
+				try bot.createEvent("77", "Launch", at, EventEntity.External)
+				return none
+			})
+			assert missing.kind == ErrorKind.Invalid
+			try sentSince(seen, 0, [
+				"GET /guilds/77?with_counts=true",
+				"GET /guilds/77/channels",
+				"POST /guilds/77/channels",
+				"PATCH /guilds/77/channels",
+				"GET /guilds/77/members/search?query=ad&limit=5",
+				"PATCH /guilds/77/members/7",
+				"PATCH /guilds/77/members/7",
+				"PATCH /guilds/77/members/@me",
+				"PUT /guilds/77/members/7/roles/5",
+				"DELETE /guilds/77/members/7/roles/5",
+				"DELETE /guilds/77/members/7",
+				"PUT /guilds/77/bans/7",
+				"POST /guilds/77/bulk-ban",
+				"DELETE /guilds/77/bans/7",
+				"GET /guilds/77/bans?limit=1000",
+				"GET /guilds/77/prune?days=14&include_roles=5",
+				"POST /guilds/77/prune",
+				"GET /guilds/77/roles",
+				"GET /guilds/77/roles/5",
+				"POST /guilds/77/roles",
+				"PATCH /guilds/77/roles/5",
+				"DELETE /guilds/77/roles/5",
+				"PATCH /guilds/77/roles",
+				"GET /guilds/77/emojis",
+				"GET /guilds/77/emojis/6",
+				"POST /guilds/77/emojis",
+				"PATCH /guilds/77/emojis/6",
+				"DELETE /guilds/77/emojis/6",
+				"GET /stickers/8",
+				"GET /sticker-packs",
+				"GET /guilds/77/stickers",
+				"POST /guilds/77/stickers",
+				"PATCH /guilds/77/stickers/8",
+				"DELETE /guilds/77/stickers/8",
+				"GET /guilds/77/scheduled-events?with_user_count=true",
+				"GET /guilds/77/scheduled-events/9?with_user_count=true",
+				"POST /guilds/77/scheduled-events",
+				"PATCH /guilds/77/scheduled-events/9",
+				"DELETE /guilds/77/scheduled-events/9",
+				"GET /guilds/77/scheduled-events/9/users?limit=100&with_member=true",
+				"GET /guilds/77/audit-logs?limit=100&action_type=20",
+				"GET /gateway/bot",
+			])
+			let member = seen.bodies[5]
+			assert "{member.get("communication_disabled_until")}" == "2026-11-01T18:00:00Z" && "{member.get("nick")}" == "Ada"
+			let cleared = seen.bodies[6]
+			assert json(cleared) == "\{\"channel_id\":null,\"communication_disabled_until\":null}"
+			assert "{seen.bodies[19].get("permissions")}" == "2" && "{seen.bodies[19].get("color")}" == "16711680"
+			assert seen.forms[31] == "multipart/form-data"
+			let event = seen.bodies[36]
+			assert "{event.get("entity_type")}" == "3" && "{event.get("scheduled_end_time")}" == "2026-11-01T19:00:00Z"
+			assert "{seen.bodies[37].get("status")}" == "2"
+			try server.close()
+			return none
+		}
+
+		// Commands, webhooks made by the bot, and the answers of an
+		// interaction that came over the Gateway.
+		@test()
+		def TestCommandAndWebhookRoutes() !none {
+			let seen = new Seen()
+			let server = try recorder(seen)
+			let bot = clientOf(server)
+			let app = try bot.app()
+			assert app.id == "1"
+			let ping = new Command("ping", "Ping").availability([CommandContext.Guild, CommandContext.BotDM], [InstallType.Guild, InstallType.User])
+			try bot.commands()
+			try bot.commands("77")
+			try bot.createCommand(ping)
+			try bot.editCommand("5", ping, guildId = "77")
+			try bot.deleteCommand("5")
+			try bot.commandPermissions("77")
+			let hook = try bot.createWebhook("1", "CI")
+			try bot.webhooks("1")
+			try bot.webhooks("77", guild = true)
+			try bot.webhook("1")
+			try bot.editWebhook("1", name = "CI2", channelId = "2")
+			try bot.deleteWebhook("1")
+			hook.token = "tk"
+			try hook.refresh()
+			try hook.message("50")
+			try hook.delete("50")
+			try hook.edit(name = "CI3")
+			try hook.delete()
+			try sentSince(seen, 0, [
+				"GET /applications/@me",
+				"GET /applications/1/commands?with_localizations=true",
+				"GET /applications/1/guilds/77/commands?with_localizations=true",
+				"POST /applications/1/commands",
+				"PATCH /applications/1/guilds/77/commands/5",
+				"DELETE /applications/1/commands/5",
+				"GET /applications/1/guilds/77/commands/permissions",
+				"POST /channels/1/webhooks",
+				"GET /channels/1/webhooks",
+				"GET /guilds/77/webhooks",
+				"GET /webhooks/1",
+				"PATCH /webhooks/1",
+				"DELETE /webhooks/1",
+				"GET /webhooks/1/tk",
+				"GET /webhooks/1/tk/messages/50",
+				"DELETE /webhooks/1/tk/messages/50",
+				"PATCH /webhooks/1/tk",
+				"DELETE /webhooks/1/tk",
+			])
+			let created = seen.bodies[3]
+			assert json(created.get("contexts")) == "[0,1]" && json(created.get("integration_types")) == "[0,1]"
+
+			// An interaction the Gateway delivered is answered through the
+			// callback, then edited and followed up through its webhook.
+			let start = seen.requests.len()
+			let i = new Interaction()
+			try (new JSON()).decode("\{\"id\": \"61\", \"application_id\": \"555\", \"type\": 4, \"token\": \"tok\", \"data\": \{\"name\": \"pick\", \"options\": [\{\"name\": \"color\", \"type\": 3, \"value\": \"re\", \"focused\": true}, \{\"name\": \"loud\", \"type\": 5, \"value\": true}, \{\"name\": \"size\", \"type\": 10, \"value\": 1.5}, \{\"name\": \"who\", \"type\": 6, \"value\": \"8\"}, \{\"name\": \"room\", \"type\": 7, \"value\": \"3\"}, \{\"name\": \"team\", \"type\": 8, \"value\": \"5\"}, \{\"name\": \"doc\", \"type\": 11, \"value\": \"4\"}], \"resolved\": \{\"members\": \{\"8\": \{\"nick\": \"Bob\"}}, \"channels\": \{\"3\": \{\"id\": \"3\", \"name\": \"lobby\"}}, \"roles\": \{\"5\": \{\"id\": \"5\", \"name\": \"mods\"}}, \"attachments\": \{\"4\": \{\"id\": \"4\", \"filename\": \"a.txt\"}}, \"messages\": \{\"9\": \{\"id\": \"9\"}}}, \"target_id\": \"9\"}}", i)
+			i.client = bot
+			let focus = i.focused()
+			fail "nothing focused" when focus is none
+			assert focus.name == "color" && i.flag("loud") && i.number("size") == 1.5
+			let member = i.memberOption("who")
+			let room = i.channelOption("room")
+			let team = i.roleOption("team")
+			let doc = i.attachmentOption("doc")
+			let target = i.targetMessage()
+			fail "options not resolved" when member is none || room is none
+			fail "options not resolved" when team is none || doc is none
+			fail "no target" when target is none
+			assert member.nick == "Bob" && room.name == "lobby" && team.name == "mods" && doc.filename == "a.txt" && target.id == "9"
+			try i.autocomplete([choice("red", "red"), choice("rose", "rose")])
+			let twice = caught(def () !none {
+				try i.autocomplete([choice("red", "red")])
+				return none
+			})
+			assert twice.kind == ErrorKind.Invalid
+			try i.followup("more", ephemeral = true)
+			try i.editReply(content = "changed")
+			try i.deleteReply()
+			let other = new Interaction()
+			other.id = "62"
+			other.token = "tok2"
+			other.applicationId = "555"
+			other.client = bot
+			try other.acknowledge(ephemeral = true)
+			try other.reply("late answer")
+			let third = new Interaction()
+			third.id = "63"
+			third.token = "tok3"
+			third.client = bot
+			try third.modal(new Modal("feedback", "Feedback", label("What went wrong?", input("what", variant = TextInputStyle.Paragraph)), label("Screenshot", upload("shot", max = 2))))
+			let fourth = new Interaction()
+			fourth.id = "64"
+			fourth.token = "tok4"
+			fourth.client = bot
+			try fourth.launch()
+			try sentSince(seen, start, [
+				"POST /interactions/61/tok/callback",
+				"POST /webhooks/555/tok?wait=true",
+				"PATCH /webhooks/555/tok/messages/@original",
+				"DELETE /webhooks/555/tok/messages/@original",
+				"POST /interactions/62/tok2/callback",
+				"PATCH /webhooks/555/tok2/messages/@original",
+				"POST /interactions/63/tok3/callback",
+				"POST /interactions/64/tok4/callback",
+			])
+			let answered = seen.bodies[start]
+			assert "{answered.get("type")}" == "8"
+			let deferred = seen.bodies[start + 4]
+			assert "{deferred.get("type")}" == "5"
+			let modal = seen.bodies[start + 6]
+			let data = modal.get("data")
+			fail "no modal" unless data is map<string, any>
+			assert "{modal.get("type")}" == "9" && "{data.get("title")}" == "Feedback"
+			assert "{seen.bodies[start + 7].get("type")}" == "12"
+			try server.close()
+			return none
+		}
+
+		// The builders write the JSON Discord takes.
+		@test()
+		def TestComponentBodies() !none {
+			let home = Runtime.getEnv("ADM_APP_HOME")
+			let dir = home is none ?? ("/tmp", home)
+			try os.writeFile(dir + "/chart.png", [137, 80, 78, 71])
+			let chart = try file(dir + "/chart.png", spoiler = true)
+			assert chart.name == "chart.png" && chart.contentType == "image/png" && fileName(chart) == "SPOILER_chart.png"
+			try os.remove(dir + "/chart.png", false)
+			let layout = container([section(thumbnail("attachment://chart.png", "chart"), "Sales", "Up 4%"), gallery(MediaItem{url: "https://e.com/a.png"}, MediaItem{url: "https://e.com/b.png", spoiler: true}), attached("report.pdf"), row(purchase("sku1"), button("Ok", "ok", ButtonStyle.Success, emoji = "a:party:123"))])
+			let text = string((new JSON()).encode(componentBody(layout)))
+			assert text.contains("\"accessory\":\{\"type\":11,\"media\":\{\"url\":\"attachment://chart.png\"}") && text.contains("\"file\":\{\"url\":\"attachment://report.pdf\"}") && text.contains("\"sku_id\":\"sku1\"") && text.contains("\"emoji\":\{\"id\":\"123\",\"name\":\"party\",\"animated\":true}")
+			assert !text.contains("accent_color")
+			let pick = menu(ComponentType.ChannelSelect, "room", channelTypes = [ChannelType.GuildText], defaults = ["3"])
+			let picked = string((new JSON()).encode(componentBody(pick)))
+			assert picked.contains("\"channel_types\":[0]") && picked.contains("\"default_values\":[\{\"id\":\"3\",\"type\":\"channel\"}]")
+			let embed = new Embed("abc", "de")
+			embed.field("f", "gh")
+			assert embed.size() == 8
+			assert caught(def () !none {
+				try draftBody(Draft{components: [row(button("A", ""))]})
+				return none
+			}).kind == ErrorKind.Invalid
+			return none
+		}
+
+		// A session's sends: presence, member requests and voice, and their
+		// failure when it is not connected.
+		@test()
+		def TestGatewaySends() !none {
+			let seen = new Seen()
+			let server = try discordServer(seen)
+			let bot = clientOf(server)
+			let gw = bot.gateway(Intent.Guilds)
+			let offline = caught(def () !none {
+				try gw.setPresence(Status.Idle)
+				return none
+			})
+			assert offline.kind == ErrorKind.Transport
+			let first = gw.iterate()
+			fail "no READY" unless first is Ready
+			try gw.setPresence(Status.DoNotDisturb, [Activity{name: "the logs", kind: 3}])
+			try gw.requestMembers("77", query = "a", limit = 10, nonce = "n1")
+			try gw.updateVoice("77", "3", mute = true)
+			time.sleep(100ms)
+			try gw.close()
+			assert gw.iterate() is none && gw.lastError is none
+			let ops string[]
+			for let (_, p) in seen.payloads {
+				ops.push("{p.get("op")}")
+			}
+			assert ops.includes("3") && ops.includes("8") && ops.includes("4")
+
+			let group = try bot.shards([Intent.Guilds], count = 2)
+			try group.close()
+			assert group.iterate() is none
+			try server.close()
+			return none
+		}
+	}
+}

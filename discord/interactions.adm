@@ -1,0 +1,560 @@
+partial module adm.notify.discord {
+	use (
+		std.time
+		std.net.http
+		std.crypto
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON, json, hexdecode)
+	)
+
+	// What brought an interaction.
+	enum InteractionType {
+		// Discord checking the endpoint; the handler answers it itself.
+		Ping         = 1,
+		Command      = 2,
+		Component    = 3,
+		Autocomplete = 4,
+		ModalSubmit  = 5,
+	}
+
+	// An option the user filled in, or a subcommand with its own.
+	struct OptionValue {
+		name string
+		@json("type")
+		kind OptionType
+		// Text, an integer, a number, a bool, or the id of a user, role,
+		// channel or attachment (`Interaction.resolved` holds them).
+		value any
+		// The option being typed in, for autocomplete.
+		focused bool
+		options OptionValue[]
+	}
+
+	// The users, members, roles, channels, messages and attachments an
+	// interaction's options and targets name, by id.
+	struct Resolved {
+		users       map<string, User>
+		members     map<string, Member>
+		roles       map<string, Role>
+		channels    map<string, Channel>
+		messages    map<string, Message>
+		attachments map<string, Attachment>
+	}
+
+	// What an interaction carries: the command and its options, the
+	// component clicked, the modal submitted.
+	struct InteractionData {
+		// The command's.
+		id string
+		name string
+		@json("type")
+		commandType int
+		resolved Resolved
+		options OptionValue[]
+		@json("guild_id")
+		guildId string
+		// The user or message a menu command was used on.
+		@json("target_id")
+		targetId string
+		// The component's or the modal's.
+		@json("custom_id")
+		customId string
+		@json("component_type")
+		componentType int
+		// What a select chose.
+		values string[]
+		// The modal's inputs as submitted.
+		components Component[]
+	}
+
+	// A user's use of the application: a command, a click on a component,
+	// a modal submitted, an autocomplete request. It arrives through the
+	// handler of `Client.interactions` or, on the Gateway, as an
+	// InteractionCreate event. It is answered once, within three seconds
+	// (`reply`, `update`, `modal`, `autocomplete`, or `acknowledge` to
+	// answer later); through the handler a slow answer is deferred by itself.
+	// Follow-ups may come for fifteen minutes.
+	//
+	// ```
+	// let commands = bot.interactions(def (i discord.Interaction) !none {
+	// 	switch i.data.name {
+	// 		case "roll":
+	// 			return i.reply("Rolling a d{i.integer("sides")}")
+	// 	}
+	// 	return i.reply("Unknown command", ephemeral = true)
+	// })
+	// try mux.handle("POST /discord", commands)
+	// ```
+	//
+	// Answers fail with DiscordError Invalid for a second answer (use a
+	// follow-up), or a limit the message breaks.
+	type Interaction {
+		id string
+		@json("application_id")
+		applicationId string
+		@json("type")
+		kind InteractionType
+		data InteractionData
+		@json("guild_id")
+		guildId string
+		channel ?Channel
+		@json("channel_id")
+		channelId string
+		// The member who used it, in a guild.
+		member ?Member
+		// The user who used it, outside a guild.
+		user ?User
+		token string
+		// The message of the component clicked.
+		message ?Message
+		// What the bot may do in the channel, as decimal text.
+		@json("app_permissions")
+		appPermissions string
+		locale string
+		@json("guild_locale")
+		guildLocale string
+		entitlements any[]
+		// 0 a guild, 1 the bot's DM, 2 another DM or group chat.
+		context int
+		@json("attachment_size_limit")
+		attachmentLimit int
+		@json(ignore = true)
+		internal client ?Client = none
+		@json(ignore = true)
+		internal exchange ?Exchange = none
+		@json(ignore = true)
+		internal atomic answered bool = false
+		@json(ignore = true)
+		internal atomic deferred bool = false
+
+		def new() {}
+
+		// The user who used it, in a guild or not.
+		def author() User {
+			let m = member
+			if !(m is none) {
+				let u = m.user
+				return u unless u is none
+			}
+			let u = user
+			return u is none ?? (User{}, u)
+		}
+
+		// The subcommand used, as "group sub" or "sub"; "" for none.
+		def subcommand() string {
+			let path string[]
+			let level = data.options
+			for level.len() == 1 && (level[0].kind := OptionType.Subcommand || OptionType.SubcommandGroup) {
+				path.push(level[0].name)
+				level = level[0].options
+			}
+			return path.join(" ")
+		}
+
+		// The option `name` (of the subcommand used); none when not given.
+		def option(name string) ?OptionValue {
+			return findOption(leafOptions(data.options), name)
+		}
+
+		// The text of option `name`; "" when not given.
+		def text(name string) string {
+			let o = option(name)
+			return "" when o is none
+			let v = o.value
+			return v is string ?? (v, "")
+		}
+
+		// The integer of option `name`; 0 when not given.
+		def integer(name string) int {
+			let o = option(name)
+			return 0 when o is none
+			let v = o.value
+			return v when v is int
+			return int(v) when v is float
+			return 0
+		}
+
+		// The number of option `name`; 0 when not given.
+		def number(name string) float {
+			let o = option(name)
+			return 0.0 when o is none
+			let v = o.value
+			return v when v is float
+			return float(v) when v is int
+			return 0.0
+		}
+
+		// The bool of option `name`; false when not given.
+		def flag(name string) bool {
+			let o = option(name)
+			return false when o is none
+			let v = o.value
+			return v is bool && v
+		}
+
+		// The user an option (User, Mentionable) or a user-menu command
+		// names; none when not given.
+		def userOption(name string = "") ?User {
+			return data.resolved.users.get(idOf(name))
+		}
+
+		// The member an option or a user-menu command names, in a guild.
+		def memberOption(name string = "") ?Member {
+			return data.resolved.members.get(idOf(name))
+		}
+
+		// The role an option names; none when not given.
+		def roleOption(name string) ?Role {
+			return data.resolved.roles.get(idOf(name))
+		}
+
+		// The channel an option names; none when not given.
+		def channelOption(name string) ?Channel {
+			return data.resolved.channels.get(idOf(name))
+		}
+
+		// The file an Attachment option carries; none when not given.
+		def attachmentOption(name string) ?Attachment {
+			return data.resolved.attachments.get(idOf(name))
+		}
+
+		// The message a message-menu command was used on.
+		def targetMessage() ?Message {
+			return data.resolved.messages.get(data.targetId)
+		}
+
+		// The option being typed in, for an Autocomplete interaction.
+		def focused() ?OptionValue {
+			for let (_, o) in leafOptions(data.options) {
+				return o when o.focused
+			}
+			return none
+		}
+
+		// What the input `customId` of a submitted modal holds: the text,
+		// or the choices of a select joined by commas; "" when absent.
+		def field(customId string) string {
+			let c = findComponent(data.components, customId)
+			return "" when c is none
+			return c.values.len() > 0 ?? (c.values.join(","), c.value)
+		}
+
+		// The choices of the select `customId` of a submitted modal, or
+		// with no argument those of the select clicked.
+		def values(customId string = "") string[] {
+			return data.values when customId.len() == 0
+			let c = findComponent(data.components, customId)
+			return c is none ?? (string[], c.values)
+		}
+
+		// Answers with a message (`ephemeral`: seen only by the user), or
+		// once deferred fills in the deferred answer. Fails with Invalid
+		// for a second answer, or as `Client.send` does.
+		def reply(content string = "", embeds Embed[] = [], components Component[] = [], files File[] = [], ephemeral bool = false, mentions ?AllowedMentions = none, poll ?Poll = none, tts bool = false, silent bool = false, suppressEmbeds bool = false) !none {
+			let draft = Draft{files: files, mentions: mentions}
+			draft.content = content when content.len() > 0
+			draft.embeds = embeds when embeds.len() > 0
+			draft.components = components when components.len() > 0
+			draft.flags = (ephemeral ?? (flagEphemeral, 0)) | (silent ?? (flagSilent, 0)) | (suppressEmbeds ?? (flagSuppressEmbeds, 0))
+			draft.extra.set("tts", true) when tts
+			let asked = poll
+			draft.extra.set("poll", try pollBody(asked)) unless asked is none
+			if deferred {
+				try originalEdit(self, try draftBody(draft), files)
+				return none
+			}
+			return try answer(self, 4, try draftBody(draft), files)
+		}
+
+		// Answers a component's interaction by changing the message it is
+		// on (a none argument stays as it is), or once deferred changes it
+		// then. Fails as `reply` does.
+		def update(content ?string = none, embeds ?Embed[] = none, components ?Component[] = none, files File[] = [], keep ?string[] = none, mentions ?AllowedMentions = none) !none {
+			let draft = Draft{content: content, embeds: embeds, components: components, files: files, keep: keep, mentions: mentions}
+			if deferred {
+				try originalEdit(self, try draftBody(draft), files)
+				return none
+			}
+			return try answer(self, 7, try draftBody(draft), files)
+		}
+
+		// Answers later: "thinking…" for a command or a modal (`reply` then
+		// fills it in), nothing visible for a component (`update` then
+		// changes its message). Fails with Invalid for a second answer.
+		def acknowledge(ephemeral bool = false) !none {
+			let callback = self.kind == InteractionType.Component ?? (6, 5)
+			let body = new map<string, any>()
+			body.set("flags", flagEphemeral) when ephemeral
+			try answer(self, callback, body)
+			deferred = true
+			return none
+		}
+
+		// Answers with a modal for the user to fill in; its submission comes
+		// as a ModalSubmit interaction. Fails with Invalid for a second
+		// answer, or more than five components.
+		def modal(form Modal) !none {
+			fail invalid("a modal holds 1 to 5 components, not {form.components.len()}") when form.components.len() == 0 || form.components.len() > 5
+			fail invalid("a modal's title is longer than 45 characters") when form.title.len() > 45
+			let body = map<string, any>{"custom_id": form.customId, "title": form.title, "components": bodiesOf(form.components)}
+			return try answer(self, 9, body)
+		}
+
+		// Answers an Autocomplete interaction with up to 25 choices.
+		// Fails as every call does.
+		def autocomplete(choices Choice[]) !none {
+			let list any[] = []
+			for let (k, c) in choices {
+				break when k == 25
+				list.push(map<string, any>{"name": c.name, "value": c.value})
+			}
+			return try answer(self, 8, map<string, any>{"choices": list})
+		}
+
+		// Answers a PrimaryEntryPoint command by launching the
+		// application's activity.
+		// Fails as every call does.
+		def launch() !none {
+			return try answer(self, 12, none)
+		}
+
+		// A further message after the answer. Returns it. Fails as `send`
+		// does.
+		def followup(content string = "", embeds Embed[] = [], components Component[] = [], files File[] = [], ephemeral bool = false, mentions ?AllowedMentions = none, poll ?Poll = none, tts bool = false, silent bool = false) !Message {
+			let draft = Draft{files: files, mentions: mentions}
+			draft.content = content when content.len() > 0
+			draft.embeds = embeds when embeds.len() > 0
+			draft.components = components when components.len() > 0
+			draft.flags = (ephemeral ?? (flagEphemeral, 0)) | (silent ?? (flagSilent, 0))
+			draft.extra.set("tts", true) when tts
+			let asked = poll
+			draft.extra.set("poll", try pollBody(asked)) unless asked is none
+			let out = Message{}
+			try decodeInto(try tokenCall(self, http.Method.POST, "?wait=true", try draftBody(draft), uploads(files)), out)
+			return out
+		}
+
+		// Changes the answer (`messageId` "@original") or a follow-up; a
+		// none argument stays as it is.
+		// Fails as every call does.
+		def editReply(messageId string = "@original", content ?string = none, embeds ?Embed[] = none, components ?Component[] = none, files File[] = [], keep ?string[] = none, mentions ?AllowedMentions = none) !Message {
+			let draft = Draft{content: content, embeds: embeds, components: components, files: files, keep: keep, mentions: mentions}
+			let out = Message{}
+			try decodeInto(try tokenCall(self, http.Method.PATCH, "/messages/{messageId}", try draftBody(draft), uploads(files)), out)
+			return out
+		}
+
+		// Deletes the answer, or a follow-up.
+		// Fails as every call does.
+		def deleteReply(messageId string = "@original") !none {
+			return try discard(try tokenCall(self, http.Method.DELETE, "/messages/{messageId}"))
+		}
+
+		// The answer as a message, or a follow-up.
+		// Fails as every call does.
+		def reply(messageId string) !Message {
+			let out = Message{}
+			try decodeInto(try tokenCall(self, http.Method.GET, "/messages/{messageId}"), out)
+			return out
+		}
+
+		internal def idOf(name string) string {
+			return data.targetId when name.len() == 0
+			let o = option(name)
+			return "" when o is none
+			let v = o.value
+			return v is string ?? (v, "")
+		}
+	}
+
+	// The options under the subcommand used.
+	internal def leafOptions(options OptionValue[]) OptionValue[] {
+		let level = options
+		for level.len() == 1 && (level[0].kind := OptionType.Subcommand || OptionType.SubcommandGroup) {
+			level = level[0].options
+		}
+		return level
+	}
+
+	internal def findOption(options OptionValue[], name string) ?OptionValue {
+		for let (_, o) in options {
+			return o when o.name == name
+		}
+		return none
+	}
+
+	// The input `customId` anywhere in a modal's components.
+	internal def findComponent(list Component[], customId string) ?Component {
+		for let (_, c) in list {
+			return c when c.customId == customId
+			let child = c.child
+			if !(child is none) {
+				return child when child.customId == customId
+			}
+			let inner = findComponent(c.components, customId)
+			return inner unless inner is none
+		}
+		return none
+	}
+
+	// The first answer to an interaction: the HTTP response of the
+	// handler's request while it waits, else the callback endpoint.
+	internal def answer(i Interaction, kind int, body ?any, files File[] = []) !none {
+		let payload = map<string, any>{"type": kind}
+		payload.set("data", body) unless body is none
+		let exchange = i.exchange
+		if !(exchange is none) && exchange.offer(Answer{body: payload, files: uploads(files)}) {
+			i.answered = true
+			return none
+		}
+		fail invalid("the interaction {i.id} was answered already: send a follow-up") when i.answered
+		let client = i.client
+		fail invalid("the interaction {i.id} came with no client to answer through") when client is none
+		i.answered = true
+		return try discard(try deliver(client, Call{method: http.Method.POST, path: "/interactions/{i.id}/{i.token}/callback", body: payload, files: uploads(files), bare: true}))
+	}
+
+	internal def originalEdit(i Interaction, body map<string, any>, files File[]) !none {
+		return try discard(try tokenCall(i, http.Method.PATCH, "/messages/@original", body, uploads(files)))
+	}
+
+	// A call on the interaction's webhook, `/webhooks/<app>/<token>`.
+	internal def tokenCall(i Interaction, method http.Method, rest string, body ?any = none, files File[] = []) !http.Response {
+		let client = i.client
+		fail invalid("the interaction {i.id} came with no client to answer through") when client is none
+		return try deliver(client, Call{method: method, path: "/webhooks/{i.applicationId}/{i.token}{rest}", body: body, files: files, bare: true})
+	}
+
+	// An answer the handler's request is waiting for.
+	internal struct Answer {
+		body  map<string, any>
+		files File[]
+	}
+
+	// The meeting point of the handler's request and the task running the
+	// program's callback: the first answer offered becomes the HTTP
+	// response, unless the wait ran out and the request answered with a
+	// deferral first.
+	internal type Exchange {
+		internal state   int           = 0
+		internal pending ?Answer       = none
+		ready            channel<none>
+
+		def new() {
+			ready = new channel<none>(1)
+		}
+
+		// Takes the answer while the request still waits; false once it
+		// deferred or was answered.
+		atomic def offer(a Answer) bool {
+			return false unless state == 0
+			state = 1
+			pending = a
+			ready.offer(none)
+			return true
+		}
+
+		// Ends the wait: the answer offered, or none after which the
+		// request defers.
+		atomic def close() ?Answer {
+			state = 2 when state == 0
+			return pending
+		}
+	}
+
+	partial type Client {
+		// A handler for std.net.http that receives the interactions Discord
+		// posts to the application's Interactions Endpoint URL: it checks
+		// each request's Ed25519 signature with `publicKey` (the
+		// application's, hex; "" takes `DISCORD_PUBLIC_KEY`, else
+		// `Client.app().verifyKey`), answers Discord's pings, and runs
+		// `handle` on its own task. The first answer `handle` gives becomes
+		// the HTTP response; when none came after `deferAfter`, the request
+		// answers with a deferral and the answer given later fills it in.
+		// A request whose signature does not verify gets 401.
+		def interactions(handle def (Interaction) !none, publicKey string = "", deferAfter duration = 2500ms) InteractionHandler {
+			return new InteractionHandler(self, handle, publicKey, deferAfter)
+		}
+	}
+
+	// The handler `Client.interactions` makes. Implements http.Handler.
+	type InteractionHandler {
+		internal client     Client
+		internal handle     def (Interaction) !none
+		internal keyHex     string
+		internal deferAfter duration
+		internal atomic key ?crypto.Ed25519PublicKey = none
+
+		def new(client Client, handle def (Interaction) !none, publicKey string, deferAfter duration) {
+			self.client = client
+			self.handle = handle
+			let env = Runtime.getEnv("DISCORD_PUBLIC_KEY")
+			keyHex = publicKey.len() > 0 ?? (publicKey, env is none ?? ("", env))
+			self.deferAfter = deferAfter
+		}
+
+		// Implements http.Handler. Fails when the public key cannot be
+		// read, or `handle` fails before it answers.
+		def serve(ctx http.Context) !none {
+			let body = try ctx.bytes()
+			let verifier = try publicKeyOf(self)
+			let signature = ctx.header("X-Signature-Ed25519")
+			let stamp = ctx.header("X-Signature-Timestamp")
+			let raw = hexdecode(signature) onerror recover byte[]
+			let signed = stamp.bytes() + body
+			return ctx.text(401, "invalid request signature") when raw.len() != 64 || stamp.len() == 0 || !verifier.verify(signed, raw)
+			let i = new Interaction()
+			(new JSON()).decode(body, i) onerror (err error) {
+				fail invalid("the interaction is not what Discord sends: {err.message}")
+			}
+			return ctx.json(map<string, any>{"type": 1}) when i.kind == InteractionType.Ping
+			i.client = client
+			let exchange = new Exchange()
+			i.exchange = exchange
+			let finished = new channel<?error>(1)
+			async runHandler(handle, i, finished)
+			let failure ?error = none
+			select {
+				case exchange.ready:
+				case finished:
+					failure = <-finished
+				case time.sleepChan(deferAfter):
+			}
+			let given = exchange.close()
+			if given is none {
+				fail failure unless failure is none
+				let kind = i.kind == InteractionType.Component ?? (6, 5)
+				i.deferred = true
+				i.answered = true
+				return ctx.json(map<string, any>{"type": kind})
+			}
+			return ctx.json(given.body) when given.files.len() == 0
+			let (data, contentType) = try formOf(given.body.get("data"), given.files, "", new map<string, string>())
+			return ctx.blob(200, contentType, data)
+		}
+	}
+
+	// Runs the program's callback on its own task and reports how it
+	// ended.
+	internal def runHandler(handle def (Interaction) !none, i Interaction, finished channel<?error>) {
+		let failure ?error = none
+		handle(i) onerror (err error) {
+			failure = err
+			recover none
+		}
+		finished <- failure
+	}
+
+	internal def publicKeyOf(h InteractionHandler) !crypto.Ed25519PublicKey {
+		let known = h.key
+		return known unless known is none
+		let text = h.keyHex
+		if text.len() == 0 {
+			let app = try h.client.app()
+			text = app.verifyKey
+		}
+		let key = try crypto.newEd25519PublicKey(try hexdecode(text))
+		h.key = key
+		return key
+	}
+}

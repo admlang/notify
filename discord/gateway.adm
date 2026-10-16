@@ -1,0 +1,608 @@
+partial module adm.notify.discord {
+	use (
+		std.time
+		std.math::(Random)
+		std.net.http
+		std.net.http.websocket
+		std.data.compress.zlib
+		std.data.encoding::(JSON, json)
+	)
+
+	// The events a Gateway session asks for; each turns on a family of
+	// events. GuildMembers, GuildPresences and MessageContent are
+	// privileged: the application's settings must allow them.
+	enum Intent {
+		Guilds                      = 0,
+		GuildMembers                = 1,
+		GuildModeration             = 2,
+		GuildExpressions            = 3,
+		GuildIntegrations           = 4,
+		GuildWebhooks               = 5,
+		GuildInvites                = 6,
+		GuildVoiceStates            = 7,
+		GuildPresences              = 8,
+		GuildMessages               = 9,
+		GuildMessageReactions       = 10,
+		GuildMessageTyping          = 11,
+		DirectMessages              = 12,
+		DirectMessageReactions      = 13,
+		DirectMessageTyping         = 14,
+		MessageContent              = 15,
+		GuildScheduledEvents        = 16,
+		AutoModerationConfiguration = 20,
+		AutoModerationExecution     = 21,
+		GuildMessagePolls           = 24,
+		DirectMessagePolls          = 25,
+	}
+
+	// The status a bot shows.
+	enum Status {
+		Online       = "online",
+		Idle         = "idle",
+		DoNotDisturb = "dnd",
+		Invisible    = "invisible",
+	}
+
+	// Sends a session may make a minute besides its heartbeats (Discord
+	// allows 120 in all).
+	internal const sendsPerMinute = 115
+
+	// A Gateway session of one shard: a WebSocket to Discord that delivers
+	// the events of `intents` as they happen and takes presence, voice and
+	// member requests. `next` drives it: it connects, identifies, keeps
+	// the heartbeat going on a task of its own, and when the connection
+	// drops (or Discord asks) reconnects and resumes the session, so the
+	// events missed in between still come; a session that cannot be
+	// resumed is identified anew (and Ready comes again).
+	//
+	// ```
+	// let gw = bot.gateway(discord.Intent.Guilds, discord.Intent.GuildMessages, discord.Intent.MessageContent)
+	// for let event in gw {
+	// 	match event {
+	// 		case discord.MessageCreate:
+	// 			try bot.send(event.message.channelId, "pong") when event.message.content == "!ping"
+	// 		default:
+	// 	}
+	// }
+	// ```
+	//
+	// `next` fails with DiscordError: Auth for a token Discord refuses,
+	// Invalid for intents the application may not use, a shard Discord
+	// refuses or sharding it requires, Transport once `reconnectLimit`
+	// dials in a row failed or after `close`.
+	type Gateway {
+		// The intents as Discord's bit set.
+		intents                    int
+		shard                      int             = 0
+		shards                     int             = 1
+		// Asks Discord to compress the connection (zlib-stream).
+		compress                   bool            = true
+		// Members past which a guild sends only those online.
+		largeThreshold             int             = 250
+		// The presence the session starts with.
+		status                     Status          = Status.Online
+		activities                 Activity[]
+		// Dials in a row that may fail before `next` does; 0 for no limit.
+		reconnectLimit             int             = 0
+		// The session, as READY opened it.
+		sessionId                  string          = ""
+		resumeURL                  string          = ""
+		// The sequence of the last event received.
+		sequence                   int             = 0
+		// The bot, as READY named it.
+		user                       User
+		// The time the last heartbeat took to be acknowledged.
+		latency                    duration        = 0s
+		// What ended iteration with `for`; none after `close`.
+		lastError                  ?error          = none
+		internal client            Client
+		internal url               string          = ""
+		internal conn              ?websocket.Conn = none
+		internal sender            ?Sender         = none
+		internal inflater          ?zlib.Inflater  = none
+		internal gate              ?IdentifyGate   = none
+		internal random            Random
+		internal atomic generation int             = 0
+		internal atomic acked      bool            = true
+		internal atomic beatSent   int64           = 0
+		internal atomic stopped    bool            = false
+		internal failures          int             = 0
+
+		def new(client Client, intents int, shard int = 0, shards int = 1) {
+			self.client = client
+			self.intents = intents
+			self.shard = shard
+			self.shards = shards
+			random = new Random(int(time.monoNs()) + shard)
+		}
+
+		// The next event, connecting first and reconnecting when the
+		// connection drops. Fails as the type says.
+		def next() !Event {
+			for {
+				fail DiscordError{message: "discord: the gateway session was closed", code: ErrorKind.Transport.value, kind: ErrorKind.Transport} when stopped
+				if conn is none {
+					let failure ?error = none
+					connect(self) onerror (err error) {
+						failure = err
+						recover none
+					}
+					if !(failure is none) {
+						drop(self)
+						// A token or intents Discord refuses end the session for
+						// good.
+						let fatal = failure is DiscordError && (failure.kind := ErrorKind.Auth || ErrorKind.Invalid)
+						fail failure when fatal || stopped
+						failures++
+						fail failure when reconnectLimit > 0 && failures >= reconnectLimit
+						time.sleep(backoff(self, failures))
+						continue
+					}
+					failures = 0
+				}
+				let open = conn
+				continue when open is none
+				let lost ?error = none
+				let payload = readPayload(self, open) onerror (err error) {
+					lost = err
+					recover byte[]
+				}
+				if !(lost is none) {
+					drop(self)
+					let code = 0
+					let reason = ""
+					if lost is websocket.WebSocketError && lost.kind == websocket.ErrorKind.Closed {
+						code = lost.closeCode
+						reason = lost.reason
+					}
+					let fatal = closeFailure(code, reason)
+					fail fatal unless fatal is none
+					continue
+				}
+				let frame = Frame{}
+				try (new JSON()).decode(payload, frame)
+				sequence = frame.s when frame.op == 0 && frame.s > 0
+				match frame.op {
+					case 0:
+						let event = try eventOf(frame.t, payload, client)
+						if event is Ready {
+							sessionId = event.sessionId
+							resumeURL = event.resumeURL
+							user = event.user
+						}
+						return event
+					case 1:
+						try write(self, open, heartbeatBody(sequence), true)
+					case 7:
+						open.closeWith(4000, "reconnect") onerror recover none
+						drop(self)
+					case 9:
+						let d = Dispatch<bool>{}
+						(new JSON()).decode(payload, d) onerror recover none
+						if !d.d {
+							sessionId = ""
+							sequence = 0
+						}
+						open.closeWith(4000, "invalid session") onerror recover none
+						drop(self)
+						time.sleep(duration(int64(1000000000.0 + random.of<float>() * 4000000000.0)))
+					case 11:
+						acked = true
+						latency = duration(time.monoNs() - beatSent)
+					default:
+				}
+			}
+			fail "discord: unreachable"
+		}
+
+		// Implements Iterator<Event>: the events until `close`, or until
+		// `next` fails (kept in `lastError`).
+		def iterate() ?Event {
+			let failure ?error = none
+			let event = next() onerror (err error) {
+				failure = err
+				recover RawEvent{}
+			}
+			if !(failure is none) {
+				lastError = stopped ?? (none, failure)
+				return none
+			}
+			return event
+		}
+
+		// Ends the session: Discord shows the bot offline and the session
+		// cannot be resumed.
+		def close() !none {
+			stopped = true
+			let open = conn
+			drop(self)
+			return none when open is none
+			open.close() onerror recover none
+			return none
+		}
+
+		// Changes the bot's status and activities (a custom status is an
+		// Activity of kind 4 whose `state` is the text). Fails with
+		// Transport when the session is not connected.
+		def setPresence(status Status = Status.Online, activities Activity[] = [], afk bool = false) !none {
+			self.status = status
+			self.activities = activities
+			return try sendOp(self, 3, presenceBody(self, afk))
+		}
+
+		// Asks for the members of a guild: those whose name starts with
+		// `query` ("" with `limit` 0: all of them, which needs Guild
+		// Members), or `userIds`; with `presences` their presences too.
+		// They come as MembersChunk events carrying `nonce`.
+		// Fails as every call does.
+		def requestMembers(guildId string, query string = "", limit int = 0, userIds string[] = [], presences bool = false, nonce string = "") !none {
+			let body = map<string, any>{"guild_id": guildId, "presences": presences}
+			if userIds.len() > 0 {
+				body.set("user_ids", texts(userIds))
+			} else {
+				body.set("query", query)
+				body.set("limit", limit)
+			}
+			body.set("nonce", nonce) when nonce.len() > 0
+			return try sendOp(self, 8, body)
+		}
+
+		// Joins the bot to a voice channel of a guild, moves it, or with
+		// `channelId` "" leaves; VoiceStateUpdate and VoiceServerUpdate
+		// follow.
+		// Fails as every call does.
+		def updateVoice(guildId string, channelId string = "", mute bool = false, deaf bool = false) !none {
+			let body = map<string, any>{"guild_id": guildId, "channel_id": channelId.len() > 0 ?? (channelId, none), "self_mute": mute, "self_deaf": deaf}
+			return try sendOp(self, 4, body)
+		}
+	}
+
+	// The writes of one connection, one at a time, with the pace Discord
+	// allows outside heartbeats.
+	internal type Sender {
+		conn                 websocket.Conn
+		internal windowStart int64          = 0
+		internal count       int            = 0
+
+		def new(conn websocket.Conn) {
+			self.conn = conn
+		}
+
+		// How long a send waits for its place; 0s takes it.
+		atomic def slot() duration {
+			let now = time.monoNs()
+			if now - windowStart >= 60000000000 {
+				windowStart = now
+				count = 0
+			}
+			return duration(windowStart + 60000000000 - now) when count >= sendsPerMinute
+			count++
+			return 0s
+		}
+
+		atomic def write(text string) !none {
+			return try conn.writeText(text)
+		}
+	}
+
+	// When shards may identify: those of one bucket (`shard %
+	// maxConcurrency`) five seconds apart. Shared by the shards of a group.
+	internal type IdentifyGate {
+		maxConcurrency int             = 1
+		internal last  map<int, int64>
+
+		def new(maxConcurrency int) {
+			self.maxConcurrency = maxConcurrency.max(1)
+		}
+
+		atomic def slot(shard int) duration {
+			let bucket = shard % maxConcurrency
+			let now = time.monoNs()
+			let before = last.get(bucket)
+			let at = before is none ?? (int64(0), before)
+			return duration(at + 5000000000 - now) when at > 0 && now - at < 5000000000
+			last.set(bucket, now)
+			return 0s
+		}
+	}
+
+	internal struct Hello {
+		@json("heartbeat_interval")
+		interval int
+	}
+
+	// Opens the connection: dials, reads Hello, starts the heartbeat, and
+	// resumes the session or identifies a new one.
+	internal def connect(g Gateway) !none {
+		let resuming = g.sessionId.len() > 0
+		if g.url.len() == 0 || !resuming {
+			let info = try g.client.gatewayBot()
+			g.url = info.url
+			let known = g.gate
+			g.gate = new IdentifyGate(info.limit.maxConcurrency) when known is none
+			time.sleep(duration(int64(info.limit.resetAfter) * 1000000)) when !resuming && info.limit.remaining == 0 && info.limit.resetAfter > 0
+		}
+		// An identify waits for its turn before the dial: a connection left
+		// waiting would miss its heartbeats.
+		let gate = g.gate
+		if !resuming && !(gate is none) {
+			let wait = gate.slot(g.shard)
+			for wait > 0s {
+				time.sleep(wait)
+				wait = gate.slot(g.shard)
+			}
+		}
+		let base = resuming && g.resumeURL.len() > 0 ?? (g.resumeURL, g.url)
+		let address = base.trimEnd("/") + "/?v=10&encoding=json" + (g.compress ?? ("&compress=zlib-stream", ""))
+		let (conn, _) = websocket.dial(address) onerror (err error) {
+			fail DiscordError{message: "discord: gateway {base}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+		}
+		g.inflater = g.compress ?? (new zlib.Inflater(), none)
+		let first = try readPayload(g, conn)
+		let hello = Dispatch<Hello>{}
+		try (new JSON()).decode(first, hello)
+		let frame = Frame{}
+		try (new JSON()).decode(first, frame)
+		fail DiscordError{message: "discord: the gateway opened with op {frame.op}, not Hello", code: ErrorKind.Server.value, kind: ErrorKind.Server} unless frame.op == 10 && hello.d.interval > 0
+		let sender = new Sender(conn)
+		g.conn = conn
+		g.sender = sender
+		g.generation++
+		g.acked = true
+		async heartbeat(g, g.generation, conn, sender, duration(int64(hello.d.interval) * 1000000))
+		return try write(g, conn, map<string, any>{"op": 6, "d": map<string, any>{"token": gatewayToken(g.client), "session_id": g.sessionId, "seq": g.sequence}}, true) when resuming
+		let identify = map<string, any>{"token": gatewayToken(g.client), "intents": g.intents, "large_threshold": g.largeThreshold, "compress": false}
+		identify.set("properties", map<string, any>{"os": "linux", "browser": "adm.notify.discord", "device": "adm.notify.discord"})
+		identify.set("shard", any[g.shard, g.shards]) when g.shards > 1
+		identify.set("presence", presenceBody(g, false))
+		return try write(g, conn, map<string, any>{"op": 2, "d": identify}, true)
+	}
+
+	// Beats every `interval` (the first after a random part of it) while
+	// `generation` is the connection's, and closes a connection whose
+	// last beat was never acknowledged, so `next` reconnects.
+	internal def heartbeat(g Gateway, generation int, conn websocket.Conn, sender Sender, interval duration) {
+		time.sleep(duration(int64(float(int64(interval)) * g.random.of<float>())))
+		for {
+			return when g.generation != generation || g.stopped
+			if !g.acked {
+				conn.closeWith(4000, "heartbeat not acknowledged") onerror recover none
+				return
+			}
+			g.acked = false
+			g.beatSent = time.monoNs()
+			let failed = false
+			sender.write(string((new JSON()).encode(heartbeatBody(g.sequence)))) onerror (err error) {
+				failed = true
+				recover none
+			}
+			return when failed
+			time.sleep(interval)
+		}
+	}
+
+	internal def heartbeatBody(sequence int) map<string, any> {
+		return map<string, any>{"op": 1, "d": sequence > 0 ?? (sequence, none)}
+	}
+
+	// The next payload of the connection, inflated: a zlib-stream message
+	// ends at the flush that closes it, which may take several frames.
+	internal def readPayload(g Gateway, conn websocket.Conn) !byte[] {
+		let out byte[] = []
+		for {
+			let (kind, data) = try conn.readMessage()
+			let inflater = g.inflater
+			return data when kind == websocket.MessageType.Text || inflater is none
+			out = out + try inflater.feed(data)
+			let n = data.len()
+			let flushed = n >= 4 && data[n - 4] == 0 && data[n - 3] == 0 && data[n - 2] == 0xff && data[n - 1] == 0xff
+			return out when flushed
+		}
+		fail "discord: unreachable"
+	}
+
+	// Sends op `op` with `d` on the session's connection, at the pace
+	// Discord allows. Fails with Transport when it is not connected.
+	internal def sendOp(g Gateway, op int, d any) !none {
+		let open = g.conn
+		fail DiscordError{message: "discord: the gateway session is not connected", code: ErrorKind.Transport.value, kind: ErrorKind.Transport} when open is none
+		return try write(g, open, map<string, any>{"op": op, "d": d}, false)
+	}
+
+	internal def write(g Gateway, conn websocket.Conn, payload map<string, any>, priority bool) !none {
+		let given = g.sender
+		let sender = given is none ?? (new Sender(conn), given)
+		if !priority {
+			let wait = sender.slot()
+			for wait > 0s {
+				time.sleep(wait)
+				wait = sender.slot()
+			}
+		}
+		sender.write(string((new JSON()).encode(payload))) onerror (err error) {
+			fail DiscordError{message: "discord: gateway send: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+		}
+		return none
+	}
+
+	// Forgets the connection: its heartbeat stops at its next beat.
+	internal def drop(g Gateway) {
+		g.generation++
+		g.conn = none
+		g.sender = none
+	}
+
+	internal def presenceBody(g Gateway, afk bool) map<string, any> {
+		let activities any[] = []
+		for let (_, a) in g.activities {
+			let entry = map<string, any>{"name": a.name, "type": a.kind}
+			entry.set("url", a.url) when a.url.len() > 0
+			entry.set("state", a.state) when a.state.len() > 0
+			activities.push(entry)
+		}
+		return map<string, any>{"since": none, "activities": activities, "status": g.status.value, "afk": afk}
+	}
+
+	internal def gatewayToken(client Client) string {
+		let key = client.token
+		return "" when key is none
+		let text = key.reveal()
+		return text.startsWith("Bot ") ?? (text[4:], text)
+	}
+
+	// The wait before redial `n` in a row: one second doubling to a
+	// minute, shortened at random by up to half.
+	internal def backoff(g Gateway, n int) duration {
+		let seconds = (1 << (n - 1).clamp(0, 6)).min(60)
+		let full = float(seconds) * 1000000000.0
+		return duration(int64(full * (0.5 + g.random.of<float>() * 0.5)))
+	}
+
+	// The failure a dropped connection ends the session with, by its close
+	// code (0 for none); none when it reconnects (resuming unless the code says the
+	// session is gone, which `next` then identifies anew).
+	internal def closeFailure(code int, reason string) ?DiscordError {
+		return DiscordError{message: "discord: the gateway refused the token ({code} {reason})", code: ErrorKind.Auth.value, kind: ErrorKind.Auth, status: code} when code == 4004
+		let refused = code := 4010 || 4011 || 4012 || 4013 || 4014
+		return DiscordError{message: "discord: the gateway refused the session ({code} {reason})", code: ErrorKind.Invalid.value, kind: ErrorKind.Invalid, status: code} when refused
+		return none
+	}
+
+	// One shard's event, from a ShardGroup.
+	struct ShardEvent {
+		shard   int
+		// The shard's session, to set presence or request members on.
+		gateway Gateway
+		event   Event
+	}
+
+	internal struct ShardItem {
+		event   ?ShardEvent = none
+		failure ?error      = none
+	}
+
+	// The Gateway sessions of every shard of a bot, read as one stream of
+	// events: each shard runs on its own task, identifying in the order
+	// Discord's concurrency limit allows. `next` fails as a Gateway's
+	// does, for any shard.
+	//
+	// ```
+	// let group = try bot.shards([discord.Intent.Guilds, discord.Intent.GuildMessages])
+	// for let item in group {
+	// 	match item.event {
+	// 		case discord.GuildCreate:
+	// 			print("shard {item.shard}: {item.event.guild.name}")
+	// 		default:
+	// 	}
+	// }
+	// ```
+	type ShardGroup {
+		gateways         Gateway[]
+		lastError        ?error             = none
+		internal events  channel<ShardItem>
+		internal started bool               = false
+
+		def new(gateways Gateway[]) {
+			self.gateways = gateways
+			events = new channel<ShardItem>(256)
+		}
+
+		// The next event of any shard. Fails as the type says.
+		def next() !ShardEvent {
+			if !started {
+				started = true
+				for let (_, g) in gateways {
+					async pump(g, events)
+				}
+			}
+			let item = <-events
+			let failure = item.failure
+			fail failure unless failure is none
+			let event = item.event
+			fail DiscordError{message: "discord: the shard group was closed", code: ErrorKind.Transport.value, kind: ErrorKind.Transport} when event is none
+			return event
+		}
+
+		// Implements Iterator<ShardEvent>.
+		def iterate() ?ShardEvent {
+			let failure ?error = none
+			let item = next() onerror (err error) {
+				failure = err
+				recover ShardEvent{}
+			}
+			if !(failure is none) {
+				lastError = failure
+				return none
+			}
+			return item
+		}
+
+		// Closes every shard's session.
+		// Fails as every call does.
+		def close() !none {
+			for let (_, g) in gateways {
+				try g.close()
+			}
+			events.offer(ShardItem{})
+			return none
+		}
+	}
+
+	internal def pump(g Gateway, out channel<ShardItem>) {
+		for {
+			let failure ?error = none
+			let event = g.next() onerror (err error) {
+				failure = err
+				recover RawEvent{}
+			}
+			if !(failure is none) {
+				out <- ShardItem{failure: g.stopped ?? (none, failure)} unless g.stopped
+				return
+			}
+			out <- ShardItem{event: ShardEvent{shard: g.shard, gateway: g, event: event}}
+		}
+	}
+
+	internal def intentBits(list Intent[]) int {
+		let bits = 0
+		for let (_, i) in list {
+			bits = bits | (1 << int(i))
+		}
+		return bits
+	}
+
+	partial type Client {
+		// The Gateway's address for the bot, its recommended shard count
+		// and its session limits.
+		// Fails as every call does.
+		def gatewayBot() !GatewayBot {
+			let out = GatewayBot{}
+			try decodeInto(try call(self, http.Method.GET, "/gateway/bot"), out)
+			return out
+		}
+
+		// A session of one shard (set `shard` and `shards` before the first
+		// `next` to run one of several) receiving the events of `intents`.
+		def gateway(intents ...Intent) Gateway {
+			return new Gateway(self, intentBits(intents))
+		}
+
+		// The sessions of every shard: `count` of them, or Discord's
+		// recommendation for 0, sharing the identify limits. Fails as every
+		// call does.
+		def shards(intents Intent[], count int = 0) !ShardGroup {
+			let info = try gatewayBot()
+			let total = count > 0 ?? (count, info.shards.max(1))
+			let gate = new IdentifyGate(info.limit.maxConcurrency)
+			let list Gateway[] = []
+			let bits = intentBits(intents)
+			for let k = 0; k < total; k++ {
+				let g = new Gateway(self, bits, k, total)
+				g.url = info.url
+				g.gate = gate
+				list.push(g)
+			}
+			return new ShardGroup(list)
+		}
+	}
+}

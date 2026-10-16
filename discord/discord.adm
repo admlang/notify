@@ -1,3 +1,397 @@
+// A Discord client over std.net.http: the REST API of API version 10
+// (messages, embeds, channels, threads, guilds, members, roles, emojis,
+// stickers, scheduled events, the audit log), webhooks, application
+// commands with the interactions they bring, and the Gateway for bots
+// that stay connected.
+//
+// ```
+// let bot = new discord.Client(botToken)            // DISCORD_TOKEN when left out
+// let embed = new discord.Embed("Release 1.4", "Now available")
+// embed.field("Downloads", "https://example.com/1.4")
+// try bot.send(channelId, "Release 1.4 is out", embeds = [embed])
+//
+// try discord.webhook(hookURL).send("Build passed")
+// ```
 partial module adm.notify.discord {
-	// Discord over std.net.http: REST (messages, embeds, channels, guilds, members), webhooks, application commands and interactions with Ed25519 verification, the Gateway over std.net.http.websocket with intents, sharding and resume
+	use (
+		std.bytes
+		std.errors
+		std.time
+		std.net.http
+		std.net.url
+		std.net.multipart
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON)
+	)
+
+	// Discord's API address; `baseURL` replaces it for a proxy.
+	const apiURL = "https://discord.com/api/v10"
+
+	// The library's version, in the User-Agent Discord asks bots to send.
+	const libraryVersion = "0.1.0"
+
+	// What went wrong, for the caller that acts on it.
+	enum ErrorKind {
+		// The token is missing or wrong (401), or lacks the permission or
+		// access the call needs (403).
+		Auth        = "auth",
+		// Discord refused the pace: `retryAfter` says how long to wait.
+		RateLimited = "ratelimited",
+		// The request breaks a rule: a limit of an embed or a component, a
+		// form field Discord rejects (`details` names each), a gateway
+		// intent the application may not use.
+		Invalid     = "invalid",
+		NotFound    = "notfound",
+		// Discord could not be reached, or the connection dropped.
+		Transport   = "transport",
+		// Discord failed (5xx), or answered with something that is not its
+		// API.
+		Server      = "server",
+	}
+
+	// The failure of every call here. `discordCode` is Discord's JSON error
+	// code (50035 for an invalid form body, 10008 for an unknown message,
+	// ...), `details` the field errors of an invalid body as
+	// `path: message`, `status` the HTTP status (0 when none came back),
+	// `retryAfter` the pause a rate limit asked for and `global` whether
+	// that limit covers every route.
+	struct DiscordError {
+		message     string
+		code        string
+		cause       ?error
+		stack       errors.StackTrace
+		kind        ErrorKind
+		status      int
+		discordCode int
+		details     string[]
+		retryAfter  ?duration
+		global      bool
+	}
+
+	// A connection to the Discord REST API as one bot: its token, and the
+	// rate limits Discord announced to it, which every call waits for
+	// before it goes out (per route, and the global 50 requests a second).
+	// It holds no connection of its own (std.net.http keeps them), so any
+	// number of tasks may share one.
+	//
+	// Calls fail with DiscordError: Auth for a missing or wrong token or a
+	// permission the bot lacks, NotFound for an unknown channel, message or
+	// guild, Invalid for a body Discord or the local limits refuse,
+	// RateLimited once `rateLimitRetries` waits were spent, Server and
+	// Transport.
+	partial type Client {
+		// `Bot <token>`; a token that starts with `Bearer ` is sent as it
+		// is, for the OAuth2 calls a user granted.
+		token            ?Secret<string>
+		// The API's base: `https://discord.com/api/v10`, or a proxy's.
+		baseURL          string
+		// How often a call refused with 429 is sent again after the wait
+		// Discord asked for, before it fails with RateLimited.
+		rateLimitRetries int             = 5
+		// The HTTP client requests go through: timeouts, a transport.
+		httpClient       http.Client
+		internal limits  Limiter
+		internal appId   string          = ""
+
+		// A client with `token` (else `DISCORD_TOKEN`), of the API at
+		// `baseURL` (else `DISCORD_API_URL`, else Discord's).
+		def new(token ?Secret<string> = none, baseURL string = "") {
+			let env = Runtime.getEnv("DISCORD_TOKEN")
+			self.token = token is none ?? (env is none ?? (none, env), token)
+			let envURL = Runtime.getEnv("DISCORD_API_URL")
+			let base = baseURL.len() > 0 ?? (baseURL, envURL is none ?? (apiURL, envURL))
+			self.baseURL = base.trimEnd("/")
+			httpClient = new http.Client()
+			httpClient.userAgent = "DiscordBot (https://github.com/admlang/notify, {libraryVersion})"
+			httpClient.retry = http.RetryPolicy{attempts: 2, statuses: [502, 503, 504]}
+			limits = new Limiter()
+		}
+
+		// The id of the bot's application, read once from
+		// `/oauth2/applications/@me`. Fails as every call does.
+		def applicationId() !string {
+			return appId when appId.len() > 0
+			let found = Application{}
+			try decodeInto(try call(self, http.Method.GET, "/oauth2/applications/@me"), found)
+			appId = found.id
+			return appId
+		}
+
+		// The application of the bot. Fails as every call does.
+		def app() !Application {
+			let found = Application{}
+			try decodeInto(try call(self, http.Method.GET, "/applications/@me"), found)
+			appId = found.id
+			return found
+		}
+	}
+
+	// One request: the method, the path under the API base with its query,
+	// a JSON body (none for none), files that turn the body into
+	// multipart/form-data with the JSON as `payload_json`, and the reason
+	// the audit log records.
+	internal struct Call {
+		method http.Method
+		path   string
+		body   ?any                = none
+		files  File[]
+		// The form field each file goes in: `files[n]` by default, a
+		// single name (`file`) for stickers.
+		field  string              = ""
+		// Form fields sent beside the files instead of `payload_json`.
+		form   map<string, string>
+		reason string              = ""
+		// Sent without the token: webhook and interaction-token routes.
+		bare   bool                = false
+	}
+
+	internal def call(client Client, method http.Method, path string, body ?any = none, reason string = "") !http.Response {
+		return try deliver(client, Call{method: method, path: path, body: body, reason: reason})
+	}
+
+	// Sends `c`, waiting first for the rate limit of its route and the
+	// global one, and again for every 429 Discord answers (up to
+	// `rateLimitRetries`). Fails with the DiscordError the reply describes
+	// when it is not a success.
+	internal def deliver(client Client, c Call) !http.Response {
+		let route = routeOf(c.method, c.path)
+		let attempt = 0
+		for {
+			let wait = client.limits.waitFor(route, !c.bare)
+			for wait > 0s {
+				time.sleep(wait)
+				wait = client.limits.waitFor(route, !c.bare)
+			}
+			let req = try requestOf(client, c)
+			let res = client.httpClient.do(req) onerror (err error) {
+				fail DiscordError{message: "discord: {c.path}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+			}
+			client.limits.update(route, res)
+			if res.status == 429 && attempt < client.rateLimitRetries {
+				let refused = try errorOf(res)
+				let pause = refused.retryAfter
+				let after = pause is none ?? (1s, pause)
+				client.limits.block(route, after, refused.global)
+				attempt++
+				continue
+			}
+			fail try errorOf(res) unless res.ok()
+			return res
+		}
+		fail "discord: unreachable"
+	}
+
+	internal def requestOf(client Client, c Call) !http.Request {
+		let req = try client.httpClient.request(c.method, client.baseURL + c.path)
+		let key = client.token
+		if !c.bare && !(key is none) {
+			let text = key.reveal()
+			req.headers.set("Authorization", text.startsWith("Bot ") || text.startsWith("Bearer ") ?? (text, "Bot " + text))
+		}
+		req.headers.set("X-Audit-Log-Reason", url.pathEscape(c.reason)) when c.reason.len() > 0
+		let body = c.body
+		if c.files.len() == 0 {
+			if !(body is none) {
+				req.replaceBody((new JSON()).encode(body))
+				req.headers.set("Content-Type", "application/json")
+			}
+			return req
+		}
+		let (data, kind) = try formOf(body, c.files, c.field, c.form)
+		req.replaceBody(data)
+		req.headers.set("Content-Type", kind)
+		return req
+	}
+
+	// A body of `files` as multipart/form-data, with the JSON `body` as
+	// `payload_json` (or the fields of `form`), and its Content-Type. Each
+	// file goes in `files[n]`, or in `field` when given.
+	internal def formOf(body ?any, files File[], field string, fields map<string, string>) !(byte[], string) {
+		let buffer = new bytes.Buffer()
+		let form = new multipart.Writer(buffer)
+		try form.writeField("payload_json", string((new JSON()).encode(body))) unless body is none
+		for let (name, value) in fields {
+			try form.writeField(name, value)
+		}
+		for let (k, f) in files {
+			let name = field.len() > 0 ?? (field, "files[{k}]")
+			let headers = map<string, string[]>{"Content-Disposition": ["form-data; name=\"{name}\"; filename=\"{quoted(f.name)}\""], "Content-Type": [f.contentType.len() > 0 ?? (f.contentType, "application/octet-stream")]}
+			let part = try form.createPart(headers)
+			try part.write(f.data)
+		}
+		try form.close()
+		return (buffer.bytes(), form.formDataContentType())
+	}
+
+	// A file name inside a quoted header parameter.
+	internal def quoted(name string) string {
+		return name.replace("\\", "\\\\").replace("\"", "\\\"")
+	}
+
+	// The rate-limit route of a request: its method and path with the ids
+	// replaced, except the major parameter Discord keys limits on (the
+	// channel, guild or webhook the path starts with); a reaction's emoji
+	// is one route for every emoji.
+	internal def routeOf(method http.Method, path string) string {
+		let plain = path.split("?")[0]
+		let parts = plain.split("/")
+		let out string[]
+		let top = parts.len() > 1 ?? (parts[1], "")
+		for let (k, p) in parts {
+			let previous = k > 0 ?? (parts[k - 1], "")
+			if previous == "reactions" {
+				out.push(":emoji")
+				continue
+			}
+			let owner = previous := "channels" || "guilds" || "webhooks"
+			let major = k == 2 && owner
+			// An interaction's id and token are one route for every
+			// interaction.
+			let early = k := 2 || 3
+			let interaction = top == "interactions" && early
+			out.push((isId(p) && !major || interaction) ?? (":id", p))
+		}
+		return "{method.value} {out.join("/")}"
+	}
+
+	internal def isId(text string) bool {
+		return text.len() > 0 && text.isNumeric()
+	}
+
+	// The DiscordError a reply's status and body describe:
+	// `{"code", "message", "errors"}`, or a rate limit's
+	// `{"message", "retry_after", "global"}`.
+	internal def errorOf(res http.Response) !DiscordError {
+		let text = res.text() onerror recover ""
+		res.close() onerror recover none
+		let parsed = (new JSON()).parse(text) onerror recover none
+		let body = parsed is map<string, any> ?? (parsed, new map<string, any>())
+		let kind = kindOf(res.status)
+		let message = textAt(body, "message")
+		let failure = DiscordError{message: "discord: {message.len() > 0 ?? (message, text.len() > 0 ?? (text.trim(), res.reason))}", code: kind.value, kind: kind, status: res.status, discordCode: intAt(body, "code")}
+		let errors = body.get("errors")
+		flattenErrors(errors, "", failure.details) unless errors is none
+		failure.message += " ({failure.details.join("; ")})" when failure.details.len() > 0
+		if res.status == 429 {
+			let after = body.get("retry_after")
+			let seconds = after is float ?? (after, after is int ?? (float(after), -1.0))
+			failure.retryAfter = seconds >= 0.0 ?? (duration(int64(seconds * 1000000000.0)), res.retryAfter())
+			failure.global = boolAt(body, "global") || res.header("X-RateLimit-Global") == "true"
+		}
+		return failure
+	}
+
+	internal def kindOf(status int) ErrorKind {
+		return ErrorKind.Auth when status := 401 || 403
+		return ErrorKind.NotFound when status == 404
+		return ErrorKind.RateLimited when status == 429
+		return ErrorKind.Server when status >= 500
+		return ErrorKind.Invalid
+	}
+
+	// Discord's nested field errors, `{"embeds": {"0": {"title":
+	// {"_errors": [{"code", "message"}]}}}`, as `embeds.0.title: message`.
+	internal def flattenErrors(node any, path string, out string[]) {
+		return unless node is map<string, any>
+		for let (key, value) in node {
+			if key == "_errors" && value is any[] {
+				for let (_, e) in value {
+					out.push("{path}: {textAt(e, "message")}") when e is map<string, any>
+				}
+				continue
+			}
+			flattenErrors(value, path.len() > 0 ?? ("{path}.{key}", key), out)
+		}
+	}
+
+	// Binds a reply's JSON onto `target`. Fails with DiscordError Server
+	// when the body is not JSON of that shape.
+	internal def decodeInto(res http.Response, target any) !none {
+		let data = res.bytes() onerror (err error) {
+			fail DiscordError{message: "discord: the reply was cut short: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport, status: res.status}
+		}
+		(new JSON()).decode(data, target) onerror (err error) {
+			fail DiscordError{message: "discord: the reply is not what the API sends: {err.message}", code: ErrorKind.Server.value, cause: err, kind: ErrorKind.Server, status: res.status}
+		}
+		return none
+	}
+
+	// The body a reply's array is bound through: the JSON codec binds
+	// objects onto typed values, not a top-level array.
+	internal struct Items<T> {
+		items T[]
+	}
+
+	// Binds a reply's JSON array as T[]. Fails as `decodeInto` does.
+	internal def listOf<T>(res http.Response) !T[] {
+		let data = res.bytes() onerror (err error) {
+			fail DiscordError{message: "discord: the reply was cut short: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport, status: res.status}
+		}
+		let box = Items<T>{}
+		(new JSON()).decode("\{\"items\":".bytes() + data + "}".bytes(), box) onerror (err error) {
+			fail DiscordError{message: "discord: the reply is not what the API sends: {err.message}", code: ErrorKind.Server.value, cause: err, kind: ErrorKind.Server, status: res.status}
+		}
+		return box.items
+	}
+
+	// Drops a reply whose body nobody reads (204 and the like).
+	internal def discard(res http.Response) !none {
+		res.close() onerror recover none
+		return none
+	}
+
+	// A failure raised before anything is sent: a limit the request breaks.
+	internal def invalid(message string) DiscordError {
+		return DiscordError{message: "discord: {message}", code: ErrorKind.Invalid.value, kind: ErrorKind.Invalid}
+	}
+
+	// `?key=value&...` of the pairs whose value is not empty; "" when none
+	// is.
+	internal def queryOf(pairs map<string, string>) string {
+		let out string[]
+		for let (k, v) in pairs {
+			out.push("{k}={url.queryEscape(v)}") when v.len() > 0
+		}
+		return out.len() > 0 ?? ("?" + out.join("&"), "")
+	}
+
+	// The text of `key` in an object; "" when absent or not a string.
+	internal def textAt(object map<string, any>, key string) string {
+		let v = object.get(key)
+		return v when v is string
+		return "{v}" when v is int
+		return ""
+	}
+
+	internal def intAt(object map<string, any>, key string) int {
+		let v = object.get(key)
+		return v when v is int
+		return int(v) when v is float
+		return 0
+	}
+
+	internal def boolAt(object map<string, any>, key string) bool {
+		let v = object.get(key)
+		return v is bool && v
+	}
+
+	internal def objectAt(object map<string, any>, key string) map<string, any> {
+		let v = object.get(key)
+		return v is map<string, any> ?? (v, new map<string, any>())
+	}
+
+	internal def texts(list string[]) any[] {
+		let out any[] = []
+		for let (_, s) in list {
+			out.push(s)
+		}
+		return out
+	}
+
+	// The time a snowflake id was made: its top 42 bits count
+	// milliseconds since the start of 2015.
+	def createdAt(id string) time.Time {
+		let ms = id.isNumeric() ?? (int64(id.toInt<uint64>() >> 22) + 1420070400000, int64(0))
+		return time.fromUnixNs(ms * 1000000)
+	}
 }

@@ -1,0 +1,105 @@
+partial module adm.notify.discord {
+	use (
+		std.time
+		std.net.http
+	)
+
+	// What Discord last said of one rate-limit bucket: the requests left
+	// and when the count fills up again (monotonic nanoseconds).
+	internal struct Bucket {
+		limit     int   = 1
+		remaining int   = 1
+		resetAt   int64 = 0
+	}
+
+	// The rate limits of one token, as Discord announces them in each
+	// reply's `X-RateLimit-*` headers: a bucket per route and major
+	// parameter (the channel, guild or webhook), the global limit of
+	// `perSecond` requests, and a global pause a 429 can ask for. Safe from
+	// many tasks.
+	internal type Limiter {
+		// Requests a second across every route; Discord's global limit for
+		// a bot is 50.
+		perSecond            int                 = 50
+		internal routes      map<string, string>
+		internal buckets     map<string, Bucket>
+		internal globalUntil int64               = 0
+		internal windowStart int64               = 0
+		internal windowCount int                 = 0
+
+		def new() {}
+
+		// How long a request on `route` has to wait before it may go out;
+		// 0s takes its place in the bucket (and in the global count when
+		// `global`: webhook and interaction-token routes are outside it).
+		atomic def waitFor(route string, global bool) duration {
+			let now = time.monoNs()
+			if global {
+				return duration(globalUntil - now) when globalUntil > now
+				if now - windowStart >= 1000000000 {
+					windowStart = now
+					windowCount = 0
+				}
+				return duration(windowStart + 1000000000 - now) when windowCount >= perSecond
+			}
+			let bucket = buckets.get(keyOf(routes, route))
+			if !(bucket is none) {
+				if bucket.resetAt <= now {
+					bucket.remaining = bucket.limit
+				} else if bucket.remaining <= 0 {
+					return duration(bucket.resetAt - now)
+				}
+				bucket.remaining--
+			}
+			windowCount++ when global
+			return 0s
+		}
+
+		// Takes what a reply says of its bucket: `X-RateLimit-Bucket`,
+		// `-Limit`, `-Remaining` and `-Reset-After`.
+		atomic def update(route string, res http.Response) {
+			let hash = res.header("X-RateLimit-Bucket")
+			return when hash.len() == 0
+			routes.set(route, hash)
+			let key = keyOf(routes, route)
+			let found = buckets.get(key)
+			let bucket = found is none ?? (Bucket{}, found)
+			let limit = res.header("X-RateLimit-Limit")
+			bucket.limit = limit.toInt<int>() when limit.isNumeric()
+			let remaining = res.header("X-RateLimit-Remaining")
+			bucket.remaining = remaining.toInt<int>() when remaining.isNumeric()
+			let after = res.header("X-RateLimit-Reset-After")
+			bucket.resetAt = time.monoNs() + int64(parseFloat<float>(after) * 1000000000.0) when after.len() > 0
+			buckets.set(key, bucket)
+		}
+
+		// Holds back `route` (or every route, when `global`) for `after`,
+		// as a 429 asked.
+		atomic def block(route string, after duration, global bool) {
+			let until = time.monoNs() + int64(after)
+			if global {
+				globalUntil = until when until > globalUntil
+				return
+			}
+			let key = keyOf(routes, route)
+			let found = buckets.get(key)
+			let bucket = found is none ?? (Bucket{}, found)
+			bucket.remaining = 0
+			bucket.resetAt = until
+			buckets.set(key, bucket)
+		}
+	}
+
+	// The bucket of a route: the hash Discord named for it with the
+	// route's major parameter, or the route itself before any reply named
+	// one.
+	internal def keyOf(routes map<string, string>, route string) string {
+		let hash = routes.get(route)
+		return route when hash is none
+		let parts = route.split("/")
+		let major = parts.len() > 2 ?? (parts[2], "")
+		let top = parts.len() > 1 ?? (parts[1], "")
+		let keyed = top := "channels" || "guilds" || "webhooks"
+		return keyed ?? ("{hash}:{major}", hash)
+	}
+}
