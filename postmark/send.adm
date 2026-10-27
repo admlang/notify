@@ -1,0 +1,383 @@
+partial module adm.notify.postmark {
+	use (
+		std.net.http
+		std.formats.mail
+		std.data.encoding::(JSON, base64encode)
+	)
+
+	// The most recipients (To, Cc and Bcc) one message takes.
+	internal const maxRecipients = 50
+
+	// The largest message Postmark takes, attachments counted.
+	internal const maxMessageBytes = 10 * 1024 * 1024
+
+	// The most messages, and bytes, one batch call takes; larger batches
+	// are split.
+	internal const maxBatch = 500
+	internal const maxBatchBytes = 50 * 1024 * 1024
+
+	// The longest tag, and the most metadata fields with their key and
+	// value lengths.
+	internal const maxTagLength = 1000
+	internal const maxMetadataFields = 10
+	internal const maxMetadataKey = 20
+	internal const maxMetadataValue = 80
+
+	// Which links Postmark rewrites to count clicks.
+	enum LinkTracking {
+		None        = "None",
+		HtmlAndText = "HtmlAndText",
+		HtmlOnly    = "HtmlOnly",
+		TextOnly    = "TextOnly",
+	}
+
+	// What Postmark answered for one message: accepted (`errorCode` 0) with
+	// its id and time, or refused with Postmark's code and text (a batch
+	// answers each message apart).
+	struct Sent {
+		to          string
+		submittedAt string
+		messageId   string
+		errorCode   int
+		message     string
+	}
+
+	// A file sent with a template message: attached, or inline where the
+	// HTML refers to `cid:<contentId>`.
+	struct Attachment {
+		name      string
+		data      byte[]
+		// The media type: `application/octet-stream` when "".
+		mediaType string = ""
+		contentId string = ""
+	}
+
+	// A message made from a stored template (by alias or id) filled with
+	// `model`.
+	//
+	// ```
+	// let welcome = new postmark.Template("welcome", to = "ana@example.net", model = {"name": "Ana"}, from = "orders@example.com")
+	// try pm.send(welcome, tag = "welcome")
+	// ```
+	type Template {
+		alias       string
+		id          int                 = 0
+		model       map<string, any>
+		// Mailboxes: the sender, and recipients separated by commas.
+		from        string
+		to          string
+		cc          string              = ""
+		bcc         string              = ""
+		replyTo     string              = ""
+		// Postmark inlines the template's CSS into the HTML.
+		inlineCss   bool                = true
+		headers     map<string, string>
+		attachments Attachment[]
+
+		// A message from the template `alias` to `to`, filled with `model`.
+		def new(alias string, to string = "", model map<string, any> = new map<string, any>(), from string = "") {
+			self.alias = alias
+			self.to = to
+			self.model = model
+			self.from = from
+		}
+
+		// A message from the template `id` to `to`, filled with `model`.
+		def new(id int, to string = "", model map<string, any> = new map<string, any>(), from string = "") {
+			self.alias = ""
+			self.id = id
+			self.to = to
+			self.model = model
+			self.from = from
+		}
+
+		// Attaches `data` as `name`; with a `contentId`, inline where the
+		// template's HTML refers to `cid:<contentId>`.
+		def attach(name string, data byte[], mediaType string = "", contentId string = "") Template {
+			attachments.push(Attachment{name: name, data: data, mediaType: mediaType, contentId: contentId})
+			return self
+		}
+	}
+
+	// How messages of one call go out; a message's own `X-PM-Tag`,
+	// `X-PM-Message-Stream`, `X-PM-Metadata-<key>`, `X-PM-TrackOpens` and
+	// `X-PM-TrackLinks` headers win over these for that message.
+	internal struct Settings {
+		stream     string
+		tag        string
+		metadata   map<string, string>
+		trackOpens ?bool
+		trackLinks ?LinkTracking
+	}
+
+	// Sending.
+	partial type Client {
+		// Sends `message` (From, To, Cc, Bcc, Reply-To, Subject, the text and
+		// HTML bodies, attachments and inline parts, other headers) on
+		// `stream` ("" is the server's default transactional stream), with
+		// a `tag`, `metadata` handed back in events, and tracking (none
+		// keeps the server's setting). Returns what Postmark accepted.
+		// Fails with Invalid when the message has no sender, no recipient,
+		// more than 50, no body, or breaks a limit of tags, metadata or
+		// size, with Inactive when every recipient is suppressed, and as
+		// every call does.
+		def send(message mail.Message, stream string = "", tag string = "", metadata map<string, string> = new map<string, string>(), trackOpens ?bool = none, trackLinks ?LinkTracking = none) !Sent {
+			let body = try bodyOf(message, Settings{stream: stream, tag: tag, metadata: metadata, trackOpens: trackOpens, trackLinks: trackLinks})
+			try checkSize(body, maxMessageBytes)
+			let sent = Sent{}
+			try decodeInto(try call(self, http.Method.POST, "/email", body), sent)
+			return sent
+		}
+
+		// Sends `template` as `send` sends a message. Fails as `send` does,
+		// and with NotFound for an unknown template.
+		def send(template Template, stream string = "", tag string = "", metadata map<string, string> = new map<string, string>(), trackOpens ?bool = none, trackLinks ?LinkTracking = none) !Sent {
+			let body = try templateBodyOf(template, Settings{stream: stream, tag: tag, metadata: metadata, trackOpens: trackOpens, trackLinks: trackLinks})
+			try checkSize(body, maxMessageBytes)
+			let sent = Sent{}
+			try decodeInto(try call(self, http.Method.POST, "/email/withTemplate", body), sent)
+			return sent
+		}
+
+		// Sends `messages` with the settings of `send`, in calls of up to
+		// 500 messages and 50 MB. Returns one Sent per message, in order:
+		// a message Postmark refused has its `errorCode`. Fails before
+		// sending anything when a message breaks a limit `send` checks,
+		// and as every call does.
+		def sendBatch(messages mail.Message[], stream string = "", tag string = "", metadata map<string, string> = new map<string, string>(), trackOpens ?bool = none, trackLinks ?LinkTracking = none) !Sent[] {
+			let settings = Settings{stream: stream, tag: tag, metadata: metadata, trackOpens: trackOpens, trackLinks: trackLinks}
+			let bodies map<string, any>[] = []
+			for let message in messages {
+				let body = try bodyOf(message, settings)
+				try checkSize(body, maxMessageBytes)
+				bodies.push(body)
+			}
+			return try batch(self, "/email/batch", bodies, false)
+		}
+
+		// Sends `templates` as `sendBatch` sends messages. Fails as
+		// `sendBatch` does.
+		def sendBatch(templates Template[], stream string = "", tag string = "", metadata map<string, string> = new map<string, string>(), trackOpens ?bool = none, trackLinks ?LinkTracking = none) !Sent[] {
+			let settings = Settings{stream: stream, tag: tag, metadata: metadata, trackOpens: trackOpens, trackLinks: trackLinks}
+			let bodies map<string, any>[] = []
+			for let template in templates {
+				let body = try templateBodyOf(template, settings)
+				try checkSize(body, maxMessageBytes)
+				bodies.push(body)
+			}
+			return try batch(self, "/email/batchWithTemplates", bodies, true)
+		}
+	}
+
+	// Posts `bodies` to a batch endpoint in calls within its limits; the
+	// template endpoint takes them under `Messages`.
+	internal def batch(client Client, path string, bodies map<string, any>[], wrapped bool) !Sent[] {
+		let out Sent[] = []
+		let codec = new JSON()
+		let chunk any[] = []
+		let size = 0
+		for let body in bodies {
+			let bytes = codec.encode(body).len()
+			if chunk.len() > 0 && (chunk.len() == maxBatch || size + bytes > maxBatchBytes) {
+				out.push(...try postBatch(client, path, chunk, wrapped))
+				chunk = []
+				size = 0
+			}
+			chunk.push(body)
+			size += bytes
+		}
+		out.push(...try postBatch(client, path, chunk, wrapped)) when chunk.len() > 0
+		return out
+	}
+
+	internal def postBatch(client Client, path string, chunk any[], wrapped bool) !Sent[] {
+		let body any = wrapped ?? (map<string, any>{"Messages": chunk}, chunk)
+		return try listOf<Sent>(try call(client, http.Method.POST, path, body))
+	}
+
+	// Fails with Invalid when `body` is larger than `limit` as JSON.
+	internal def checkSize(body map<string, any>, limit int) !none {
+		let size = (new JSON()).encode(body).len()
+		fail invalid("the message is {size} bytes, more than the {limit} Postmark takes") when size > limit
+		return none
+	}
+
+	// The send body of a std message under `settings`.
+	internal def bodyOf(message mail.Message, settings Settings) !map<string, any> {
+		let body = new map<string, any>()
+		let authors = message.from() onerror (err error) {
+			fail invalid("From does not parse: {err.message}")
+		}
+		fail invalid("the message has no From") when authors.len() == 0
+		body.set("From", authors[0].str())
+		let recipients = 0
+		for let field in ["To", "Cc", "Bcc", "Reply-To"] {
+			let list = message.header.addresses(field) onerror (err error) {
+				fail invalid("{field} does not parse: {err.message}")
+			}
+			recipients += list.len() when field != "Reply-To"
+			body.set(field.replace("-", ""), joined(list)) when list.len() > 0
+		}
+		try checkRecipients(recipients)
+		let subject = message.subject()
+		body.set("Subject", subject) when subject.len() > 0
+		let text = message.text()
+		body.set("TextBody", text) unless text is none || text.len() == 0
+		let html = message.html()
+		body.set("HtmlBody", html) unless html is none || html.len() == 0
+		fail invalid("the message has no text or HTML body") unless body.hasKey("TextBody") || body.hasKey("HtmlBody")
+		let files any[] = []
+		for let part in message.body.walk() {
+			continue when part.isMultipart()
+			let name = part.filename()
+			let cid = part.contentId()
+			if part.isAttachment() {
+				files.push(attachmentOf(Attachment{name: name is none ?? ("attachment", name), data: part.data(), mediaType: part.contentType().essence()}))
+			} else if !(cid is none) {
+				files.push(attachmentOf(Attachment{name: name is none ?? (cid, name), data: part.data(), mediaType: part.contentType().essence(), contentId: cid}))
+			}
+		}
+		body.set("Attachments", files) when files.len() > 0
+		let own = Settings{stream: settings.stream, tag: settings.tag, metadata: settings.metadata.clone(), trackOpens: settings.trackOpens, trackLinks: settings.trackLinks}
+		let headers any[] = []
+		for let name in message.header.names() {
+			let value = message.header.get(name)
+			continue when value is none
+			continue when try setting(own, name, value)
+			continue when reservedHeader(name)
+			headers.push(map<string, any>{"Name": name, "Value": value})
+		}
+		body.set("Headers", headers) when headers.len() > 0
+		try settle(body, own)
+		return body
+	}
+
+	// The send body of a template message under `settings`.
+	internal def templateBodyOf(template Template, settings Settings) !map<string, any> {
+		fail invalid("template {template.alias} has no sender") when template.from.len() == 0
+		let body = new map<string, any>()
+		if template.alias.len() > 0 {
+			body.set("TemplateAlias", template.alias)
+		} else {
+			body.set("TemplateId", template.id)
+		}
+		body.set("TemplateModel", template.model)
+		body.set("InlineCss", template.inlineCss)
+		body.set("From", (try mailboxes(template.from))[0].str())
+		let recipients = 0
+		let fields = map<string, string>{"To": template.to, "Cc": template.cc, "Bcc": template.bcc, "ReplyTo": template.replyTo}
+		for let (key, text) in fields {
+			continue when text.trim().len() == 0
+			let list = try mailboxes(text)
+			recipients += list.len() when key != "ReplyTo"
+			body.set(key, joined(list))
+		}
+		try checkRecipients(recipients)
+		let own = Settings{stream: settings.stream, tag: settings.tag, metadata: settings.metadata.clone(), trackOpens: settings.trackOpens, trackLinks: settings.trackLinks}
+		let headers any[] = []
+		for let (name, value) in template.headers {
+			continue when try setting(own, name, value)
+			headers.push(map<string, any>{"Name": name, "Value": value})
+		}
+		body.set("Headers", headers) when headers.len() > 0
+		let files any[] = []
+		for let a in template.attachments {
+			files.push(attachmentOf(a))
+		}
+		body.set("Attachments", files) when files.len() > 0
+		try settle(body, own)
+		return body
+	}
+
+	internal def checkRecipients(count int) !none {
+		fail invalid("the message has no recipient") when count == 0
+		fail invalid("{count} recipients, more than the {maxRecipients} Postmark takes") when count > maxRecipients
+		return none
+	}
+
+	// Takes an `X-PM-*` header into `settings`; false for another header.
+	// Fails with Invalid on a tracking value Postmark does not know.
+	internal def setting(settings Settings, name string, value string) !bool {
+		let lower = name.lower()
+		return false unless lower.startsWith("x-pm-")
+		if lower == "x-pm-tag" {
+			settings.tag = value
+		} else if lower == "x-pm-message-stream" {
+			settings.stream = value
+		} else if lower.startsWith("x-pm-metadata-") {
+			settings.metadata.set(name[14:], value)
+		} else if lower == "x-pm-trackopens" {
+			settings.trackOpens = value.trim().lower() == "true"
+		} else if lower == "x-pm-tracklinks" {
+			let found = linkTrackingOf(value.trim())
+			fail invalid("X-PM-TrackLinks \"{value}\" is not one of None, HtmlAndText, HtmlOnly, TextOnly") when found is none
+			settings.trackLinks = found
+		} else {
+			return false
+		}
+		return true
+	}
+
+	internal def linkTrackingOf(text string) ?LinkTracking {
+		switch text.lower() {
+			case "none":
+				return LinkTracking.None
+			case "htmlandtext":
+				return LinkTracking.HtmlAndText
+			case "htmlonly":
+				return LinkTracking.HtmlOnly
+			case "textonly":
+				return LinkTracking.TextOnly
+			default:
+				return none
+		}
+	}
+
+	// Headers Postmark sets from its own fields.
+	internal def reservedHeader(name string) bool {
+		let lower = name.lower()
+		return lower.startsWith("content-") || (lower := "from" || "to" || "cc" || "bcc" || "reply-to" || "subject" || "date" || "mime-version")
+	}
+
+	// Adds the settings to a send body, checking Postmark's limits first.
+	internal def settle(body map<string, any>, settings Settings) !none {
+		fail invalid("the tag is longer than {maxTagLength} characters") when settings.tag.len() > maxTagLength
+		fail invalid("{settings.metadata.len()} metadata fields, more than {maxMetadataFields}") when settings.metadata.len() > maxMetadataFields
+		for let (key, value) in settings.metadata {
+			fail invalid("metadata key \"{key}\" is longer than {maxMetadataKey} characters") when key.len() > maxMetadataKey
+			fail invalid("metadata \"{key}\" is longer than {maxMetadataValue} characters") when value.len() > maxMetadataValue
+		}
+		body.set("MessageStream", settings.stream) when settings.stream.len() > 0
+		body.set("Tag", settings.tag) when settings.tag.len() > 0
+		body.set("Metadata", settings.metadata) when settings.metadata.len() > 0
+		let opens = settings.trackOpens
+		body.set("TrackOpens", opens) unless opens is none
+		let links = settings.trackLinks
+		body.set("TrackLinks", links.value) unless links is none
+		return none
+	}
+
+	internal def attachmentOf(a Attachment) map<string, any> {
+		let out = map<string, any>{"Name": a.name, "Content": base64encode(a.data), "ContentType": a.mediaType.len() > 0 ?? (a.mediaType, "application/octet-stream")}
+		out.set("ContentID", "cid:" + a.contentId) when a.contentId.len() > 0
+		return out
+	}
+
+	// Mailboxes as Postmark takes them: one string, separated by commas.
+	internal def joined(list mail.Address[]) string {
+		let out string[] = []
+		for let a in list {
+			out.push(a.str())
+		}
+		return out.join(", ")
+	}
+
+	// The mailboxes of `text`. Fails with Invalid when one does not parse.
+	internal def mailboxes(text string) !mail.Address[] {
+		let list = mail.parseAddressList(text) onerror (err error) {
+			fail invalid("\"{text}\" is not a mailbox: {err.message}")
+		}
+		fail invalid("\"{text}\" names no mailbox") when list.len() == 0
+		return list
+	}
+}

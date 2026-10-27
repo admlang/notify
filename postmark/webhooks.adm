@@ -1,0 +1,236 @@
+partial module adm.notify.postmark {
+	use (
+		std.crypto
+		std.formats
+		std.formats::(MediaType)
+		std.formats.mail
+		std.net.http
+		std.data.encoding::(JSON, base64decode)
+	)
+
+	// A message the receiving server accepted.
+	struct Delivery {
+		recordType    string
+		messageId     string
+		messageStream string
+		serverId      int
+		recipient     string
+		tag           string
+		deliveredAt   string
+		// The receiving server's answer.
+		details       string
+		metadata      map<string, string>
+	}
+
+	// A recipient marked a message as spam; Postmark deactivated the
+	// address. The fields are those of a bounce.
+	struct SpamComplaint {
+		Bounce
+	}
+
+	// A recipient's address was suppressed on a stream, or the
+	// suppression lifted (`suppressSending` false).
+	struct SubscriptionChange {
+		recordType        string
+		messageId         string
+		messageStream     string
+		serverId          int
+		recipient         string
+		tag               string
+		changedAt         string
+		// `Recipient`, `Customer` or `Admin`.
+		origin            string
+		suppressSending   bool
+		// `HardBounce`, `SpamComplaint` or `ManualSuppression`.
+		suppressionReason string
+		metadata          map<string, string>
+	}
+
+	// Mail the server received: the message rebuilt as a std.formats.mail
+	// message, and the fields Postmark posted, `details`, among them the
+	// address it came to and the reply text without the quote.
+	struct Inbound {
+		message mail.Message
+		details InboundMessage
+	}
+
+	// What a Postmark webhook posts. Opens and clicks are `Open` and
+	// `Click`, as searches return them.
+	type Event = Delivery | Bounce | SpamComplaint | Open | Click | SubscriptionChange | Inbound
+
+	// The webhook receiver, an http.Handler for every webhook of a server
+	// (delivery, bounce, spam complaint, open, click, subscription change,
+	// inbound): it checks the request's credentials and hands the event to
+	// `handle`. With `username`, a request must carry those Basic
+	// credentials (the webhook's HTTP authentication); with `header`, that
+	// header must hold `secret` (one of the webhook's custom headers). A
+	// request that fails either is answered 401, a body that is not an
+	// event 400, an event `handle` fails on 500, which Postmark posts again
+	// later. A record type this version does not know is answered 200 and
+	// not handed out.
+	//
+	// ```
+	// try server.handle("POST /postmark", postmark.webhook(def (event postmark.Event) !none {
+	//     match event {
+	//         case postmark.Bounce:
+	//             print("{event.email}: {event.description}")
+	//         case postmark.Inbound:
+	//             print(event.message.subject())
+	//         default:
+	//     }
+	//     return none
+	// }, header = "X-Webhook-Secret", secret = hookSecret))
+	// ```
+	type WebhookHandler {
+		username        string           = ""
+		password        ?Secret<string>  = none
+		header          string           = ""
+		secret          ?Secret<string>  = none
+		internal handle def(Event) !none
+
+		def new(handle def(Event) !none, username string = "", password ?Secret<string> = none, header string = "", secret ?Secret<string> = none) {
+			self.handle = handle
+			self.username = username
+			self.password = password
+			self.header = header
+			self.secret = secret
+		}
+
+		// Implements http.Handler. Fails when the body cannot be read, the
+		// answer cannot be written, or `handle` fails on the event.
+		def serve(ctx http.Context) !none {
+			return ctx.text(405, "postmark webhooks come by POST") unless ctx.method() == http.Method.POST
+			if username.len() > 0 {
+				ctx.setHeader("WWW-Authenticate", "Basic realm=\"postmark\"")
+				return ctx.text(401, "wrong credentials") unless basicMatches(ctx.header("Authorization"))
+			}
+			if header.len() > 0 {
+				let expected = secret
+				let given = ctx.header(header)
+				return ctx.text(401, "wrong secret") unless !(expected is none) && crypto.constantTimeEqual(given.bytes(), expected.reveal().bytes())
+			}
+			let body = try ctx.bytes()
+			let event = eventOf(body) onerror (err error) {
+				return ctx.text(400, err.message)
+			}
+			if !(event is none) {
+				try handle(event)
+			}
+			return ctx.text(200, "")
+		}
+
+		internal def basicMatches(authorization string) bool {
+			return false unless authorization.startsWith("Basic ")
+			let decoded = base64decode(authorization[6:].trim()) onerror recover []
+			let key = password
+			let expected = username + ":" + (key is none ?? ("", key.reveal()))
+			return crypto.constantTimeEqual(decoded, expected.bytes())
+		}
+	}
+
+	// A receiver of every webhook of a server; see WebhookHandler for the
+	// credentials.
+	def webhook(handle def(Event) !none, username string = "", password ?Secret<string> = none, header string = "", secret ?Secret<string> = none) WebhookHandler {
+		return new WebhookHandler(handle, username, password, header, secret)
+	}
+
+	// The event a webhook posted; none for a record type this version does
+	// not know. Fails when the body is not a JSON object of that type.
+	internal def eventOf(body byte[]) !?Event {
+		let codec = new JSON()
+		let parsed = codec.parse(string(body)) onerror (err error) {
+			fail invalid("the webhook body is not JSON: {err.message}")
+		}
+		fail invalid("the webhook body is not an object") unless parsed is map<string, any>
+		let record = parsed.get("RecordType")
+		let kind = record is string ?? (record, "")
+		switch kind {
+			case "Delivery":
+				let e = Delivery{}
+				try decodeInto(body, e)
+				return e
+			case "Bounce":
+				let e = Bounce{}
+				try decodeInto(body, e)
+				return e
+			case "SpamComplaint":
+				let e = SpamComplaint{}
+				try decodeInto(body, e)
+				return e
+			case "Open":
+				let e = Open{}
+				try decodeInto(body, e)
+				return e
+			case "Click":
+				let e = Click{}
+				try decodeInto(body, e)
+				return e
+			case "SubscriptionChange":
+				let e = SubscriptionChange{}
+				try decodeInto(body, e)
+				return e
+			case "":
+				fail invalid("the webhook body has no RecordType") unless parsed.hasKey("FromFull")
+				let details = InboundMessage{}
+				try decodeInto(body, details)
+				return Inbound{message: try messageOf(details), details: details}
+			default:
+				return none
+		}
+	}
+
+	// The std message of a received one: its mailboxes, subject, date and
+	// headers, both bodies, and its attachments, inline when they carry a
+	// Content-ID.
+	internal def messageOf(m InboundMessage) !mail.Message {
+		let message = new mail.Message()
+		message.from(m.fromFull.email, m.fromFull.name) when m.fromFull.email.len() > 0
+		for let a in m.toFull {
+			message.to(a.email, a.name)
+		}
+		for let a in m.ccFull {
+			message.cc(a.email, a.name)
+		}
+		for let a in m.bccFull {
+			message.bcc(a.email, a.name)
+		}
+		if m.replyTo.trim().len() > 0 {
+			let replies = mail.parseAddressList(m.replyTo) onerror recover []
+			for let a in replies {
+				message.replyTo(a.address, a.name)
+			}
+		}
+		message.subject(m.subject) when m.subject.len() > 0
+		message.header.set("Date", m.date) when m.date.len() > 0
+		for let h in m.headers {
+			let lower = h.name.lower()
+			continue when lower.startsWith("content-") || lower == "mime-version" || message.header.has(h.name)
+			message.header.add(h.name, h.value)
+		}
+		message.text(m.textBody) when m.textBody.len() > 0
+		message.html(m.htmlBody) when m.htmlBody.len() > 0
+		for let a in m.attachments {
+			let data = base64decode(a.content) onerror (err error) {
+				fail invalid("attachment {a.name} is not base64: {err.message}")
+			}
+			let mediaType = mediaTypeOf(a.contentType)
+			let cid = a.contentId.trim().trimPrefix("cid:").trimPrefix("<").trimSuffix(">")
+			if cid.len() > 0 {
+				let part = message.embed(cid, data, mediaType is none ?? (new MediaType("application", "octet-stream"), mediaType))
+				part.header.set("Content-Disposition", "inline; filename=\"{a.name}\"") when a.name.len() > 0
+			} else {
+				message.attach(a.name, data, mediaType)
+			}
+		}
+		return message
+	}
+
+	// A media type as posted; none when absent or when it does not parse.
+	internal def mediaTypeOf(text string) ?MediaType {
+		return none when text.trim().len() == 0
+		let parsed = formats.parseMediaType(text) onerror (err error) {
+			return none
+		}
+		return parsed
+	}
+}

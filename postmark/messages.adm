@@ -1,0 +1,305 @@
+partial module adm.notify.postmark {
+	use (
+		std.time
+		std.net.http
+		std.data.encoding::(json)
+	)
+
+	// How far into a search Postmark pages: offset and count together stay
+	// within it.
+	internal const maxSearch = 10000
+
+	// A mailbox as Postmark's messages name it.
+	struct Mailbox {
+		email       string
+		name        string
+		// The part after `+` in the local part of an inbound address.
+		mailboxHash string
+	}
+
+	// A message the server sent. A search fills the summary; a message
+	// read by id has its bodies and the events of its delivery too.
+	struct OutboundMessage {
+		messageId     string
+		messageStream string
+		tag           string
+		from          string
+		to            Mailbox[]
+		cc            Mailbox[]
+		bcc           Mailbox[]
+		recipients    string[]
+		subject       string
+		receivedAt    string
+		// `Sent`, `Queued` or `Processed`.
+		status        string
+		trackOpens    bool
+		trackLinks    string
+		metadata      map<string, string>
+		sandboxed     bool
+		attachments   any[]
+		textBody      string
+		htmlBody      string
+		// The raw source of the message, when read by id.
+		body          string
+		messageEvents MessageEvent[]
+	}
+
+	// One step of a sent message: `Delivered`, `Bounced`, `Opened`,
+	// `LinkClicked`, `Transient`, `SubscriptionChanged`, with Postmark's
+	// details of it.
+	struct MessageEvent {
+		recipient string
+		@json("Type")
+		kind string
+		receivedAt string
+		details map<string, any>
+	}
+
+	// A message the server received. A search fills the summary; a message
+	// read by id has its bodies and headers too.
+	struct InboundMessage {
+		messageId         string
+		messageStream     string
+		from              string
+		fromName          string
+		fromFull          Mailbox
+		to                string
+		toFull            Mailbox[]
+		cc                string
+		ccFull            Mailbox[]
+		bcc               string
+		bccFull           Mailbox[]
+		replyTo           string
+		originalRecipient string
+		subject           string
+		date              string
+		mailboxHash       string
+		tag               string
+		// `Processed`, `Blocked`, `Queued`, `Failed` or `Scheduled`.
+		status            string
+		blockedReason     string
+		attachments       InboundAttachment[]
+		textBody          string
+		htmlBody          string
+		// The text of a reply without the quoted message.
+		strippedTextReply string
+		headers           MessageHeader[]
+	}
+
+	// An attachment of a received message; `content` (base64) only in the
+	// inbound webhook.
+	struct InboundAttachment {
+		name string
+		contentType string
+		contentLength int
+		@json("ContentID")
+		contentId string
+		content string
+	}
+
+	// One header of a received message.
+	struct MessageHeader {
+		name  string
+		value string
+	}
+
+	// A recipient's mail client or operating system.
+	struct Agent {
+		name    string
+		company string
+		family  string
+	}
+
+	// Where an open or a click came from.
+	struct Geo {
+		countryIsoCode string
+		country        string
+		regionIsoCode  string
+		region         string
+		city           string
+		zip            string
+		coords         string
+		ip             string
+	}
+
+	// A message opened: by whom, with what, from where; `firstOpen` for the
+	// first time.
+	struct Open {
+		recordType    string
+		messageId     string
+		messageStream string
+		recipient     string
+		tag           string
+		firstOpen     bool
+		receivedAt    string
+		client        Agent
+		os            Agent
+		platform      string
+		userAgent     string
+		readSeconds   int
+		geo           Geo
+		metadata      map<string, string>
+	}
+
+	// A tracked link followed: which one, from the HTML or text body
+	// (`clickLocation`), by whom and from where.
+	struct Click {
+		recordType    string
+		messageId     string
+		messageStream string
+		recipient     string
+		tag           string
+		originalLink  string
+		clickLocation string
+		receivedAt    string
+		client        Agent
+		os            Agent
+		platform      string
+		userAgent     string
+		geo           Geo
+		metadata      map<string, string>
+	}
+
+	// Which sent messages a search keeps; empty fields keep all.
+	struct MessageFilter {
+		recipient string              = ""
+		from      string              = ""
+		tag       string              = ""
+		// `queued`, `sent` or `processed`.
+		status    string              = ""
+		subject   string              = ""
+		stream    string              = ""
+		// In Postmark's time zone (US Eastern).
+		since     ?time.DateTime      = none
+		until     ?time.DateTime      = none
+		// Messages sent with these metadata values.
+		metadata  map<string, string>
+	}
+
+	// Which received messages a search keeps; empty fields keep all.
+	struct InboundFilter {
+		recipient   string         = ""
+		from        string         = ""
+		tag         string         = ""
+		subject     string         = ""
+		mailboxHash string         = ""
+		// `blocked`, `processed`, `queued`, `failed` or `scheduled`.
+		status      string         = ""
+		since       ?time.DateTime = none
+		until       ?time.DateTime = none
+	}
+
+	// Which opens or clicks a search keeps; empty fields keep all.
+	struct EngagementFilter {
+		recipient     string = ""
+		tag           string = ""
+		stream        string = ""
+		clientName    string = ""
+		clientCompany string = ""
+		clientFamily  string = ""
+		osName        string = ""
+		osFamily      string = ""
+		osCompany     string = ""
+		// `Desktop`, `Mobile`, `WebMail`, `Unknown`.
+		platform      string = ""
+		country       string = ""
+		region        string = ""
+		city          string = ""
+	}
+
+	// Message search.
+	partial type Client {
+		// The sent messages `filter` keeps, newest first, 500 a page, the
+		// first 10000 at most.
+		def outbound(filter MessageFilter = MessageFilter{}) Pages<OutboundMessage> {
+			let pairs = map<string, string>{"recipient": filter.recipient, "fromemail": filter.from, "tag": filter.tag, "status": filter.status, "subject": filter.subject, "messagestream": filter.stream}
+			let since = filter.since
+			pairs.set("fromdate", since.str()) unless since is none
+			let until = filter.until
+			pairs.set("todate", until.str()) unless until is none
+			for let (key, value) in filter.metadata {
+				pairs.set("metadata_" + key, value)
+			}
+			return searchPages<OutboundMessage>(self, withQuery("/messages/outbound", pairs), "Messages")
+		}
+
+		// The sent message `id` with its bodies and events. Fails with
+		// NotFound for an unknown one, and as every call does.
+		def outboundMessage(id string) !OutboundMessage {
+			let found = OutboundMessage{}
+			try decodeInto(try call(self, http.Method.GET, "/messages/outbound/{segment(id)}/details"), found)
+			return found
+		}
+
+		// The raw source of the sent message `id`; "" once Postmark no
+		// longer keeps it. Fails as `outboundMessage` does.
+		def outboundDump(id string) !string {
+			let found = Dump{}
+			try decodeInto(try call(self, http.Method.GET, "/messages/outbound/{segment(id)}/dump"), found)
+			return found.body
+		}
+
+		// The received messages `filter` keeps, newest first, 500 a page,
+		// the first 10000 at most.
+		def inbound(filter InboundFilter = InboundFilter{}) Pages<InboundMessage> {
+			let pairs = map<string, string>{"recipient": filter.recipient, "fromemail": filter.from, "tag": filter.tag, "subject": filter.subject, "mailboxhash": filter.mailboxHash, "status": filter.status}
+			let since = filter.since
+			pairs.set("fromdate", since.str()) unless since is none
+			let until = filter.until
+			pairs.set("todate", until.str()) unless until is none
+			return searchPages<InboundMessage>(self, withQuery("/messages/inbound", pairs), "InboundMessages")
+		}
+
+		// The received message `id` with its bodies and headers. Fails with
+		// NotFound for an unknown one, and as every call does.
+		def inboundMessage(id string) !InboundMessage {
+			let found = InboundMessage{}
+			try decodeInto(try call(self, http.Method.GET, "/messages/inbound/{segment(id)}/details"), found)
+			return found
+		}
+
+		// Lets through the received message `id` that the inbound rules or
+		// spam filter blocked. Fails as `inboundMessage` does.
+		def bypass(id string) !none {
+			try call(self, http.Method.PUT, "/messages/inbound/{segment(id)}/bypass")
+			return none
+		}
+
+		// Posts the received message `id` to the inbound webhook again,
+		// after the webhook failed it. Fails as `inboundMessage` does.
+		def retry(id string) !none {
+			try call(self, http.Method.PUT, "/messages/inbound/{segment(id)}/retry")
+			return none
+		}
+
+		// The opens `filter` keeps, newest first, 500 a page.
+		def opens(filter EngagementFilter = EngagementFilter{}) Pages<Open> {
+			return searchPages<Open>(self, withQuery("/messages/outbound/opens", engagementQuery(filter)), "Opens")
+		}
+
+		// The opens of the sent message `id`, 500 a page.
+		def opensOf(id string) Pages<Open> {
+			return searchPages<Open>(self, "/messages/outbound/opens/{segment(id)}", "Opens")
+		}
+
+		// The clicks `filter` keeps, newest first, 500 a page.
+		def clicks(filter EngagementFilter = EngagementFilter{}) Pages<Click> {
+			return searchPages<Click>(self, withQuery("/messages/outbound/clicks", engagementQuery(filter)), "Clicks")
+		}
+
+		// The clicks of the sent message `id`, 500 a page.
+		def clicksOf(id string) Pages<Click> {
+			return searchPages<Click>(self, "/messages/outbound/clicks/{segment(id)}", "Clicks")
+		}
+	}
+
+	internal def engagementQuery(f EngagementFilter) map<string, string> {
+		return map<string, string>{"recipient": f.recipient, "tag": f.tag, "messagestream": f.stream, "client_name": f.clientName, "client_company": f.clientCompany, "client_family": f.clientFamily, "os_name": f.osName, "os_family": f.osFamily, "os_company": f.osCompany, "platform": f.platform, "country": f.country, "region": f.region, "city": f.city}
+	}
+
+	// The pages of a search, which Postmark answers only within its first
+	// 10000 results.
+	internal def searchPages<T>(client Client, path string, key string) Pages<T> {
+		return countPages<T>(client, path, key, 500, reach = maxSearch)
+	}
+}

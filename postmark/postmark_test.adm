@@ -1,0 +1,510 @@
+partial module adm.notify.postmark {
+	use (
+		std.time
+		std.testing
+		std.formats::(MediaType)
+		std.formats.mail
+		std.net.http
+		std.net.http.httptest
+		std.data.encoding::(JSON, base64decode)
+	)
+
+	// A server token for the live test: `POSTMARK_API_TEST` validates sends
+	// and delivers nothing; a real one also reads templates, bounces and
+	// statistics, and sends from `ADM_TEST_POSTMARK_FROM` (a confirmed
+	// signature) to Postmark's black hole address.
+	@env("ADM_TEST_POSTMARK_TOKEN")
+	internal const liveToken string
+
+	@env("ADM_TEST_POSTMARK_FROM")
+	internal const liveFrom string
+
+	// What the loopback server was asked, and what it answers.
+	internal type Seen {
+		// `METHOD /path?query` of each request.
+		calls    string[]
+		// The JSON body of each request; none for one without.
+		bodies   any[]
+		servers  string[]
+		accounts string[]
+		agents   string[]
+		// The reply of `METHOD /path` (no query): its JSON text.
+		replies  map<string, string>
+		// The status of `METHOD /path` when not 200.
+		statuses map<string, int>
+		// How many times `METHOD /path` answers 429 before it answers.
+		limited  map<string, int>
+		// The base address of the server.
+		base     string              = ""
+
+		def new() {}
+	}
+
+	// `value` as JSON text.
+	internal def json(value ?any) string {
+		return value is none ?? ("null", string((new JSON()).encode(value)))
+	}
+
+	// A server that answers as the API: a reply set for the request's
+	// method and path, else `{}`. A batch answers one accepted result per
+	// message.
+	internal def apiServer(seen Seen) !httptest.Server {
+		let mux = new http.ServeMux()
+		try mux.handle("/", def (ctx http.Context) !none {
+			let method = ctx.method().value
+			let address = ctx.url()
+			let query = address.rawQuery
+			let path = address.rawPath.len() > 0 ?? (address.rawPath, ctx.path())
+			seen.calls.push("{method} {path}" + (query.len() > 0 ?? ("?" + query, "")))
+			let text = try ctx.text()
+			let parsed = text.len() > 0 ?? (try (new JSON()).parse(text), none)
+			seen.bodies.push(parsed is none ?? (new map<string, any>(), parsed))
+			seen.servers.push(ctx.header("X-Postmark-Server-Token"))
+			seen.accounts.push(ctx.header("X-Postmark-Account-Token"))
+			seen.agents.push(ctx.header("User-Agent"))
+			let key = "{method} {ctx.path()}"
+			let left = seen.limited.get(key)
+			if !(left is none) && left > 0 {
+				seen.limited.set(key, left - 1)
+				ctx.setHeader("Retry-After", "0")
+				return try ctx.text(429, "")
+			}
+			let status = seen.statuses.get(key)
+			let reply = seen.replies.get(key)
+			if reply is none && key.startsWith("POST /email/batch") {
+				let messages = parsed is map<string, any> ?? (parsed.get("Messages"), parsed)
+				let out any[] = []
+				if messages is any[] {
+					for let (i, _) in messages {
+						out.push(map<string, any>{"ErrorCode": 0, "Message": "OK", "MessageID": "m{i}", "To": "x"})
+					}
+				}
+				return try ctx.text(json(out))
+			}
+			ctx.setHeader("Content-Type", "application/json")
+			return try ctx.text(status is none ?? (200, status), reply is none ?? ("\{}", reply))
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		seen.base = "http://{server.address().str()}"
+		return server
+	}
+
+	internal def clientOf(seen Seen) Client {
+		return new Client("server-token", seen.base, accountToken = "account-token")
+	}
+
+	// The JSON body of request `at`.
+	internal def bodyAt(seen Seen, at int) any {
+		return seen.bodies[at]
+	}
+
+	// The value at a path of objects and arrays (`Attachments.0.Name`);
+	// none when one step is missing.
+	internal def at(value ?any, path string) ?any {
+		let current = value
+		for let step in path.split(".") {
+			if current is map<string, any> {
+				current = current.get(step)
+			} else if current is any[] && step.isNumeric() {
+				let i = step.toInt<int>()
+				return none when i >= current.len()
+				current = current[i]
+			} else {
+				return none
+			}
+		}
+		return current
+	}
+
+	internal def textOf(value ?any, path string) string {
+		let v = at(value, path)
+		return v when v is string
+		return "{v}" when v is int || v is int64 || v is bool
+		return ""
+	}
+
+	// The PostmarkError `call` fails with; none when it succeeds or fails
+	// otherwise.
+	internal def caught(call def () !none) ?PostmarkError {
+		let found ?PostmarkError = none
+		call() onerror (err error) {
+			found = err when err is PostmarkError
+			recover none
+		}
+		return found
+	}
+
+	internal def simple() mail.Message {
+		return new mail.Message().from("a@example.com").to("b@example.net").subject("s").text("t")
+	}
+
+	check "Postmark sending" {
+		// A std message becomes Postmark's JSON: mailboxes, bodies,
+		// attachments, inline parts with their Content-ID, headers, and the
+		// settings, a message's X-PM headers winning over the arguments.
+		@test()
+		def TestSendMessage() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let pm = clientOf(seen)
+			seen.replies.set("POST /email", json(map<string, any>{"To": "ana@example.net", "SubmittedAt": "2026-10-26T10:00:00.1234567-04:00", "MessageID": "b7bc2f4a-e38e-4336-af7d-e6c392c2f817", "ErrorCode": 0, "Message": "OK"}))
+			let message = new mail.Message()
+				.from("orders@example.com", "Shop")
+				.replyTo("help@example.com")
+				.to("ana@example.net", "Ana")
+				.cc("carla@example.net")
+				.bcc("audit@example.com")
+				.subject("Your order")
+				.text("Thanks, Ana.")
+				.html("<p>Thanks.</p><img src=\"cid:logo\">")
+			message.attach("receipt.txt", "total 7".bytes())
+			message.embed("logo", byte[137, 80, 78, 71], new MediaType("image", "png"))
+			message.header.set("X-Order", "7")
+			message.header.set("X-PM-Tag", "receipt")
+			message.header.set("X-PM-Metadata-order", "7")
+			let sent = try pm.send(message, stream = "outbound", tag = "order", metadata = {"shop": "eu"}, trackOpens = true, trackLinks = LinkTracking.HtmlOnly)
+			assert sent.messageId == "b7bc2f4a-e38e-4336-af7d-e6c392c2f817" && sent.errorCode == 0 && sent.submittedAt.startsWith("2026-10-26")
+			assert seen.calls[0] == "POST /email" && seen.servers[0] == "server-token" && seen.accounts[0] == "" && seen.agents[0].startsWith("adm.notify.postmark/")
+			let body = bodyAt(seen, 0)
+			assert textOf(body, "From") == "Shop <orders@example.com>" && textOf(body, "ReplyTo") == "help@example.com"
+			assert textOf(body, "To") == "Ana <ana@example.net>" && textOf(body, "Cc") == "carla@example.net" && textOf(body, "Bcc") == "audit@example.com"
+			assert textOf(body, "Subject") == "Your order" && textOf(body, "TextBody") == "Thanks, Ana." && textOf(body, "HtmlBody").contains("cid:logo")
+			let receipt = textOf(body, "Attachments.0.Name") == "receipt.txt" ?? (0, 1)
+			assert string(try base64decode(textOf(body, "Attachments.{receipt}.Content"))) == "total 7" && textOf(body, "Attachments.{receipt}.ContentType") == "text/plain"
+			assert textOf(body, "Attachments.{1 - receipt}.ContentID") == "cid:logo" && textOf(body, "Attachments.{1 - receipt}.ContentType") == "image/png"
+			assert textOf(body, "Headers.0.Name") == "X-Order" && textOf(body, "Headers.0.Value") == "7" && at(body, "Headers.1") is none
+			assert textOf(body, "Tag") == "receipt" && textOf(body, "Metadata.shop") == "eu" && textOf(body, "Metadata.order") == "7"
+			assert textOf(body, "MessageStream") == "outbound" && textOf(body, "TrackOpens") == "true" && textOf(body, "TrackLinks") == "HtmlOnly"
+			try pm.send(simple())
+			let plain = bodyAt(seen, 1)
+			assert at(plain, "Tag") is none && at(plain, "TrackOpens") is none && at(plain, "MessageStream") is none && at(plain, "Attachments") is none
+			try server.close()
+			return none
+		}
+
+		// A template message goes by alias or id with its model, and its
+		// attachments and headers.
+		@test()
+		def TestSendTemplate() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let pm = clientOf(seen)
+			seen.replies.set("POST /email/withTemplate", json(map<string, any>{"MessageID": "t1", "ErrorCode": 0}))
+			let welcome = new Template("welcome", to = "Ana <ana@example.net>", model = {"name": "Ana", "items": [1, 2]}, from = "Shop <orders@example.com>")
+			welcome.attach("terms.pdf", "%PDF".bytes(), mediaType = "application/pdf").attach("logo.png", byte[1], contentId = "logo")
+			welcome.headers.set("X-PM-Message-Stream", "broadcast")
+			welcome.inlineCss = false
+			let sent = try pm.send(welcome, tag = "welcome")
+			assert sent.messageId == "t1"
+			let body = bodyAt(seen, 0)
+			assert textOf(body, "TemplateAlias") == "welcome" && at(body, "TemplateId") is none
+			assert textOf(body, "TemplateModel.name") == "Ana" && textOf(body, "TemplateModel.items.1") == "2" && textOf(body, "InlineCss") == "false"
+			assert textOf(body, "To") == "Ana <ana@example.net>" && textOf(body, "From") == "Shop <orders@example.com>"
+			assert textOf(body, "Attachments.0.ContentType") == "application/pdf" && textOf(body, "Attachments.1.ContentID") == "cid:logo" && textOf(body, "Attachments.1.ContentType") == "application/octet-stream"
+			assert textOf(body, "MessageStream") == "broadcast" && textOf(body, "Tag") == "welcome" && at(body, "Headers") is none
+			try pm.send(new Template(42, to = "ben@example.net", from = "orders@example.com"))
+			assert textOf(bodyAt(seen, 1), "TemplateId") == "42" && at(bodyAt(seen, 1), "TemplateAlias") is none
+			try server.close()
+			return none
+		}
+
+		// Batches are split at 500 messages; each message gets its result;
+		// template batches go under `Messages`.
+		@test()
+		def TestBatches() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let pm = clientOf(seen)
+			let many mail.Message[] = []
+			for let i in 0..501 {
+				many.push(new mail.Message().from("a@example.com").to("r{i}@example.net").subject("s").text("t"))
+			}
+			let results = try pm.sendBatch(many, tag = "bulk")
+			assert results.len() == 501 && results[500].messageId == "m0" && results[499].messageId == "m499"
+			assert seen.calls.join(",") == "POST /email/batch,POST /email/batch"
+			let first = bodyAt(seen, 0)
+			assert first is any[] && first.len() == 500 && textOf(first, "0.Tag") == "bulk" && textOf(first, "499.To") == "r499@example.net"
+			seen.replies.set("POST /email/batchWithTemplates", json([map<string, any>{"ErrorCode": 0, "MessageID": "x"}, map<string, any>{"ErrorCode": 406, "Message": "inactive"}]))
+			let mixed = try pm.sendBatch([new Template("a", to = "x@example.net", from = "a@example.com"), new Template("b", to = "y@example.net", from = "a@example.com")])
+			assert mixed.len() == 2 && mixed[1].errorCode == 406 && mixed[1].message == "inactive"
+			assert textOf(bodyAt(seen, 2), "Messages.1.TemplateAlias") == "b"
+			try server.close()
+			return none
+		}
+
+		// Messages that break a rule of sending fail with Invalid before
+		// anything is sent.
+		@test()
+		def TestSendLimits() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let pm = clientOf(seen)
+			let crowd = new mail.Message().from("a@example.com").subject("s").text("t")
+			for let i in 0..51 {
+				crowd.to("r{i}@example.net")
+			}
+			let longTag = "t" * 1001
+			let manyFields = new map<string, string>()
+			for let i in 0..11 {
+				manyFields.set("k{i}", "v")
+			}
+			let badLinks = simple()
+			badLinks.header.set("X-PM-TrackLinks", "Sometimes")
+			let cases = [
+				caught(def () !none { try pm.send(new mail.Message().to("b@example.net").text("t")); return none }),
+				caught(def () !none { try pm.send(new mail.Message().from("a@example.com").text("t")); return none }),
+				caught(def () !none { try pm.send(crowd); return none }),
+				caught(def () !none { try pm.send(new mail.Message().from("a@example.com").to("b@example.net")); return none }),
+				caught(def () !none { try pm.send(simple(), tag = longTag); return none }),
+				caught(def () !none { try pm.send(simple(), metadata = manyFields); return none }),
+				caught(def () !none { try pm.send(simple(), metadata = {"a-key-longer-than-twenty": "v"}); return none }),
+				caught(def () !none { try pm.send(badLinks); return none }),
+				caught(def () !none { try pm.send(new Template("a", to = "b@example.net")); return none }),
+				caught(def () !none { try pm.send(new Template("a", from = "a@example.com")); return none }),
+				caught(def () !none { try pm.sendBatch([simple(), crowd]); return none }),
+			]
+			for let (i, failure) in cases {
+				fail "case {i} did not fail with Invalid" unless !(failure is none) && failure.kind == ErrorKind.Invalid
+			}
+			assert seen.calls.len() == 0
+			try server.close()
+			return none
+		}
+
+		// Postmark's refusals map to their kinds by error code and status; a
+		// 429 is waited out until the retries are spent; a call without its
+		// token fails before it is sent.
+		@test()
+		def TestErrors() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let pm = clientOf(seen)
+			let codes = map<int, ErrorKind>{300: ErrorKind.Invalid, 406: ErrorKind.Inactive, 10: ErrorKind.Auth, 701: ErrorKind.NotFound, 1101: ErrorKind.NotFound}
+			for let (code, kind) in codes {
+				seen.statuses.set("POST /email", code == 10 ?? (401, 422))
+				seen.replies.set("POST /email", json(map<string, any>{"ErrorCode": code, "Message": "refused {code}"}))
+				let failure = caught(def () !none { try pm.send(simple()); return none })
+				fail "code {code} gave no {kind.value}" unless !(failure is none) && failure.kind == kind && failure.errorCode == code && failure.message.contains("refused {code}")
+			}
+			let statuses = map<int, ErrorKind>{404: ErrorKind.NotFound, 403: ErrorKind.Auth, 500: ErrorKind.Server, 413: ErrorKind.Invalid}
+			for let (status, kind) in statuses {
+				seen.statuses.set("GET /bounces/1", status)
+				seen.replies.set("GET /bounces/1", "oops")
+				let failure = caught(def () !none { try pm.bounce(1); return none })
+				fail "status {status} gave no {kind.value}" unless !(failure is none) && failure.kind == kind && failure.status == status
+			}
+			seen.statuses.set("GET /bounces/1", 200)
+			seen.replies.set("GET /bounces/1", "not json")
+			let garbled = caught(def () !none { try pm.bounce(1); return none })
+			assert !(garbled is none) && garbled.kind == ErrorKind.Server
+			seen.limited.set("GET /deliverystats", 2)
+			let from = seen.calls.len()
+			try pm.deliveryStats()
+			assert seen.calls.len() - from == 3
+			pm.rateLimitRetries = 0
+			seen.limited.set("GET /deliverystats", 1)
+			let limited = caught(def () !none { try pm.deliveryStats(); return none })
+			assert !(limited is none) && limited.kind == ErrorKind.RateLimited
+			let calls = seen.calls.len()
+			let noAccount = caught(def () !none { try (new Client("server-token", seen.base)).server(1); return none })
+			assert !(noAccount is none) && noAccount.kind == ErrorKind.Auth && seen.calls.len() == calls
+			let unreachable = caught(def () !none { try (new Client("t", "http://127.0.0.1:1")).deliveryStats(); return none })
+			assert !(unreachable is none) && unreachable.kind == ErrorKind.Transport
+			try server.close()
+			return none
+		}
+
+		// Against Postmark itself, when a token is given.
+		@test()
+		def TestLive() !none {
+			return none when liveToken.len() == 0
+			let pm = new Client(liveToken)
+			let from = liveFrom.len() > 0 ?? (liveFrom, "sender@example.com")
+			let message = new mail.Message().from(from).to("test@blackhole.postmarkapp.com").subject("adm.notify.postmark test").text("Sent by the live test.")
+			message.attach("note.txt", "hello from adm".bytes())
+			let sent = try pm.send(message, tag = "adm-test", metadata = {"run": "live"})
+			assert sent.errorCode == 0
+			let results = try pm.sendBatch([simple().to("test@blackhole.postmarkapp.com"), message])
+			assert results.len() == 2
+			return none when liveToken == testToken
+			try pm.deliveryStats()
+			try pm.templates().next()
+			try pm.bounces().next()
+			try pm.outbound(MessageFilter{tag: "adm-test"}).next()
+			return none
+		}
+	}
+
+	check "Postmark account" {
+		// Bounces page by count and offset with their filters; one is read,
+		// dumped and reactivated; suppressions are listed, added and lifted.
+		@test()
+		def TestBouncesAndSuppressions() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let pm = clientOf(seen)
+			seen.replies.set("GET /deliverystats", json(map<string, any>{"InactiveMails": 3, "Bounces": [map<string, any>{"Name": "All", "Count": 4}, map<string, any>{"Type": "HardBounce", "Name": "Hard bounce", "Count": 3}]}))
+			let stats = try pm.deliveryStats()
+			assert stats.inactiveMails == 3 && stats.bounces[1].kind == "HardBounce" && stats.bounces[1].count == 3
+			let bounce = map<string, any>{"ID": 4323372036854775807, "Type": "HardBounce", "TypeCode": 1, "Name": "Hard bounce", "MessageID": "m1", "ServerID": 23, "MessageStream": "outbound", "Email": "gone@example.net", "BouncedAt": "2026-10-01T10:00:00-04:00", "DumpAvailable": true, "Inactive": true, "CanActivate": true, "Description": "The server was unable to deliver your message"}
+			seen.replies.set("GET /bounces", json(map<string, any>{"TotalCount": 2, "Bounces": [bounce, bounce]}))
+			let listed = try pm.bounces(BounceFilter{kind: "HardBounce", inactive: true, email: "gone", since: new time.DateTime(2026, 10, 1)}).all()
+			assert listed.len() == 2 && listed[0].id == 4323372036854775807 && listed[0].serverId == 23 && listed[0].kind == "HardBounce" && listed[0].canActivate
+			assert seen.calls[1] == "GET /bounces?type=HardBounce&emailFilter=gone&inactive=true&fromdate=2026-10-01T00%3A00%3A00&count=500&offset=0"
+			seen.replies.set("GET /bounces/7", json(bounce))
+			seen.replies.set("GET /bounces/7/dump", json(map<string, any>{"Body": "Return-Path: <>"}))
+			seen.replies.set("PUT /bounces/7/activate", json(map<string, any>{"Message": "OK", "Bounce": map<string, any>{"ID": 7, "Inactive": false}}))
+			assert (try pm.bounce(7)).email == "gone@example.net"
+			assert try pm.bounceDump(7) == "Return-Path: <>"
+			let back = try pm.activate(7)
+			assert back.id == 7 && !back.inactive
+			seen.replies.set("GET /message-streams/outbound/suppressions/dump", json(map<string, any>{"Suppressions": [map<string, any>{"EmailAddress": "gone@example.net", "SuppressionReason": "HardBounce", "Origin": "Recipient", "CreatedAt": "2026-10-01T10:00:00-04:00"}]}))
+			let suppressed = try pm.suppressions(reason = "HardBounce", since = new time.Date(2026, 9, 1))
+			assert suppressed.len() == 1 && suppressed[0].origin == "Recipient"
+			assert seen.calls[seen.calls.len() - 1] == "GET /message-streams/outbound/suppressions/dump?SuppressionReason=HardBounce&fromdate=2026-09-01"
+			seen.replies.set("POST /message-streams/broadcast/suppressions", json(map<string, any>{"Suppressions": [map<string, any>{"EmailAddress": "a@example.net", "Status": "Queued"}, map<string, any>{"EmailAddress": "b@example.net", "Status": "Failed", "Message": "Invalid email address"}]}))
+			let added = try pm.suppress("broadcast", "a@example.net", "b@example.net")
+			assert added.len() == 2 && added[1].status == "Failed"
+			assert textOf(bodyAt(seen, seen.calls.len() - 1), "Suppressions.1.EmailAddress") == "b@example.net"
+			try pm.unsuppress("broadcast", "a@example.net")
+			assert seen.calls[seen.calls.len() - 1] == "POST /message-streams/broadcast/suppressions/delete"
+			try server.close()
+			return none
+		}
+
+		// Templates are listed, read, made, saved by id or alias, removed
+		// and validated.
+		@test()
+		def TestTemplates() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let pm = clientOf(seen)
+			seen.replies.set("GET /templates", json(map<string, any>{"TotalCount": 1, "Templates": [map<string, any>{"TemplateId": 1, "Name": "Welcome", "Alias": "welcome", "TemplateType": "Standard", "LayoutTemplate": none, "Active": true}]}))
+			seen.replies.set("GET /templates/welcome", json(map<string, any>{"TemplateId": 1, "Name": "Welcome", "Alias": "welcome", "Subject": "Hi \{\{name}}", "HtmlBody": "<p>\{\{name}}</p>", "TextBody": "\{\{name}}", "TemplateType": "Standard", "LayoutTemplate": "basic", "AssociatedServerId": 9, "Active": true}))
+			seen.replies.set("POST /templates", json(map<string, any>{"TemplateId": 2, "Name": "Basic", "Alias": "basic", "TemplateType": "Layout", "Active": true}))
+			seen.replies.set("PUT /templates/1", json(map<string, any>{"TemplateId": 1, "Name": "Hello"}))
+			seen.replies.set("POST /templates/validate", json(map<string, any>{"AllContentIsValid": false, "Subject": map<string, any>{"ContentIsValid": true, "RenderedContent": "Hi Ana"}, "HtmlBody": map<string, any>{"ContentIsValid": false, "ValidationErrors": [map<string, any>{"Message": "The syntax is invalid", "Line": 1, "CharacterPosition": 4}]}, "TextBody": map<string, any>{"ContentIsValid": true, "RenderedContent": "Ana"}, "SuggestedTemplateModel": map<string, any>{"name": "name_Value"}}))
+			let all = try pm.templates(kind = TemplateKind.Standard).all()
+			assert all.len() == 1 && all[0].alias == "welcome" && all[0].layoutTemplate is none
+			let found = try pm.template("welcome")
+			assert found.subject == "Hi \{\{name}}" && found.associatedServerId == 9 && found.kind == "Standard"
+			let layout = found.layoutTemplate
+			assert !(layout is none) && layout == "basic"
+			let made = try pm.createTemplate(TemplateInfo{name: "Basic", alias: "basic", htmlBody: "<main>\{\{\{@content}}}</main>", textBody: "\{\{\{@content}}}", kind: "Layout"})
+			assert made.templateId == 2 && made.kind == "Layout"
+			found.name = "Hello"
+			assert (try pm.updateTemplate(found)).name == "Hello"
+			try pm.deleteTemplate("basic")
+			let validation = try pm.validateTemplate(TemplateInfo{subject: "Hi \{\{name}}", htmlBody: "<p>\{\{#name}</p>", textBody: "\{\{name}}"}, model = {"name": "Ana"})
+			assert !validation.allContentIsValid && validation.htmlBody.validationErrors[0].characterPosition == 4 && validation.subject.renderedContent == "Hi Ana"
+			assert seen.calls.join(",") == "GET /templates?TemplateType=Standard&count=500&offset=0,GET /templates/welcome,POST /templates,PUT /templates/1,DELETE /templates/basic,POST /templates/validate"
+			assert textOf(bodyAt(seen, 2), "TemplateType") == "Layout" && at(bodyAt(seen, 2), "Subject") is none && at(bodyAt(seen, 2), "LayoutTemplate") is none
+			assert textOf(bodyAt(seen, 3), "LayoutTemplate") == "basic"
+			assert textOf(bodyAt(seen, 5), "TestRenderModel.name") == "Ana" && textOf(bodyAt(seen, 5), "TemplateType") == "Standard"
+			try server.close()
+			return none
+		}
+
+		// Outbound and inbound searches carry their filters; messages are
+		// read with their events, dumped, let through and retried; opens
+		// and clicks are listed in all and per message.
+		@test()
+		def TestMessages() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let pm = clientOf(seen)
+			seen.replies.set("GET /messages/outbound", json(map<string, any>{"TotalCount": 1, "Messages": [map<string, any>{"MessageID": "o1", "To": [map<string, any>{"Email": "ana@example.net", "Name": "Ana"}], "Status": "Sent", "Metadata": map<string, any>{"order": "7"}, "Attachments": []}]}))
+			seen.replies.set("GET /messages/outbound/o1/details", json(map<string, any>{"MessageID": "o1", "TextBody": "t", "MessageEvents": [map<string, any>{"Recipient": "ana@example.net", "Type": "Delivered", "ReceivedAt": "2026-10-01T10:00:00-04:00", "Details": map<string, any>{"DeliveryMessage": "250 OK", "DestinationServer": "mx"}}]}))
+			seen.replies.set("GET /messages/outbound/o1/dump", json(map<string, any>{"Body": "From: a"}))
+			seen.replies.set("GET /messages/inbound", json(map<string, any>{"TotalCount": 1, "InboundMessages": [map<string, any>{"MessageID": "i1", "FromFull": map<string, any>{"Email": "ben@example.net", "Name": "Ben"}, "Status": "Blocked", "Attachments": [map<string, any>{"Name": "a.txt", "ContentType": "text/plain", "ContentLength": 3, "ContentID": ""}]}]}))
+			seen.replies.set("GET /messages/inbound/i1/details", json(map<string, any>{"MessageID": "i1", "StrippedTextReply": "Thanks", "Headers": [map<string, any>{"Name": "X-Spam-Score", "Value": "0.1"}], "BlockedReason": "spam"}))
+			seen.replies.set("GET /messages/outbound/opens", json(map<string, any>{"TotalCount": 1, "Opens": [map<string, any>{"RecordType": "Open", "MessageID": "o1", "FirstOpen": true, "Client": map<string, any>{"Name": "Gmail", "Family": "Gmail"}, "OS": map<string, any>{"Name": "Android"}, "Geo": map<string, any>{"CountryISOCode": "RO", "City": "Cluj", "IP": "10.0.0.1"}, "ReadSeconds": 12}]}))
+			seen.replies.set("GET /messages/outbound/clicks/o1", json(map<string, any>{"TotalCount": 1, "Clicks": [map<string, any>{"RecordType": "Click", "OriginalLink": "https://example.com", "ClickLocation": "HTML"}]}))
+			let sent = try pm.outbound(MessageFilter{recipient: "ana@example.net", status: "sent", since: new time.DateTime(2026, 10, 1, 9, 30), metadata: {"order": "7"}}).all()
+			assert sent.len() == 1 && sent[0].to[0].name == "Ana" && "{sent[0].metadata.get("order")}" == "7"
+			assert seen.calls[0] == "GET /messages/outbound?recipient=ana%40example.net&status=sent&fromdate=2026-10-01T09%3A30%3A00&metadata_order=7&count=500&offset=0"
+			let detail = try pm.outboundMessage("o1")
+			assert detail.messageEvents[0].kind == "Delivered" && "{detail.messageEvents[0].details.get("DeliveryMessage")}" == "250 OK"
+			assert try pm.outboundDump("o1") == "From: a"
+			let received = try pm.inbound(InboundFilter{status: "blocked", mailboxHash: "h1"}).all()
+			assert received.len() == 1 && received[0].fromFull.name == "Ben" && received[0].attachments[0].contentLength == 3
+			let inboundDetail = try pm.inboundMessage("i1")
+			assert inboundDetail.strippedTextReply == "Thanks" && inboundDetail.headers[0].value == "0.1" && inboundDetail.blockedReason == "spam"
+			try pm.bypass("i1")
+			try pm.retry("i1")
+			let opens = try pm.opens(EngagementFilter{platform: "Mobile", country: "Romania"}).all()
+			assert opens.len() == 1 && opens[0].firstOpen && opens[0].client.name == "Gmail" && opens[0].os.name == "Android" && opens[0].geo.countryIsoCode == "RO" && opens[0].geo.ip == "10.0.0.1" && opens[0].readSeconds == 12
+			seen.replies.set("GET /messages/outbound/opens/o1", json(map<string, any>{"TotalCount": 0, "Opens": []}))
+			assert (try pm.opensOf("o1").all()).len() == 0
+			let clicks = try pm.clicksOf("o1").all()
+			assert clicks.len() == 1 && clicks[0].originalLink == "https://example.com" && clicks[0].clickLocation == "HTML"
+			assert seen.calls[3:].join(",") == "GET /messages/inbound?mailboxhash=h1&status=blocked&count=500&offset=0,GET /messages/inbound/i1/details,PUT /messages/inbound/i1/bypass,PUT /messages/inbound/i1/retry,GET /messages/outbound/opens?platform=Mobile&country=Romania&count=500&offset=0,GET /messages/outbound/opens/o1?count=500&offset=0,GET /messages/outbound/clicks/o1?count=500&offset=0"
+			try server.close()
+			return none
+		}
+
+		// A search pages within its reach: offset and count never pass it.
+		@test()
+		def TestSearchReach() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let pm = clientOf(seen)
+			seen.replies.set("GET /messages/outbound", json(map<string, any>{"TotalCount": 50, "Messages": [map<string, any>{"MessageID": "a"}, map<string, any>{"MessageID": "b"}]}))
+			let pages = countPages<OutboundMessage>(pm, "/messages/outbound", "Messages", 2, reach = 3)
+			let first = try pages.next()
+			let second = try pages.next()
+			assert !(first is none) && !(second is none) && pages.total == 3
+			assert try pages.next() is none
+			assert seen.calls.join(",") == "GET /messages/outbound?count=2&offset=0,GET /messages/outbound?count=1&offset=2"
+			try server.close()
+			return none
+		}
+
+		// Servers and sender signatures go with the account token alone.
+		@test()
+		def TestServersAndSignatures() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let pm = clientOf(seen)
+			let one = map<string, any>{"ID": 5, "Name": "Shop", "ApiTokens": ["abc"], "Color": "Blue", "DeliveryType": "Live", "InboundHash": "h", "TrackLinks": "HtmlAndText", "InboundSpamThreshold": 5}
+			seen.replies.set("GET /servers", json(map<string, any>{"TotalCount": 1, "Servers": [one]}))
+			seen.replies.set("GET /servers/5", json(one))
+			seen.replies.set("POST /servers", json(one))
+			seen.replies.set("PUT /servers/5", json(one))
+			let listed = try pm.servers(name = "Shop").all()
+			assert listed.len() == 1 && listed[0].apiTokens[0] == "abc" && listed[0].inboundSpamThreshold == 5
+			let found = try pm.server(5)
+			assert found.trackLinks == "HtmlAndText"
+			let made = try pm.createServer(Server{name: "Shop", color: "Blue", deliveryType: "Sandbox", trackOpens: true})
+			assert made.id == 5
+			found.inboundHookUrl = "https://example.com/in"
+			try pm.updateServer(found)
+			try pm.deleteServer(5)
+			let signature = map<string, any>{"ID": 8, "Domain": "example.com", "EmailAddress": "orders@example.com", "Name": "Shop", "Confirmed": true, "SPFVerified": true, "DKIMVerified": true, "DKIMHost": "pm._domainkey.example.com", "ReturnPathDomainCNAMEValue": "pm.mtasv.net", "SafeToRemoveRevokedKeyFromDNS": true}
+			seen.replies.set("GET /senders", json(map<string, any>{"TotalCount": 1, "SenderSignatures": [signature]}))
+			seen.replies.set("GET /senders/8", json(signature))
+			seen.replies.set("POST /senders", json(signature))
+			seen.replies.set("PUT /senders/8", json(signature))
+			let signatures = try pm.signatures().all()
+			assert signatures.len() == 1 && signatures[0].confirmed
+			let sig = try pm.signature(8)
+			assert sig.spfVerified && sig.dkimHost == "pm._domainkey.example.com" && sig.returnPathDomainCnameValue == "pm.mtasv.net" && sig.safeToRemoveRevokedKeyFromDns
+			try pm.createSignature("orders@example.com", "Shop", returnPathDomain = "pm-bounces.example.com", note = "Please confirm")
+			sig.replyToEmailAddress = "help@example.com"
+			try pm.updateSignature(sig)
+			try pm.resendConfirmation(8)
+			try pm.deleteSignature(8)
+			assert seen.calls.join(",") == "GET /servers?name=Shop&count=500&offset=0,GET /servers/5,POST /servers,PUT /servers/5,DELETE /servers/5,GET /senders?count=500&offset=0,GET /senders/8,POST /senders,PUT /senders/8,POST /senders/8/resend,DELETE /senders/8"
+			for let i in 0..seen.calls.len() {
+				fail "call {i} carried the wrong tokens" unless seen.accounts[i] == "account-token" && seen.servers[i] == ""
+			}
+			assert textOf(bodyAt(seen, 2), "DeliveryType") == "Sandbox" && textOf(bodyAt(seen, 2), "TrackOpens") == "true"
+			assert textOf(bodyAt(seen, 3), "InboundHookUrl") == "https://example.com/in" && at(bodyAt(seen, 3), "DeliveryType") is none
+			assert textOf(bodyAt(seen, 7), "FromEmail") == "orders@example.com" && textOf(bodyAt(seen, 7), "ReturnPathDomain") == "pm-bounces.example.com" && at(bodyAt(seen, 7), "ReplyToEmail") is none
+			assert textOf(bodyAt(seen, 8), "ReplyToEmail") == "help@example.com"
+			try server.close()
+			return none
+		}
+	}
+}

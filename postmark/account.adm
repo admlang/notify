@@ -1,0 +1,168 @@
+partial module adm.notify.postmark {
+	use std.net.http
+
+	// A server: one set of sending, tracking and webhook settings with its
+	// own server tokens (`apiTokens`) and inbound address.
+	struct Server {
+		id                         int
+		name                       string
+		apiTokens                  string[]
+		// `Purple`, `Blue`, `Turquoise`, `Green`, `Red`, `Yellow`, `Grey`,
+		// `Orange`: the colour the web app shows it in.
+		color                      string
+		smtpApiActivated           bool
+		rawEmailEnabled            bool
+		// `Live`, or `Sandbox` that delivers nothing; set when created.
+		deliveryType               string
+		serverLink                 string
+		inboundAddress             string
+		inboundHookUrl             string
+		bounceHookUrl              string
+		openHookUrl                string
+		deliveryHookUrl            string
+		clickHookUrl               string
+		postFirstOpenOnly          bool
+		inboundDomain              string
+		inboundHash                string
+		inboundSpamThreshold       int
+		trackOpens                 bool
+		trackLinks                 string
+		includeBounceContentInHook bool
+		enableSmtpApiErrorHooks    bool
+	}
+
+	// A sender signature: an address (or, through its domain, every address
+	// of it) the account may send from once confirmed, with the DNS
+	// records that authenticate its domain.
+	struct Signature {
+		id                            int
+		domain                        string
+		emailAddress                  string
+		replyToEmailAddress           string
+		name                          string
+		confirmed                     bool
+		spfVerified                   bool
+		spfHost                       string
+		spfTextValue                  string
+		dkimVerified                  bool
+		weakDkim                      bool
+		dkimHost                      string
+		dkimTextValue                 string
+		dkimPendingHost               string
+		dkimPendingTextValue          string
+		dkimRevokedHost               string
+		dkimRevokedTextValue          string
+		safeToRemoveRevokedKeyFromDns bool
+		dkimUpdateStatus              string
+		returnPathDomain              string
+		returnPathDomainVerified      bool
+		returnPathDomainCnameValue    string
+		confirmationPersonalNote      string
+	}
+
+	// Servers and sender signatures, with the account token.
+	partial type Client {
+		// The servers of the account, those whose name contains `name` when
+		// given, 500 a page.
+		def servers(name string = "") Pages<Server> {
+			return countPages<Server>(self, withQuery("/servers", map<string, string>{"name": name}), "Servers", 500, token = Token.Account)
+		}
+
+		// The server `id`. Fails with NotFound for an unknown one, and as
+		// every call does.
+		def server(id int) !Server {
+			let found = Server{}
+			try decodeInto(try call(self, http.Method.GET, "/servers/{id}", token = Token.Account), found)
+			return found
+		}
+
+		// Creates `server` from its settings. Returns it with its id and
+		// tokens. Fails with Invalid when Postmark refuses a setting (a
+		// name in use), and as every call does.
+		def createServer(server Server) !Server {
+			let body = serverBody(server)
+			body.set("DeliveryType", server.deliveryType) when server.deliveryType.len() > 0
+			let made = Server{}
+			try decodeInto(try call(self, http.Method.POST, "/servers", body, token = Token.Account), made)
+			return made
+		}
+
+		// Saves the settings of `server` (its `id` names it). Fails as
+		// `createServer` does, and with NotFound for an unknown one.
+		def updateServer(server Server) !Server {
+			let saved = Server{}
+			try decodeInto(try call(self, http.Method.PUT, "/servers/{server.id}", serverBody(server), token = Token.Account), saved)
+			return saved
+		}
+
+		// Removes the server `id` with its messages. Postmark allows it
+		// once its support turned deletion on for the account. Fails as
+		// `server` does.
+		def deleteServer(id int) !none {
+			try call(self, http.Method.DELETE, "/servers/{id}", token = Token.Account)
+			return none
+		}
+
+		// The sender signatures of the account, 500 a page; a listing fills
+		// the address, name, domain and `confirmed` only.
+		def signatures() Pages<Signature> {
+			return countPages<Signature>(self, "/senders", "SenderSignatures", 500, token = Token.Account)
+		}
+
+		// The sender signature `id` with its DNS records. Fails with
+		// NotFound for an unknown one, and as every call does.
+		def signature(id int) !Signature {
+			let found = Signature{}
+			try decodeInto(try call(self, http.Method.GET, "/senders/{id}", token = Token.Account), found)
+			return found
+		}
+
+		// Adds `email` as a sender signature named `name`; Postmark mails
+		// it a confirmation link (with `note`). Fails with Invalid when
+		// Postmark refuses the address (a public domain, one in use), and
+		// as every call does.
+		def createSignature(email string, name string, replyTo string = "", returnPathDomain string = "", note string = "") !Signature {
+			let body = map<string, any>{"FromEmail": email, "Name": name}
+			body.set("ReplyToEmail", replyTo) when replyTo.len() > 0
+			body.set("ReturnPathDomain", returnPathDomain) when returnPathDomain.len() > 0
+			body.set("ConfirmationPersonalNote", note) when note.len() > 0
+			let made = Signature{}
+			try decodeInto(try call(self, http.Method.POST, "/senders", body, token = Token.Account), made)
+			return made
+		}
+
+		// Saves the name, reply-to address, return-path domain and note of
+		// `signature` (its `id` names it). Fails as `createSignature` and
+		// `signature` do.
+		def updateSignature(signature Signature) !Signature {
+			let body = map<string, any>{"Name": signature.name}
+			body.set("ReplyToEmail", signature.replyToEmailAddress) when signature.replyToEmailAddress.len() > 0
+			body.set("ReturnPathDomain", signature.returnPathDomain) when signature.returnPathDomain.len() > 0
+			body.set("ConfirmationPersonalNote", signature.confirmationPersonalNote) when signature.confirmationPersonalNote.len() > 0
+			let saved = Signature{}
+			try decodeInto(try call(self, http.Method.PUT, "/senders/{signature.id}", body, token = Token.Account), saved)
+			return saved
+		}
+
+		// Removes the sender signature `id`. Fails as `signature` does.
+		def deleteSignature(id int) !none {
+			try call(self, http.Method.DELETE, "/senders/{id}", token = Token.Account)
+			return none
+		}
+
+		// Mails the confirmation link of signature `id` again. Fails as
+		// `signature` does.
+		def resendConfirmation(id int) !none {
+			try call(self, http.Method.POST, "/senders/{id}/resend", token = Token.Account)
+			return none
+		}
+	}
+
+	// The settings of a server Postmark takes.
+	internal def serverBody(s Server) map<string, any> {
+		let out = map<string, any>{"Name": s.name, "SmtpApiActivated": s.smtpApiActivated, "RawEmailEnabled": s.rawEmailEnabled, "InboundHookUrl": s.inboundHookUrl, "BounceHookUrl": s.bounceHookUrl, "OpenHookUrl": s.openHookUrl, "DeliveryHookUrl": s.deliveryHookUrl, "ClickHookUrl": s.clickHookUrl, "PostFirstOpenOnly": s.postFirstOpenOnly, "InboundDomain": s.inboundDomain, "InboundSpamThreshold": s.inboundSpamThreshold, "TrackOpens": s.trackOpens, "IncludeBounceContentInHook": s.includeBounceContentInHook, "EnableSmtpApiErrorHooks": s.enableSmtpApiErrorHooks}
+		out.set("Color", s.color) when s.color.len() > 0
+		out.set("TrackLinks", s.trackLinks) when s.trackLinks.len() > 0
+		return out
+	}
+}

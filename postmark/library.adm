@@ -1,5 +1,5 @@
-// Postmark mail send and webhooks
-@manifest(version = "0.0.1")
+// Postmark sending, templates, bounces, message search and webhooks
+@manifest(version = "0.1.0")
 library adm.notify.postmark {
 	use (
 		adm.notify.postmark

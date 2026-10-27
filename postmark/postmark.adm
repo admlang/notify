@@ -1,3 +1,220 @@
+// A Postmark client over std.net.http: single and batch sends from
+// std.formats.mail messages or templates (attachments and inline images,
+// tags, metadata, message streams, open and link tracking), templates and
+// layouts, bounces and suppressions, outbound and inbound message search
+// with opens and clicks, servers and sender signatures through the account
+// token, and a webhook handler that hands out typed events and inbound mail
+// as std.formats.mail messages.
+//
+// ```
+// let pm = new postmark.Client(serverToken)         // POSTMARK_SERVER_TOKEN when left out
+// let message = new mail.Message()
+//     .from("orders@example.com", "Shop")
+//     .to("ana@example.net")
+//     .subject("Your order")
+//     .html("<p>Thanks, Ana.</p>")
+// let sent = try pm.send(message, stream = "outbound", tag = "order")
+// print(sent.messageId)
+// ```
 partial module adm.notify.postmark {
-	// Postmark over std.net.http: send single and batch mail from std.formats.mail messages or templates, message streams, bounces and suppressions, webhooks for delivery, bounce, open and inbound
+	use (
+		std.errors
+		std.time
+		std.net.http
+		std.net.url
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON)
+	)
+
+	// Postmark's API address; `baseURL` replaces it for a proxy or a test
+	// server.
+	const apiURL = "https://api.postmarkapp.com"
+
+	// The server token that validates every send and delivers nothing.
+	const testToken = "POSTMARK_API_TEST"
+
+	// The library's version, in the User-Agent of every request.
+	const libraryVersion = "0.1.0"
+
+	// What went wrong, for the caller that acts on it.
+	enum ErrorKind {
+		// The token is missing or wrong, or the call needs the other token
+		// (account or server).
+		Auth        = "auth",
+		// Postmark refused the pace.
+		RateLimited = "ratelimited",
+		// The request breaks a rule: a field Postmark rejects, a sender
+		// signature that is not confirmed, a limit checked before sending.
+		Invalid     = "invalid",
+		// Every recipient is inactive: they bounced hard, complained or
+		// unsubscribed (`errorCode` 406).
+		Inactive    = "inactive",
+		// No message, template, bounce, server or signature of that id.
+		NotFound    = "notfound",
+		// Postmark could not be reached, or the connection dropped.
+		Transport   = "transport",
+		// Postmark failed, or answered with something that is not its API.
+		Server      = "server",
+	}
+
+	// The failure of every call here. `errorCode` is Postmark's API error
+	// code (`300` invalid request, `406` inactive recipient, ...), `status`
+	// the HTTP status (0 when none came back) and `retryAfter` the pause a
+	// rate limit asked for.
+	struct PostmarkError {
+		message    string
+		code       string
+		cause      ?error
+		stack      errors.StackTrace
+		kind       ErrorKind
+		status     int
+		errorCode  int
+		retryAfter ?duration
+	}
+
+	// A connection to the Postmark API with a server token (sending,
+	// templates, bounces, messages, webhooks of one server) and, for
+	// servers and sender signatures, an account token. Any number of tasks
+	// may share one; std.net.http keeps the connections.
+	//
+	// Calls fail with PostmarkError: Auth for a token Postmark refuses (or
+	// the wrong one of the two), NotFound for an unknown id, Inactive for
+	// a send whose recipients are all suppressed, Invalid for a request
+	// Postmark or the local checks refuse, RateLimited once
+	// `rateLimitRetries` waits were spent, Server and Transport.
+	partial type Client {
+		serverToken      ?Secret<string>
+		accountToken     ?Secret<string>
+		// The API's base: `https://api.postmarkapp.com`, or a proxy's.
+		baseURL          string
+		// How often a call refused with 429 is sent again after a wait,
+		// before it fails with RateLimited.
+		rateLimitRetries int             = 5
+		// The HTTP client requests go through: timeouts, a transport.
+		httpClient       http.Client
+
+		// A client with `serverToken` (else `POSTMARK_SERVER_TOKEN`) and
+		// `accountToken` (else `POSTMARK_ACCOUNT_TOKEN`), of the API at
+		// `baseURL` (else `POSTMARK_API_URL`, else Postmark's).
+		def new(serverToken ?Secret<string> = none, baseURL string = "", accountToken ?Secret<string> = none) {
+			let server = Runtime.getEnv("POSTMARK_SERVER_TOKEN")
+			self.serverToken = serverToken is none ?? (server is none ?? (none, server), serverToken)
+			let account = Runtime.getEnv("POSTMARK_ACCOUNT_TOKEN")
+			self.accountToken = accountToken is none ?? (account is none ?? (none, account), accountToken)
+			let envURL = Runtime.getEnv("POSTMARK_API_URL")
+			let base = baseURL.len() > 0 ?? (baseURL, envURL is none ?? (apiURL, envURL))
+			self.baseURL = base.trimEnd("/")
+			httpClient = new http.Client()
+			httpClient.userAgent = "adm.notify.postmark/{libraryVersion}"
+			httpClient.retry = http.RetryPolicy{attempts: 2, statuses: [502, 503, 504]}
+		}
+	}
+
+	// Which token a call authenticates with.
+	internal enum Token {
+		Server,
+		Account,
+	}
+
+	// Sends `method` to `path` (with its query), `body` as JSON when given,
+	// with the server or the account token, again after a wait for every
+	// 429 (up to `rateLimitRetries`). Returns the body of a 2xx reply.
+	// Fails with the PostmarkError the reply describes otherwise.
+	internal def call(client Client, method http.Method, path string, body ?any = none, token Token = Token.Server) !byte[] {
+		let endpoint = method.value + " " + path.split("?")[0]
+		let key = token == Token.Server ?? (client.serverToken, client.accountToken)
+		let header = token == Token.Server ?? ("X-Postmark-Server-Token", "X-Postmark-Account-Token")
+		fail PostmarkError{message: "postmark: {endpoint}: no {token == Token.Server ?? ("server", "account")} token", code: ErrorKind.Auth.value, kind: ErrorKind.Auth} when key is none
+		let attempt = 0
+		for {
+			let req = try client.httpClient.request(method, client.baseURL + path)
+			req.headers.set(header, key.reveal())
+			req.headers.set("Accept", "application/json")
+			if !(body is none) {
+				req.replaceBody((new JSON()).encode(body))
+				req.headers.set("Content-Type", "application/json")
+			}
+			let res = client.httpClient.do(req) onerror (err error) {
+				fail PostmarkError{message: "postmark: {endpoint}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+			}
+			if res.status == 429 {
+				let asked = res.retryAfter()
+				let pause = asked is none ?? (1s * float(attempt + 1), asked)
+				res.close() onerror recover none
+				if attempt < client.rateLimitRetries {
+					attempt++
+					time.sleep(pause)
+					continue
+				}
+				fail PostmarkError{message: "postmark: {endpoint}: rate limited", code: ErrorKind.RateLimited.value, kind: ErrorKind.RateLimited, status: 429, retryAfter: pause}
+			}
+			let data = res.bytes() onerror (err error) {
+				fail PostmarkError{message: "postmark: {endpoint}: the reply was cut short: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport, status: res.status}
+			}
+			fail failureOf(endpoint, res.status, res.reason, data) unless res.ok()
+			return data
+		}
+		fail "postmark: unreachable"
+	}
+
+	// The body of a refusal: `{"ErrorCode": 300, "Message": "..."}`.
+	internal struct Refusal {
+		errorCode int
+		message   string
+	}
+
+	// The PostmarkError of a reply that is not 2xx.
+	internal def failureOf(endpoint string, status int, reason string, data byte[]) PostmarkError {
+		let refusal = Refusal{}
+		(new JSON()).decode(data, refusal) onerror recover none
+		let kind = kindOf(refusal.errorCode, status)
+		let text = string(data).trim()
+		let detail = refusal.message.len() > 0 ?? (refusal.message, text.len() > 0 && text.len() <= 200 ?? (text, reason))
+		return PostmarkError{message: "postmark: {endpoint}: {status} {detail}", code: kind.value, kind: kind, status: status, errorCode: refusal.errorCode}
+	}
+
+	// The kind of a Postmark error code; the HTTP status decides one
+	// Postmark gave no code.
+	internal def kindOf(errorCode int, status int) ErrorKind {
+		return ErrorKind.Auth when errorCode == 10 || (status := 401 || 403)
+		return ErrorKind.Inactive when errorCode == 406
+		return ErrorKind.NotFound when (errorCode := 407 || 701 || 1101) || status == 404
+		return ErrorKind.RateLimited when status == 429
+		return ErrorKind.Server when status >= 500
+		return ErrorKind.Invalid
+	}
+
+	// A failure raised before anything is sent: a limit the request breaks.
+	internal def invalid(message string) PostmarkError {
+		return PostmarkError{message: "postmark: {message}", code: ErrorKind.Invalid.value, kind: ErrorKind.Invalid}
+	}
+
+	// Binds the JSON of a reply onto `target`. Fails with PostmarkError
+	// Server when it is not of that shape.
+	internal def decodeInto(data byte[], target any) !none {
+		(new JSON()).decode(data, target) onerror (err error) {
+			fail PostmarkError{message: "postmark: the reply is not what the API sends: {err.message}", code: ErrorKind.Server.value, cause: err, kind: ErrorKind.Server}
+		}
+		return none
+	}
+
+	// The body an array is bound through: the JSON codec binds objects onto
+	// typed values, not a top-level array.
+	internal struct Items<T> {
+		items T[]
+	}
+
+	// A reply that is a JSON array, as T[]. Fails as `decodeInto` does.
+	internal def listOf<T>(data byte[]) !T[] {
+		let box = Items<T>{}
+		let text = string(data).trim()
+		return box.items when text.len() == 0
+		try decodeInto("\{\"items\":{text}}".bytes(), box)
+		return box.items
+	}
+
+	// `text` escaped for one segment of a path.
+	internal def segment(text string) string {
+		return url.pathEscape(text)
+	}
 }

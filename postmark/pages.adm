@@ -1,0 +1,124 @@
+partial module adm.notify.postmark {
+	use (
+		std.net.http
+		std.net.url
+	)
+
+	// A list Postmark hands out a page at a time (bounces, templates,
+	// messages, opens, clicks, servers, signatures): `next` fetches the
+	// next page, `all` the rest in one array.
+	//
+	// ```
+	// let bounces = pm.bounces(postmark.BounceFilter{kind: "HardBounce"})
+	// let page = try bounces.next()               // ?Bounce[]
+	// let every = try pm.templates().all()
+	// ```
+	type Pages<T> {
+		// How many items the whole list holds, once a page was fetched.
+		total          int                   = 0
+		internal fetch def (int) !(T[], int)
+		internal at    int                   = 0
+		internal ended bool                  = false
+
+		// Pages that `fetch` returns for an offset, each with the count of
+		// the whole list.
+		def new(fetch def (int) !(T[], int)) {
+			self.fetch = fetch
+		}
+
+		// The next page; none after the last. Fails as the call behind the
+		// list does.
+		def next() !?T[] {
+			return none when ended
+			let (page, count) = try fetch(at)
+			total = count
+			at += page.len()
+			ended = page.len() == 0 || at >= count
+			return none when page.len() == 0
+			return page
+		}
+
+		// Every item left, in one array. Fails as `next` does.
+		def all() !T[] {
+			let out T[] = []
+			for {
+				let page = try next()
+				break when page is none
+				out.push(...page)
+			}
+			return out
+		}
+	}
+
+	// The pages of a list Postmark pages by `count` and `offset`: `path`
+	// (with its query, if any) answers `{"TotalCount": n, <key>: [...]}`.
+	// With a `reach`, offset and count stay within it and the list ends
+	// there.
+	internal def countPages<T>(client Client, path string, key string, count int, token Token = Token.Server, reach int = 0) Pages<T> {
+		let joiner = path.contains("?") ?? ("&", "?")
+		return new Pages<T>(def (offset int) !(T[], int) {
+			let size = reach > 0 && offset + count > reach ?? (reach - offset, count)
+			let nothing T[] = []
+			return (nothing, offset) when size <= 0
+			let data = try call(client, http.Method.GET, "{path}{joiner}count={size}&offset={offset}", token = token)
+			let box = PageOf<T>{totalCount: -1}
+			try decodeInto(data, box)
+			let page = box.items(key)
+			let total = box.totalCount >= 0 ?? (box.totalCount, offset + page.len())
+			return (page, reach > 0 && total > reach ?? (reach, total))
+		})
+	}
+
+	// A page of any list: Postmark names the array after the list, and
+	// the reply holds one of these.
+	internal type PageOf<T> {
+		totalCount       int
+		bounces          T[]
+		templates        T[]
+		messages         T[]
+		inboundMessages  T[]
+		opens            T[]
+		clicks           T[]
+		servers          T[]
+		senderSignatures T[]
+
+		def new() {}
+
+		// The array named `key`.
+		def items(key string) T[] {
+			switch key {
+				case "Bounces":
+					return bounces
+				case "Templates":
+					return templates
+				case "Messages":
+					return messages
+				case "InboundMessages":
+					return inboundMessages
+				case "Opens":
+					return opens
+				case "Clicks":
+					return clicks
+				case "Servers":
+					return servers
+				default:
+					return senderSignatures
+			}
+		}
+	}
+
+	// Query parameters, encoded, from the pairs whose value is not "".
+	internal def queryOf(pairs map<string, string>) string {
+		let out string[] = []
+		for let (key, value) in pairs {
+			out.push("{key}={url.queryEscape(value)}") when value.len() > 0
+		}
+		return out.join("&")
+	}
+
+	// `path` with the query of `pairs`, if any.
+	internal def withQuery(path string, pairs map<string, string>) string {
+		let query = queryOf(pairs)
+		return query.len() > 0 ?? (path + "?" + query, path)
+	}
+}

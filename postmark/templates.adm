@@ -1,0 +1,127 @@
+partial module adm.notify.postmark {
+	use (
+		std.net.http
+		std.data.encoding::(json)
+	)
+
+	// Which templates a listing keeps.
+	enum TemplateKind {
+		All      = "All",
+		Standard = "Standard",
+		// Layouts: the shared frame standard templates are placed in
+		// (`{{{@content}}}`).
+		Layout   = "Layout",
+	}
+
+	// A stored template or layout: Mustachio bodies filled with a model
+	// when a template message is sent. A listing fills the id, name,
+	// alias, kind, layout and `active` only.
+	struct TemplateInfo {
+		templateId int
+		name string
+		alias string
+		subject string
+		htmlBody string
+		textBody string
+		active bool
+		// `Standard` or `Layout`.
+		@json("TemplateType")
+		kind string
+		// The alias of the layout a standard template sits in; none for no
+		// layout.
+		layoutTemplate ?string = none
+		associatedServerId int
+	}
+
+	// What validating a template found in its subject and bodies, and a
+	// model with the fields they use.
+	struct TemplateCheck {
+		allContentIsValid      bool
+		subject                ContentCheck
+		htmlBody               ContentCheck
+		textBody               ContentCheck
+		suggestedTemplateModel ?any         = none
+	}
+
+	// One part of a template validation: whether it parses, where it does
+	// not, and the part rendered with the test model.
+	struct ContentCheck {
+		contentIsValid   bool
+		validationErrors TemplateProblem[]
+		renderedContent  string
+	}
+
+	// Where a template does not parse: the text, the line and the
+	// character in it.
+	struct TemplateProblem {
+		message           string
+		line              int
+		characterPosition int
+	}
+
+	// Templates.
+	partial type Client {
+		// The templates of the server, of `kind`, those in the layout
+		// `layout` when given, 500 a page.
+		def templates(kind TemplateKind = TemplateKind.All, layout string = "") Pages<TemplateInfo> {
+			let path = withQuery("/templates", map<string, string>{"TemplateType": kind.value, "LayoutTemplate": layout})
+			return countPages<TemplateInfo>(self, path, "Templates", 500)
+		}
+
+		// The template with the id or alias `idOrAlias`. Fails with NotFound
+		// for an unknown one, and as every call does.
+		def template(idOrAlias string) !TemplateInfo {
+			let found = TemplateInfo{}
+			try decodeInto(try call(self, http.Method.GET, "/templates/{segment(idOrAlias)}"), found)
+			return found
+		}
+
+		// Stores `template` (its name, alias, subject, bodies, kind and
+		// layout). Returns it with its id. Fails with Invalid when Postmark
+		// refuses its content, and as every call does.
+		def createTemplate(template TemplateInfo) !TemplateInfo {
+			let made = TemplateInfo{}
+			try decodeInto(try call(self, http.Method.POST, "/templates", templateBody(template)), made)
+			return made
+		}
+
+		// Saves `template`, named by its id (else its alias). Fails as
+		// `createTemplate` does, and with NotFound for an unknown one.
+		def updateTemplate(template TemplateInfo) !TemplateInfo {
+			let name = template.templateId > 0 ?? ("{template.templateId}", template.alias)
+			let saved = TemplateInfo{}
+			try decodeInto(try call(self, http.Method.PUT, "/templates/{segment(name)}", templateBody(template)), saved)
+			return saved
+		}
+
+		// Removes the template `idOrAlias`. Fails with NotFound for an
+		// unknown one, and as every call does.
+		def deleteTemplate(idOrAlias string) !none {
+			try call(self, http.Method.DELETE, "/templates/{segment(idOrAlias)}")
+			return none
+		}
+
+		// Checks the subject and bodies of `template` and renders them with
+		// `model`, CSS inlined when `inlineCss`. Fails as every call does;
+		// content that does not parse is in the result, not a failure.
+		def validateTemplate(template TemplateInfo, model map<string, any> = new map<string, any>(), inlineCss bool = true) !TemplateCheck {
+			let body = map<string, any>{"Subject": template.subject, "HtmlBody": template.htmlBody, "TextBody": template.textBody, "TestRenderModel": model, "InlineCssForHtmlTestRender": inlineCss, "TemplateType": template.kind.len() > 0 ?? (template.kind, "Standard")}
+			let layout = template.layoutTemplate
+			body.set("LayoutTemplate", layout) unless layout is none
+			let found = TemplateCheck{}
+			try decodeInto(try call(self, http.Method.POST, "/templates/validate", body), found)
+			return found
+		}
+	}
+
+	// The fields of a template Postmark takes.
+	internal def templateBody(t TemplateInfo) map<string, any> {
+		let out = map<string, any>{"Name": t.name, "HtmlBody": t.htmlBody, "TextBody": t.textBody}
+		out.set("Alias", t.alias) when t.alias.len() > 0
+		out.set("Subject", t.subject) when t.subject.len() > 0
+		out.set("TemplateType", t.kind) when t.kind.len() > 0
+		let layout = t.layoutTemplate
+		out.set("LayoutTemplate", layout) unless layout is none
+		return out
+	}
+}

@@ -11,4 +11,4 @@ repo_salt = "base64:m/zL99AnPUAmtDDJzo1dnavJ9Ur7DVZceRxf8O7zt8s="
 
 # The line `adm search` shows for the library; `adm publish` files it.
 [apps."adm.notify.postmark"]
-description = "Postmark mail send and webhooks"
+description = "Postmark sending, templates, bounces, message search and webhooks"

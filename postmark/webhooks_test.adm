@@ -1,0 +1,140 @@
+partial module adm.notify.postmark {
+	use (
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.data.encoding::(base64encode)
+	)
+
+	// Serves `handler` at /hook and returns its address.
+	internal def hookServer(handler WebhookHandler) !(httptest.Server, string) {
+		let mux = new http.ServeMux()
+		try mux.handle("/hook", handler)
+		let server = new httptest.Server(mux)
+		try server.start()
+		return (server, "http://{server.address().str()}/hook")
+	}
+
+	// Posts `body` with `headers`.
+	internal def postHook(target string, body string, headers map<string, string> = new map<string, string>()) !http.Response {
+		let client = new http.Client()
+		let req = try client.request(http.Method.POST, target)
+		req.headers.set("Content-Type", "application/json")
+		for let (k, v) in headers {
+			req.headers.set(k, v)
+		}
+		req.replaceBody(body.bytes())
+		return try client.do(req)
+	}
+
+	check "Postmark webhooks" {
+		// Each record type comes out as its own struct; inbound mail comes
+		// out as a std message with its mailboxes, headers, bodies and
+		// attachments, inline ones under their Content-ID.
+		@test()
+		def TestEvents() !none {
+			let got Event[] = []
+			let (server, target) = try hookServer(webhook(def (event Event) !none {
+				got.push(event)
+				return none
+			}))
+			let posts = [
+				map<string, any>{"RecordType": "Delivery", "ServerID": 23, "MessageStream": "outbound", "MessageID": "m1", "Recipient": "ana@example.net", "Tag": "order", "DeliveredAt": "2026-10-01T10:00:00Z", "Details": "250 OK", "Metadata": map<string, any>{"order": "7"}},
+				map<string, any>{"RecordType": "Bounce", "ID": 42, "Type": "HardBounce", "TypeCode": 1, "MessageID": "m2", "Email": "gone@example.net", "Description": "unknown user", "Inactive": true, "CanActivate": true, "Content": "Return-Path: <>"},
+				map<string, any>{"RecordType": "SpamComplaint", "ID": 43, "Type": "SpamComplaint", "TypeCode": 512, "Email": "angry@example.net"},
+				map<string, any>{"RecordType": "Open", "MessageID": "m3", "FirstOpen": true, "Recipient": "ana@example.net", "Client": map<string, any>{"Name": "Apple Mail"}, "Geo": map<string, any>{"CountryISOCode": "RO"}},
+				map<string, any>{"RecordType": "Click", "MessageID": "m4", "OriginalLink": "https://example.com/p", "ClickLocation": "HTML", "Recipient": "ana@example.net"},
+				map<string, any>{"RecordType": "SubscriptionChange", "MessageID": "m5", "Recipient": "ben@example.net", "Origin": "Recipient", "SuppressSending": true, "SuppressionReason": "ManualSuppression", "ChangedAt": "2026-10-01T11:00:00Z"},
+				map<string, any>{"FromName": "Ben", "MessageStream": "inbound", "From": "ben@example.net", "FromFull": map<string, any>{"Email": "ben@example.net", "Name": "Ben", "MailboxHash": ""}, "To": "support+t7@example.com", "ToFull": [map<string, any>{"Email": "support+t7@example.com", "Name": "Support", "MailboxHash": "t7"}], "CcFull": [map<string, any>{"Email": "carla@example.net", "Name": ""}], "BccFull": [map<string, any>{"Email": "audit@example.com", "Name": ""}], "OriginalRecipient": "support+t7@example.com", "ReplyTo": "Ben <reply@example.net>", "Subject": "Order 7", "MessageID": "i1", "Date": "Mon, 26 Oct 2026 10:00:00 +0000", "MailboxHash": "t7", "TextBody": "Where is it?\n\n> quoted", "HtmlBody": "<p>Where is it?</p><img src=\"cid:pic@x\">", "StrippedTextReply": "Where is it?", "Tag": "", "Headers": [map<string, any>{"Name": "X-Spam-Score", "Value": "0.3"}, map<string, any>{"Name": "Message-ID", "Value": "<orig@example.net>"}, map<string, any>{"Name": "MIME-Version", "Value": "1.0"}, map<string, any>{"Name": "Content-Type", "Value": "multipart/mixed; boundary=x"}], "Attachments": [map<string, any>{"Name": "a.txt", "Content": base64encode("order 7".bytes()), "ContentType": "text/plain", "ContentLength": 7}, map<string, any>{"Name": "pic.png", "Content": base64encode(byte[137, 80]), "ContentType": "image/png", "ContentLength": 2, "ContentID": "pic@x"}]},
+			]
+			for let post in posts {
+				let res = try postHook(target, json(post))
+				fail "a post was answered {res.status}" unless res.status == 200
+			}
+			assert got.len() == 7
+			let kinds string[] = []
+			for let event in got {
+				match event {
+					case Delivery:
+						assert event.recipient == "ana@example.net" && event.serverId == 23 && event.details == "250 OK" && "{event.metadata.get("order")}" == "7"
+						kinds.push("delivery")
+					case Bounce:
+						assert event.id == 42 && event.kind == "HardBounce" && event.inactive && event.content == "Return-Path: <>"
+						kinds.push("bounce")
+					case SpamComplaint:
+						assert event.id == 43 && event.typeCode == 512 && event.email == "angry@example.net"
+						kinds.push("spam")
+					case Open:
+						assert event.firstOpen && event.client.name == "Apple Mail" && event.geo.countryIsoCode == "RO"
+						kinds.push("open")
+					case Click:
+						assert event.originalLink == "https://example.com/p" && event.clickLocation == "HTML"
+						kinds.push("click")
+					case SubscriptionChange:
+						assert event.suppressSending && event.suppressionReason == "ManualSuppression" && event.origin == "Recipient"
+						kinds.push("subscription")
+					case Inbound:
+						let m = event.message
+						let authors = try m.from()
+						assert authors[0].address == "ben@example.net" && authors[0].name == "Ben"
+						assert (try m.to())[0].address == "support+t7@example.com" && (try m.cc())[0].address == "carla@example.net" && (try m.bcc())[0].address == "audit@example.com"
+						assert (try m.replyTo())[0].address == "reply@example.net"
+						assert m.subject() == "Order 7" && "{m.messageId()}" == "orig@example.net" && "{m.header.get("X-Spam-Score")}" == "0.3"
+						assert "{m.text()}" == "Where is it?\n\n> quoted" && "{m.html()}".contains("cid:pic@x")
+						let files = m.attachments()
+						assert files.len() == 1 && "{files[0].filename()}" == "a.txt" && string(files[0].data()) == "order 7"
+						let inline = m.body.walk().filter(p => "{p.contentId()}" == "pic@x")
+						assert inline.len() == 1 && inline[0].contentType().essence() == "image/png"
+						assert event.details.mailboxHash == "t7" && event.details.strippedTextReply == "Where is it?" && event.details.originalRecipient == "support+t7@example.com"
+						assert !string(m.bytes()).contains("boundary=x")
+						kinds.push("inbound")
+					default:
+				}
+			}
+			assert kinds.join(",") == "delivery,bounce,spam,open,click,subscription,inbound"
+			try server.close()
+			return none
+		}
+
+		// Credentials by Basic authentication or a header secret; bodies
+		// that are not events, unknown record types, failing handlers and
+		// other methods each get their answer.
+		@test()
+		def TestAnswers() !none {
+			let calls = 0
+			let handler = webhook(def (event Event) !none {
+				calls++
+				match event {
+					case Delivery:
+						fail "refused" when event.recipient == "fail@example.net"
+					default:
+				}
+				return none
+			}, username = "postmark", password = "s3cret", header = "X-Hook-Secret", secret = "h00k")
+			let (server, target) = try hookServer(handler)
+			let delivery = json(map<string, any>{"RecordType": "Delivery", "Recipient": "ana@example.net"})
+			let good = map<string, string>{"Authorization": "Basic " + base64encode("postmark:s3cret".bytes()), "X-Hook-Secret": "h00k"}
+			assert (try postHook(target, delivery)).status == 401
+			assert (try postHook(target, delivery, {"Authorization": "Basic " + base64encode("postmark:s3cret".bytes())})).status == 401
+			assert (try postHook(target, delivery, {"Authorization": "Basic " + base64encode("postmark:nope".bytes()), "X-Hook-Secret": "h00k"})).status == 401
+			assert (try postHook(target, delivery, good)).status == 200 && calls == 1
+			assert (try postHook(target, json(map<string, any>{"RecordType": "Delivery", "Recipient": "fail@example.net"}), good)).status == 500 && calls == 2
+			assert (try postHook(target, "[1", good)).status == 400
+			assert (try postHook(target, "[1]", good)).status == 400
+			assert (try postHook(target, json(map<string, any>{"Subject": "no record type"}), good)).status == 400
+			assert (try postHook(target, json(map<string, any>{"RecordType": "Delivery", "ServerID": "not a number"}), good)).status == 400
+			assert (try postHook(target, json(map<string, any>{"RecordType": "SomethingNew"}), good)).status == 200 && calls == 2
+			let recorder = new httptest.ResponseRecorder()
+			try handler.serve(recorder.context(try httptest.newRequest(http.Method.GET, "/hook")))
+			assert recorder.result().status == 405
+			let (open, openTarget) = try hookServer(webhook(def (event Event) !none {
+				calls++ when event is Delivery
+				return none
+			}))
+			assert (try postHook(openTarget, delivery)).status == 200 && calls == 3
+			try open.close()
+			try server.close()
+			return none
+		}
+	}
+}

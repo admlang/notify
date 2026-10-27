@@ -1,0 +1,184 @@
+partial module adm.notify.postmark {
+	use (
+		std.time
+		std.net.http
+		std.data.encoding::(json)
+	)
+
+	// A message a receiving server refused, or a spam complaint: what
+	// came back, and whether the address is now inactive (Postmark sends
+	// it nothing until it is reactivated).
+	struct Bounce {
+		id int64
+		// `HardBounce`, `SoftBounce`, `Transient`, `SpamComplaint`, ... and
+		// its number (`typeCode`).
+		@json("Type")
+		kind string
+		typeCode int
+		name string
+		tag string
+		messageId string
+		serverId int
+		messageStream string
+		description string
+		details string
+		email string
+		from string
+		bouncedAt string
+		dumpAvailable bool
+		inactive bool
+		canActivate bool
+		subject string
+		// The returned message, when the webhook was set to include it.
+		content string
+		metadata map<string, string>
+	}
+
+	// The bounces of the server by kind, and how many addresses are
+	// inactive.
+	struct DeliveryStats {
+		inactiveMails int
+		bounces       BounceCount[]
+	}
+
+	// The bounces of one kind (`name`, `kind`; `All` for the total).
+	struct BounceCount {
+		name string
+		count int
+		@json("Type")
+		kind string
+	}
+
+	// Which bounces a listing keeps; empty fields keep all.
+	struct BounceFilter {
+		// `HardBounce`, `SoftBounce`, `SpamComplaint`, ...
+		kind      string         = ""
+		inactive  ?bool          = none
+		// Addresses containing this text.
+		email     string         = ""
+		tag       string         = ""
+		messageId string         = ""
+		stream    string         = ""
+		// In Postmark's time zone (US Eastern).
+		since     ?time.DateTime = none
+		until     ?time.DateTime = none
+	}
+
+	// An address a message stream sends nothing to: why (`HardBounce`,
+	// `SpamComplaint`, `ManualSuppression`), who suppressed it
+	// (`Recipient`, `Customer`, `Admin`) and when.
+	struct Suppression {
+		emailAddress      string
+		suppressionReason string
+		origin            string
+		createdAt         string
+	}
+
+	// What Postmark did with one address of a suppression request:
+	// `Queued`, or `Failed` with its `message`.
+	struct SuppressionResult {
+		emailAddress string
+		status       string
+		message      string
+	}
+
+	internal struct Suppressions {
+		suppressions Suppression[]
+	}
+
+	internal struct SuppressionResults {
+		suppressions SuppressionResult[]
+	}
+
+	internal struct Dump {
+		body string
+	}
+
+	internal struct Activated {
+		message string
+		bounce  Bounce
+	}
+
+	// Bounces and suppressions.
+	partial type Client {
+		// The bounce counts of the server. Fails as every call does.
+		def deliveryStats() !DeliveryStats {
+			let found = DeliveryStats{}
+			try decodeInto(try call(self, http.Method.GET, "/deliverystats"), found)
+			return found
+		}
+
+		// The bounces `filter` keeps, newest first, 500 a page.
+		def bounces(filter BounceFilter = BounceFilter{}) Pages<Bounce> {
+			let inactive = filter.inactive
+			let pairs = map<string, string>{"type": filter.kind, "emailFilter": filter.email, "tag": filter.tag, "messageID": filter.messageId, "messagestream": filter.stream, "inactive": inactive is none ?? ("", "{inactive}")}
+			let since = filter.since
+			pairs.set("fromdate", since.str()) unless since is none
+			let until = filter.until
+			pairs.set("todate", until.str()) unless until is none
+			return countPages<Bounce>(self, withQuery("/bounces", pairs), "Bounces", 500)
+		}
+
+		// The bounce `id`. Fails with NotFound for an unknown one, and as
+		// every call does.
+		def bounce(id int64) !Bounce {
+			let found = Bounce{}
+			try decodeInto(try call(self, http.Method.GET, "/bounces/{id}"), found)
+			return found
+		}
+
+		// The raw source of the bounce `id` as the receiving server sent it
+		// back; "" once Postmark no longer keeps it (`dumpAvailable`). Fails
+		// as `bounce` does.
+		def bounceDump(id int64) !string {
+			let found = Dump{}
+			try decodeInto(try call(self, http.Method.GET, "/bounces/{id}/dump"), found)
+			return found.body
+		}
+
+		// Makes the address of bounce `id` active again, so Postmark sends to
+		// it. Returns the bounce as it now is. Fails with Invalid when the
+		// bounce cannot be reactivated (`canActivate`), and as `bounce` does.
+		def activate(id int64) !Bounce {
+			let found = Activated{}
+			try decodeInto(try call(self, http.Method.PUT, "/bounces/{id}/activate"), found)
+			return found.bounce
+		}
+
+		// The suppressed addresses of `stream`, those of `reason`, `origin`
+		// and `email` when given, suppressed between `since` and `until`.
+		// Fails as every call does.
+		def suppressions(stream string = "outbound", reason string = "", origin string = "", email string = "", since ?time.Date = none, until ?time.Date = none) !Suppression[] {
+			let pairs = map<string, string>{"SuppressionReason": reason, "Origin": origin, "EmailAddress": email}
+			pairs.set("fromdate", since.str()) unless since is none
+			pairs.set("todate", until.str()) unless until is none
+			let found = Suppressions{}
+			try decodeInto(try call(self, http.Method.GET, withQuery("/message-streams/{segment(stream)}/suppressions/dump", pairs)), found)
+			return found.suppressions
+		}
+
+		// Suppresses `emails` on `stream`. Returns what Postmark did with
+		// each. Fails as every call does.
+		def suppress(stream string, emails ...string) !SuppressionResult[] {
+			return try changeSuppressions(self, "/message-streams/{segment(stream)}/suppressions", emails)
+		}
+
+		// Lifts the suppression of `emails` on `stream` (one made for a spam
+		// complaint stays). Returns what Postmark did with each. Fails as
+		// every call does.
+		def unsuppress(stream string, emails ...string) !SuppressionResult[] {
+			return try changeSuppressions(self, "/message-streams/{segment(stream)}/suppressions/delete", emails)
+		}
+	}
+
+	internal def changeSuppressions(client Client, path string, emails string[]) !SuppressionResult[] {
+		return [] when emails.len() == 0
+		let entries any[] = []
+		for let email in emails {
+			entries.push(map<string, any>{"EmailAddress": email})
+		}
+		let found = SuppressionResults{}
+		try decodeInto(try call(client, http.Method.POST, path, map<string, any>{"Suppressions": entries}), found)
+		return found.suppressions
+	}
+}
