@@ -1,0 +1,90 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.time
+		std.net.http
+	)
+
+	// A list SendGrid hands out a page at a time (suppressions, templates,
+	// senders, domains): `next` fetches the next page, `all` the rest in
+	// one array. Each page waits for its endpoint's rate limit like any
+	// call.
+	//
+	// ```
+	// let bounces = sg.suppressions(sendgrid.SuppressionList.Bounces)
+	// let page = try bounces.next()               // ?Suppression[]
+	// let every = try sg.templates().all()
+	// ```
+	type Pages<T> {
+		internal fetch def (string) !(T[], string)
+		internal at    string
+		internal ended bool                        = false
+
+		// Pages that `fetch` returns for a position ("" for the first),
+		// each with the position of the next ("" after the last).
+		def new(fetch def (string) !(T[], string)) {
+			self.fetch = fetch
+			at = ""
+		}
+
+		// The next page; none after the last. Fails as the call behind the
+		// list does.
+		def next() !?T[] {
+			return none when ended
+			let (page, cursor) = try fetch(at)
+			at = cursor
+			ended = cursor.len() == 0
+			return none when page.len() == 0 && ended
+			return page
+		}
+
+		// Every item left, in one array. Fails as `next` does.
+		def all() !T[] {
+			let out T[] = []
+			for {
+				let page = try next()
+				break when page is none
+				out.push(...page)
+			}
+			return out
+		}
+	}
+
+	// The pages of a list SendGrid pages by `limit` and `offset`: `path`
+	// (with its query, if any) answers a JSON array; a page shorter than
+	// `limit` is the last.
+	internal def offsetPages<T>(client Client, path string, limit int) Pages<T> {
+		let joiner = path.contains("?") ?? ("&", "?")
+		return new Pages<T>(def (cursor string) !(T[], string) {
+			let offset = cursor.len() > 0 ?? (cursor.toInt<int>(), 0)
+			let reply = try call(client, http.Method.GET, "{path}{joiner}limit={limit}&offset={offset}")
+			let page = try listOf<T>(reply.data)
+			return (page, page.len() < limit ?? ("", "{offset + page.len()}"))
+		})
+	}
+
+	// The wait SendGrid asked of each endpoint once its requests ran out
+	// or it answered 429. Safe from many tasks.
+	internal type Limiter {
+		internal blocked map<string, int64>
+
+		def new() {}
+
+		// How long a call of `endpoint` has to wait before it may go out;
+		// 0s takes its place.
+		atomic def waitFor(endpoint string) duration {
+			let until = blocked.get(endpoint)
+			return 0s when until is none
+			let now = time.monoNs()
+			return duration(until - now) when until > now
+			blocked.delete(endpoint)
+			return 0s
+		}
+
+		// Holds back `endpoint` for `after`.
+		atomic def block(endpoint string, after duration) {
+			let until = time.monoNs() + int64(after)
+			let held = blocked.get(endpoint)
+			blocked.set(endpoint, until) when held is none || until > held
+		}
+	}
+}

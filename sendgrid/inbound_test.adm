@@ -1,0 +1,173 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.bytes
+		std.testing
+		std.formats.mail
+		std.net.http
+		std.net.http.httptest
+		std.net.multipart
+		std.data.encoding::(base64encode)
+	)
+
+	// A form field of inbound parse: text, raw bytes (another charset), or
+	// a file with its media type.
+	internal struct FormEntry {
+		name      string
+		text      string = ""
+		data      byte[]
+		filename  string = ""
+		mediaType string = ""
+	}
+
+	// Posts `entries` as multipart/form-data to `target`, with
+	// `authorization` when given.
+	internal def postForm(target string, entries FormEntry[], authorization string = "") !http.Response {
+		let body = new bytes.Buffer()
+		let form = new multipart.Writer(body)
+		for let e in entries {
+			if e.filename.len() > 0 {
+				let headers = map<string, string[]>{"Content-Disposition": ["form-data; name=\"{e.name}\"; filename=\"{e.filename}\""], "Content-Type": [e.mediaType]}
+				let part = try form.createPart(headers)
+				try part.write(e.data)
+			} else if e.data.len() > 0 {
+				let part = try form.createFormField(e.name)
+				try part.write(e.data)
+			} else {
+				try form.writeField(e.name, e.text)
+			}
+		}
+		try form.close()
+		let client = new http.Client()
+		let req = try client.request(http.Method.POST, target)
+		req.headers.set("Content-Type", form.formDataContentType())
+		req.headers.set("Authorization", authorization) when authorization.len() > 0
+		req.replaceBody(body.bytes())
+		return try client.do(req)
+	}
+
+	// `text`, or "" for none.
+	internal def given(text ?string) string {
+		return text is none ?? ("", text)
+	}
+
+	// Serves `handler` at /inbound and returns its address.
+	internal def inboundServer(handler InboundHandler) !(httptest.Server, string) {
+		let mux = new http.ServeMux()
+		try mux.handle("/inbound", handler)
+		let server = new httptest.Server(mux)
+		try server.start()
+		return (server, "http://{server.address().str()}/inbound")
+	}
+
+	check "SendGrid inbound parse" {
+		// The parsed form becomes a message: the posted headers, the bodies
+		// in their charsets, an attachment, and an inline image under its
+		// Content-ID; the envelope and the checks come beside it.
+		@test()
+		def TestParsedForm() !none {
+			let got Inbound[] = []
+			let (server, target) = try inboundServer(inbound(def (received Inbound) !none {
+				got.push(received)
+				return none
+			}))
+			let headers = "Received: by mx.sendgrid.net\nFrom: Ana <ana@example.net>\nTo: support@example.com\nSubject: =?UTF-8?Q?Caf=C3=A9_order?=\nMessage-ID: <abc@example.net>\nMIME-Version: 1.0\nContent-Type: multipart/mixed;\n boundary=\"xyz\"\n"
+			let entries = [
+				FormEntry{name: "headers", text: headers},
+				FormEntry{name: "text", text: "Where is my order?"},
+				FormEntry{name: "html", data: byte[60, 112, 62, 99, 97, 102, 233, 60, 105, 109, 103, 32, 115, 114, 99, 61, 34, 99, 105, 100, 58, 105, 49, 34, 62, 60, 47, 112, 62]},
+				FormEntry{name: "from", text: "Ana <ana@example.net>"},
+				FormEntry{name: "to", text: "support@example.com"},
+				FormEntry{name: "subject", text: "Café order"},
+				FormEntry{name: "envelope", text: "\{\"to\":[\"support@example.com\",\"archive@example.com\"],\"from\":\"bounce@example.net\"}"},
+				FormEntry{name: "charsets", text: "\{\"to\":\"UTF-8\",\"html\":\"iso-8859-1\",\"subject\":\"UTF-8\",\"from\":\"UTF-8\",\"text\":\"utf-8\"}"},
+				FormEntry{name: "sender_ip", text: "203.0.113.5"},
+				FormEntry{name: "spam_score", text: "1.5"},
+				FormEntry{name: "spam_report", text: "Spam detection report"},
+				FormEntry{name: "dkim", text: "\{@example.net : pass}"},
+				FormEntry{name: "SPF", text: "pass"},
+				FormEntry{name: "attachments", text: "2"},
+				FormEntry{name: "attachment-info", text: "\{\"attachment1\":\{\"filename\":\"order.txt\",\"name\":\"order.txt\",\"type\":\"text/plain\"},\"attachment2\":\{\"filename\":\"logo.png\",\"name\":\"logo.png\",\"type\":\"image/png\",\"content-id\":\"i1\"}}"},
+				FormEntry{name: "content-ids", text: "\{\"i1\":\"attachment2\"}"},
+				FormEntry{name: "attachment1", data: "order 7".bytes(), filename: "order.txt", mediaType: "text/plain"},
+				FormEntry{name: "attachment2", data: byte[137, 80, 78, 71], filename: "logo.png", mediaType: "image/png"},
+			]
+			let res = try postForm(target, entries)
+			assert res.status == 200 && got.len() == 1
+			let r = got[0]
+			let m = r.message
+			assert m.subject() == "Café order" && given(m.messageId()) == "abc@example.net"
+			let authors = try m.from()
+			assert authors.len() == 1 && authors[0].address == "ana@example.net" && authors[0].name == "Ana"
+			assert given(m.text()) == "Where is my order?"
+			assert given(m.html()) == "<p>café<img src=\"cid:i1\"></p>"
+			let files = m.attachments()
+			assert files.len() == 1 && given(files[0].filename()) == "order.txt" && string(files[0].data()) == "order 7"
+			let inline = m.body.walk().filter(p => given(p.contentId()) == "i1")
+			assert inline.len() == 1 && inline[0].contentType().essence() == "image/png" && inline[0].data().len() == 4
+			assert r.from == "bounce@example.net" && r.to.join(",") == "support@example.com,archive@example.com"
+			assert r.senderIP == "203.0.113.5" && r.spamScore == 1.5 && r.spamReport == "Spam detection report" && r.dkim == "\{@example.net : pass}" && r.spf == "pass"
+			let wire = string(m.bytes())
+			assert wire.contains("Received: by mx.sendgrid.net") && !wire.contains("boundary=\"xyz\"")
+			try server.close()
+			return none
+		}
+
+		// The raw setting posts the whole message, which is parsed as it
+		// came.
+		@test()
+		def TestRawMessage() !none {
+			let got Inbound[] = []
+			let (server, target) = try inboundServer(inbound(def (received Inbound) !none {
+				got.push(received)
+				return none
+			}))
+			let sent = new mail.Message().from("ben@example.net").to("support@example.com").subject("Raw").text("Hello").html("<p>Hello</p>")
+			sent.attach("a.csv", "x,y".bytes())
+			let res = try postForm(target, [FormEntry{name: "email", text: string(sent.bytes())}, FormEntry{name: "envelope", text: "\{\"to\":[\"support@example.com\"],\"from\":\"ben@example.net\"}"}, FormEntry{name: "spam_score", text: "0"}])
+			assert res.status == 200 && got.len() == 1
+			let m = got[0].message
+			assert m.subject() == "Raw" && given(m.text()) == "Hello" && given(m.html()) == "<p>Hello</p>" && m.attachments().len() == 1
+			assert got[0].from == "ben@example.net" && got[0].spamScore == 0.0
+			try server.close()
+			return none
+		}
+
+		// Credentials, method, form and handler failures each get their
+		// answer.
+		@test()
+		def TestAnswers() !none {
+			let calls = 0
+			let handler = inbound(def (received Inbound) !none {
+				calls++
+				fail "refused" when received.message.subject() == "fail"
+				return none
+			}, username = "sendgrid", password = "s3cret")
+			let (server, target) = try inboundServer(handler)
+			let raw = new mail.Message().from("a@example.net").to("b@example.com").subject("ok").text("t")
+			let good = "Basic " + base64encode("sendgrid:s3cret".bytes())
+			let form = [FormEntry{name: "email", text: string(raw.bytes())}]
+			assert (try postForm(target, form)).status == 401
+			assert (try postForm(target, form, "Basic " + base64encode("sendgrid:wrong".bytes()))).status == 401
+			assert (try postForm(target, form, good)).status == 200 && calls == 1
+			raw.subject("fail")
+			assert (try postForm(target, [FormEntry{name: "email", text: string(raw.bytes())}], good)).status == 500
+			assert (try postForm(target, [FormEntry{name: "envelope", text: "[1"}], good)).status == 400
+			assert (try postForm(target, [FormEntry{name: "headers", text: "Subject: x\n"}, FormEntry{name: "text", data: byte[1, 2]}, FormEntry{name: "charsets", text: "\{\"text\":\"x-unknown\"}"}], good)).status == 400
+			let client = new http.Client()
+			let req = try client.request(http.Method.GET, target)
+			req.headers.set("Authorization", good)
+			assert (try client.do(req)).status == 405
+			let recorder = new httptest.ResponseRecorder()
+			try handler.serve(recorder.context(try httptest.newRequest(http.Method.PUT, "/inbound")))
+			assert recorder.result().status == 405
+			let plain = try client.request(http.Method.POST, target)
+			plain.headers.set("Authorization", good)
+			plain.headers.set("Content-Type", "text/plain")
+			plain.replaceBody("hello".bytes())
+			assert (try client.do(plain)).status == 400
+			assert calls == 2
+			try server.close()
+			return none
+		}
+	}
+}

@@ -1,0 +1,231 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.time
+		std.net.http
+		std.net.url
+		std.data.encoding::(json)
+	)
+
+	// How statistics are summed: a row per day, week or month.
+	enum Period {
+		Day   = "day",
+		Week  = "week",
+		Month = "month",
+	}
+
+	// What statistics are broken down by; each row of a breakdown other
+	// than Global names its category, provider, browser, device, client
+	// or country.
+	enum Breakdown {
+		Global           = "global",
+		Categories       = "categories",
+		MailboxProviders = "mailbox_providers",
+		Browsers         = "browsers",
+		Devices          = "devices",
+		Clients          = "clients",
+		Geo              = "geo",
+	}
+
+	// The counts of one row of statistics. A breakdown by device, client,
+	// browser or country counts only opens and clicks.
+	struct Metrics {
+		requests int
+		processed int
+		delivered int
+		deferred int
+		bounces int
+		blocks int
+		@json("bounce_drops")
+		bounceDrops int
+		@json("invalid_emails")
+		invalidEmails int
+		opens int
+		@json("unique_opens")
+		uniqueOpens int
+		clicks int
+		@json("unique_clicks")
+		uniqueClicks int
+		@json("spam_reports")
+		spamReports int
+		@json("spam_report_drops")
+		spamReportDrops int
+		unsubscribes int
+		@json("unsubscribe_drops")
+		unsubscribeDrops int
+		drops int
+	}
+
+	// One row of a period: its counts, and for a breakdown what it counts
+	// (`kind` is SendGrid's `type`, `category`, `browser`, ...).
+	struct Stat {
+		@json("type")
+		kind string
+		name string
+		metrics Metrics
+	}
+
+	// The rows of one day, week or month (`date` is its first day).
+	struct Stats {
+		date  string
+		stats Stat[]
+	}
+
+	// A message of the activity feed: who it went to and how far it got.
+	struct Activity {
+		@json("msg_id")
+		id string
+		@json("from_email")
+		from string
+		@json("to_email")
+		to string
+		subject string
+		// `processed`, `delivered`, `not_delivered`.
+		status string
+		@json("opens_count")
+		opens int
+		@json("clicks_count")
+		clicks int
+		@json("last_event_time")
+		lastEventTime string
+	}
+
+	// One step of a message in the activity feed.
+	struct ActivityEvent {
+		@json("event_name")
+		name string
+		processed string
+		reason string
+		@json("attempt_num")
+		attempt int
+		url string
+		@json("bounce_type")
+		bounceType string
+		@json("http_user_agent")
+		userAgent string
+		@json("mx_server")
+		mxServer string
+	}
+
+	// A message of the activity feed with every step it took.
+	struct ActivityDetail {
+		@json("msg_id")
+		id string
+		@json("from_email")
+		from string
+		@json("to_email")
+		to string
+		subject string
+		status string
+		@json("template_id")
+		templateId string
+		@json("asm_group_id")
+		group int
+		teammate string
+		@json("api_key_id")
+		apiKeyId string
+		events ActivityEvent[]
+		@json("originating_ip")
+		originatingIP string
+		categories string[]
+		// The custom arguments the message was sent with.
+		@json("unique_args")
+		args ?any = none
+		@json("outbound_ip")
+		outboundIP string
+		@json("outbound_ip_type")
+		outboundIPType string
+	}
+
+	internal struct ActivityPage {
+		messages Activity[]
+	}
+
+	internal struct SigningKey {
+		@json("public_key")
+		publicKey string
+	}
+
+	// Statistics and the activity feed.
+	partial type Client {
+		// The statistics from `from` to `until` (none: today), a row per
+		// `by`, broken down by `breakdown`; `names` keeps the categories,
+		// mailbox providers or browsers named (required for Categories), or
+		// the country (`US`, `CA`) for Geo. Fails with Invalid when
+		// `names` are given for a breakdown that takes none.
+		def stats(from time.Date, until ?time.Date = none, by Period = Period.Day, breakdown Breakdown = Breakdown.Global, names string[] = []) !Stats[] {
+			let query = new url.Values()
+			query.set("start_date", from.str())
+			query.set("end_date", until.str()) unless until is none
+			query.set("aggregated_by", by.value)
+			let filter = filterOf(breakdown)
+			fail invalid("statistics by {breakdown.value} take no names") when names.len() > 0 && filter.len() == 0
+			fail invalid("statistics by category need the categories") when breakdown == Breakdown.Categories && names.len() == 0
+			for let name in names {
+				query.add(filter, name)
+			}
+			let path = breakdown == Breakdown.Global ?? ("/v3/stats", "/v3/{breakdown.value}/stats")
+			let reply = try call(self, http.Method.GET, "{path}?{query.encode()}")
+			return try listOf<Stats>(reply.data)
+		}
+
+		// The latest messages of the activity feed matching `query`, in
+		// SendGrid's query language (`to_email="ana@example.net"`, "" for
+		// any), at most `limit` (up to 1000).
+		// Fails as every call does.
+		def activity(query string = "", limit int = 10) !Activity[] {
+			let params = new url.Values()
+			params.set("limit", "{limit}")
+			params.set("query", query) when query.len() > 0
+			let reply = try call(self, http.Method.GET, "/v3/messages?{params.encode()}")
+			let page = ActivityPage{}
+			try decodeInto(reply.data, page)
+			return page.messages
+		}
+
+		// The message `id` of the activity feed with its events.
+		// Fails as every call does.
+		def activityOf(id string) !ActivityDetail {
+			let reply = try call(self, http.Method.GET, "/v3/messages/{segment(id)}")
+			let found = ActivityDetail{}
+			try decodeInto(reply.data, found)
+			return found
+		}
+
+		// The public key the event webhook's signatures verify with (base64
+		// DER), "" while signing is off.
+		// Fails as every call does.
+		def webhookKey() !string {
+			let reply = try call(self, http.Method.GET, "/v3/user/webhooks/event/settings/signed")
+			let found = SigningKey{}
+			try decodeInto(reply.data, found)
+			return found.publicKey
+		}
+
+		// Turns the signing of the event webhook on or off. Returns the
+		// public key its signatures verify with, "" when off.
+		// Fails as every call does.
+		def signWebhook(enabled bool) !string {
+			let reply = try call(self, http.Method.PATCH, "/v3/user/webhooks/event/settings/signed", map<string, any>{"enabled": enabled})
+			let found = SigningKey{}
+			try decodeInto(reply.data, found)
+			return found.publicKey
+		}
+	}
+
+	// The query parameter that keeps some rows of a breakdown; "" for one
+	// that takes none.
+	internal def filterOf(breakdown Breakdown) string {
+		switch breakdown {
+			case Breakdown.Categories:
+				return "categories"
+			case Breakdown.MailboxProviders:
+				return "mailbox_providers"
+			case Breakdown.Browsers:
+				return "browsers"
+			case Breakdown.Geo:
+				return "country"
+			default:
+				return ""
+		}
+	}
+}

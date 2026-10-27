@@ -1,0 +1,178 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.net.http
+		std.net.url
+		std.data.encoding::(json)
+	)
+
+	// A stored template and its versions. A dynamic template (`d-...`)
+	// fills Handlebars from the data of each personalization; a legacy one
+	// replaces substitution tags.
+	struct TemplateInfo {
+		id string
+		name string
+		// `dynamic` or `legacy`.
+		generation string
+		@json("updated_at")
+		updatedAt string
+		versions TemplateVersion[]
+	}
+
+	// One version of a template: its subject and bodies. The active version
+	// is the one sends use.
+	struct TemplateVersion {
+		id string
+		@json("template_id")
+		templateId string
+		name string
+		subject string
+		@json("html_content")
+		html string
+		@json("plain_content")
+		text string
+		// SendGrid writes the plain-text body from the HTML one.
+		@json("generate_plain_content")
+		generateText bool
+		// 1 for the version sends use, 0 otherwise.
+		active int
+		// `code` or `design`, the editor the version was made in.
+		editor string
+		// Sample data the editor previews a dynamic template with, as JSON.
+		@json("test_data")
+		testData string
+		@json("updated_at")
+		updatedAt string
+		@json("thumbnail_url")
+		thumbnailURL string
+	}
+
+	internal struct TemplatePage {
+		result TemplateInfo[]
+		@json("_metadata")
+		metadata PageLinks
+	}
+
+	internal struct PageLinks {
+		next string
+	}
+
+	// Templates.
+	partial type Client {
+		// The dynamic templates, or the legacy ones, 200 a page.
+		def templates(dynamic bool = true) Pages<TemplateInfo> {
+			let generation = dynamic ?? ("dynamic", "legacy")
+			return new Pages<TemplateInfo>(def (cursor string) !(TemplateInfo[], string) {
+				let token = cursor.len() > 0 ?? ("&page_token={url.queryEscape(cursor)}", "")
+				let reply = try call(self, http.Method.GET, "/v3/templates?generations={generation}&page_size=200{token}")
+				let page = TemplatePage{}
+				try decodeInto(reply.data, page)
+				return (page.result, pageToken(page.metadata.next))
+			})
+		}
+
+		// The template `id` with its versions.
+		// Fails as every call does.
+		def template(id string) !TemplateInfo {
+			let reply = try call(self, http.Method.GET, "/v3/templates/{segment(id)}")
+			let found = TemplateInfo{}
+			try decodeInto(reply.data, found)
+			return found
+		}
+
+		// Creates an empty template; its content goes in a version.
+		// Fails as every call does.
+		def createTemplate(name string, dynamic bool = true) !TemplateInfo {
+			let reply = try call(self, http.Method.POST, "/v3/templates", map<string, any>{"name": name, "generation": dynamic ?? ("dynamic", "legacy")})
+			let made = TemplateInfo{}
+			try decodeInto(reply.data, made)
+			return made
+		}
+
+		// Renames template `id`.
+		// Fails as every call does.
+		def renameTemplate(id string, name string) !TemplateInfo {
+			let reply = try call(self, http.Method.PATCH, "/v3/templates/{segment(id)}", map<string, any>{"name": name})
+			let saved = TemplateInfo{}
+			try decodeInto(reply.data, saved)
+			return saved
+		}
+
+		// A copy of template `id` with its versions, named `name`.
+		// Fails as every call does.
+		def duplicateTemplate(id string, name string) !TemplateInfo {
+			let reply = try call(self, http.Method.POST, "/v3/templates/{segment(id)}", map<string, any>{"name": name})
+			let made = TemplateInfo{}
+			try decodeInto(reply.data, made)
+			return made
+		}
+
+		// Removes template `id` with its versions.
+		// Fails as every call does.
+		def deleteTemplate(id string) !none {
+			try call(self, http.Method.DELETE, "/v3/templates/{segment(id)}")
+			return none
+		}
+
+		// Adds `version` to template `templateId`; `active` 1 makes it the
+		// one sends use.
+		// Fails as every call does.
+		def createVersion(templateId string, version TemplateVersion) !TemplateVersion {
+			let reply = try call(self, http.Method.POST, "/v3/templates/{segment(templateId)}/versions", versionBody(version))
+			let made = TemplateVersion{}
+			try decodeInto(reply.data, made)
+			return made
+		}
+
+		// Version `versionId` of template `templateId`.
+		// Fails as every call does.
+		def version(templateId string, versionId string) !TemplateVersion {
+			let reply = try call(self, http.Method.GET, "/v3/templates/{segment(templateId)}/versions/{segment(versionId)}")
+			let found = TemplateVersion{}
+			try decodeInto(reply.data, found)
+			return found
+		}
+
+		// Saves `version` (its `templateId` and `id` name it).
+		// Fails as every call does.
+		def updateVersion(version TemplateVersion) !TemplateVersion {
+			let reply = try call(self, http.Method.PATCH, "/v3/templates/{segment(version.templateId)}/versions/{segment(version.id)}", versionBody(version))
+			let saved = TemplateVersion{}
+			try decodeInto(reply.data, saved)
+			return saved
+		}
+
+		// Removes version `versionId` of template `templateId`.
+		// Fails as every call does.
+		def deleteVersion(templateId string, versionId string) !none {
+			try call(self, http.Method.DELETE, "/v3/templates/{segment(templateId)}/versions/{segment(versionId)}")
+			return none
+		}
+
+		// Makes version `versionId` the one sends of the template use.
+		// Fails as every call does.
+		def activate(templateId string, versionId string) !TemplateVersion {
+			let reply = try call(self, http.Method.POST, "/v3/templates/{segment(templateId)}/versions/{segment(versionId)}/activate")
+			let found = TemplateVersion{}
+			try decodeInto(reply.data, found)
+			return found
+		}
+	}
+
+	// The fields of a version SendGrid takes.
+	internal def versionBody(v TemplateVersion) map<string, any> {
+		let out = map<string, any>{"name": v.name, "subject": v.subject, "html_content": v.html, "plain_content": v.text, "generate_plain_content": v.generateText, "active": v.active}
+		out.set("editor", v.editor) when v.editor.len() > 0
+		out.set("test_data", v.testData) when v.testData.len() > 0
+		return out
+	}
+
+	// The `page_token` of the next page's address; "" after the last.
+	internal def pageToken(next string) string {
+		return "" when next.len() == 0
+		let at = next.indexOf("?")
+		return "" when at < 0
+		let query = url.parseQuery(next[at + 1:]) onerror recover new url.Values()
+		let token = query.get("page_token")
+		return token is none ?? ("", token)
+	}
+}

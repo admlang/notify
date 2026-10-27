@@ -1,0 +1,204 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.crypto
+		std.formats
+		std.formats::(MediaType)
+		std.formats.mail
+		std.net.http
+		std.data.encoding.codepages
+		std.data.encoding::(JSON, base64decode)
+	)
+
+	// A message SendGrid received for one of the account's domains, as
+	// inbound parse posted it: the message, its SMTP envelope and what
+	// SendGrid's checks found.
+	struct Inbound {
+		message    mail.Message
+		// The envelope's sender and recipients, which may differ from the
+		// message's From and To (a Bcc, a forward).
+		from       string
+		to         string[]
+		// The address of the server that handed the message over.
+		senderIP   string
+		// SpamAssassin's score (with spam checking on) and its report.
+		spamScore  float
+		spamReport string
+		// The DKIM and SPF results (`{@example.com : pass}`, `pass`).
+		dkim       string
+		spf        string
+	}
+
+	// The inbound parse receiver, an http.Handler: it turns each posted
+	// form into an Inbound and hands it to `handle`, from the raw message
+	// (the "POST the raw, full MIME message" setting) or from the parsed
+	// fields. With `username` set, a request must carry those Basic
+	// credentials (put them in the destination URL,
+	// `https://user:password@host/path`); one without is answered 401. A
+	// form that does not parse is answered 400; a message `handle` fails
+	// on 500, which SendGrid delivers again later.
+	//
+	// ```
+	// server.handle("POST /sendgrid/inbound", sendgrid.inbound(def (inbound sendgrid.Inbound) !none {
+	//     println(inbound.message.subject())
+	// }))
+	// ```
+	type InboundHandler {
+		username        string             = ""
+		password        ?Secret<string>    = none
+		internal handle def(Inbound) !none
+
+		def new(handle def(Inbound) !none, username string = "", password ?Secret<string> = none) {
+			self.handle = handle
+			self.username = username
+			self.password = password
+		}
+
+		// Implements http.Handler. Fails when the answer cannot be written
+		// or `handle` fails on the message.
+		def serve(ctx http.Context) !none {
+			return ctx.text(405, "sendgrid inbound parse comes by POST") unless ctx.method() == http.Method.POST
+			if username.len() > 0 {
+				ctx.setHeader("WWW-Authenticate", "Basic realm=\"sendgrid\"")
+				return ctx.text(401, "wrong credentials") unless authorized(ctx.header("Authorization"))
+			}
+			let received = inboundOf(ctx) onerror (err error) {
+				return ctx.text(400, err.message)
+			}
+			try handle(received)
+			return ctx.text(200, "")
+		}
+
+		internal def authorized(header string) bool {
+			return false unless header.startsWith("Basic ")
+			let decoded = base64decode(header[6:].trim()) onerror recover []
+			let secret = password
+			let expected = username + ":" + (secret is none ?? ("", secret.reveal()))
+			return crypto.constantTimeEqual(decoded, expected.bytes())
+		}
+	}
+
+	// An inbound parse receiver handing each message to `handle`; with
+	// `username`, requests must carry it and `password` as Basic
+	// credentials.
+	def inbound(handle def(Inbound) !none, username string = "", password ?Secret<string> = none) InboundHandler {
+		return new InboundHandler(handle, username, password)
+	}
+
+	// The Inbound of a posted inbound parse form. Fails when the form, the
+	// message or one of its JSON fields does not parse.
+	internal def inboundOf(ctx http.Context) !Inbound {
+		try ctx.request.parseMultipartForm()
+		let charsets = try jsonField(ctx, "charsets")
+		let received = Inbound{message: new mail.Message()}
+		let raw = ctx.formValue("email")
+		if raw.len() > 0 {
+			received.message = try mail.parse(raw.bytes())
+		} else {
+			received.message = try messageOf(ctx, charsets)
+		}
+		let envelope = try jsonField(ctx, "envelope")
+		received.from = textAt(envelope, "from")
+		let to = envelope.get("to")
+		if to is any[] {
+			for let address in to {
+				received.to.push(address) when address is string
+			}
+		}
+		received.senderIP = ctx.formValue("sender_ip")
+		let score = ctx.formValue("spam_score").trim()
+		received.spamScore = score.isNumeric() ?? (parseFloat<float>(score), 0.0)
+		received.spamReport = try field(ctx, "spam_report", charsets)
+		received.dkim = ctx.formValue("dkim")
+		received.spf = ctx.formValue("SPF")
+		return received
+	}
+
+	// The message of a parsed inbound form: the header block as posted,
+	// the bodies in their charsets, and each attachment, inline where the
+	// HTML body names it by Content-ID.
+	internal def messageOf(ctx http.Context, charsets map<string, any>) !mail.Message {
+		let message = try mail.parse(headerBlock(ctx.formValue("headers")).bytes())
+		let text = try field(ctx, "text", charsets)
+		message.text(text) when text.len() > 0
+		let html = try field(ctx, "html", charsets)
+		message.html(html) when html.len() > 0
+		let infos = try jsonField(ctx, "attachment-info")
+		let ids = try jsonField(ctx, "content-ids")
+		let count = ctx.formValue("attachments").trim()
+		let total = count.isNumeric() ?? (count.toInt<int>(), 0)
+		for let i in 1..total + 1 {
+			let name = "attachment{i}"
+			let files = ctx.request.formFiles(name)
+			continue when files.len() == 0
+			let file = files[0]
+			let data = try (try file.open()).bytes()
+			let info = objectAt(infos, name)
+			let filename = textAt(info, "filename")
+			let mediaType = mediaTypeOf(textAt(info, "type"))
+			let cid = contentIdOf(ids, name, textAt(info, "content-id"))
+			if cid.len() > 0 {
+				let kind = mediaType is none ?? (try file.contentType(), mediaType)
+				let part = message.embed(cid, data, kind)
+				part.header.set("Content-Disposition", "inline; filename=\"{filename}\"") when filename.len() > 0
+			} else {
+				message.attach(filename.len() > 0 ?? (filename, file.filename), data, mediaType)
+			}
+		}
+		return message
+	}
+
+	// A media type as posted; none when absent or when it does not parse.
+	internal def mediaTypeOf(text string) ?MediaType {
+		return none when text.trim().len() == 0
+		let parsed = formats.parseMediaType(text) onerror (err error) {
+			return none
+		}
+		return parsed
+	}
+
+	// The header block of a message with its `Content-*` fields left out:
+	// the body is rebuilt from the posted parts, which bring their own.
+	internal def headerBlock(posted string) string {
+		let out string[] = []
+		let skipping = false
+		for let line in posted.replace("\r\n", "\n").split("\n") {
+			continue when line.len() == 0
+			let folded = line.startsWith(" ") || line.startsWith("\t")
+			skipping = line.lower().startsWith("content-") unless folded
+			out.push(line) unless skipping
+		}
+		return out.join("\r\n") + "\r\n\r\n"
+	}
+
+	// The Content-ID `content-ids` gives the attachment `name`, else the
+	// one its info names; "" for an attachment that is not inline.
+	internal def contentIdOf(ids map<string, any>, name string, given string) string {
+		for let (cid, attachment) in ids {
+			return cid when attachment is string && attachment == name
+		}
+		return given.trimPrefix("<").trimSuffix(">")
+	}
+
+	// A text field of the form, converted from the charset `charsets`
+	// names for it. Fails when the charset is one std does not know.
+	internal def field(ctx http.Context, name string, charsets map<string, any>) !string {
+		let value = ctx.formValue(name)
+		let charset = textAt(charsets, name).trim().lower()
+		return value when charset := "" || "utf-8" || "utf8" || "us-ascii" || "ascii"
+		let page = codepages.forCharset(charset)
+		fail invalid("field {name} is in charset {charset}, which is not supported") when page is none
+		return codepages.decode(value.bytes(), page)
+	}
+
+	// A form field holding a JSON object; empty when absent. Fails when
+	// it is not an object.
+	internal def jsonField(ctx http.Context, name string) !map<string, any> {
+		let text = ctx.formValue(name).trim()
+		return new map<string, any>() when text.len() == 0
+		let value = (new JSON()).parse(text) onerror (err error) {
+			fail invalid("field {name} is not JSON: {err.message}")
+		}
+		fail invalid("field {name} is not a JSON object") unless value is map<string, any>
+		return value
+	}
+}

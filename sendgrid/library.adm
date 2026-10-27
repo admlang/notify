@@ -1,5 +1,5 @@
-// SendGrid mail send and event webhooks
-@manifest(version = "0.0.1")
+// SendGrid mail send, suppressions, templates, event webhook and inbound parse
+@manifest(version = "0.1.0")
 library adm.notify.sendgrid {
 	use (
 		adm.notify.sendgrid

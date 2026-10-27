@@ -1,0 +1,202 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.time
+		std.net.http
+		std.data.encoding::(json)
+	)
+
+	// The suppression lists: addresses SendGrid drops mail to.
+	enum SuppressionList {
+		// Addresses whose server refused mail for good.
+		Bounces       = "bounces",
+		// Addresses whose server refused mail for a reason that may pass
+		// (a blocklisted IP, content).
+		Blocks        = "blocks",
+		// Recipients who marked a message as spam.
+		SpamReports   = "spam_reports",
+		// Addresses that are not addresses, or whose domain does not exist.
+		InvalidEmails = "invalid_emails",
+		// Recipients who left all mail of the account (global unsubscribes).
+		Unsubscribes  = "unsubscribes",
+	}
+
+	// An address on a suppression list: when it was added (Unix seconds),
+	// and what SendGrid knows of why: the server's answer (`reason`) and
+	// its status code for bounces and blocks, the reporting IP for spam
+	// reports.
+	struct Suppression {
+		email   string
+		created int64
+		reason  string
+		status  string
+		ip      string
+	}
+
+	// An unsubscribe group: a kind of mail recipients can leave alone
+	// (newsletters, receipts), with the count of those who did.
+	struct Group {
+		id int
+		name string
+		description string
+		@json("is_default")
+		isDefault bool
+		unsubscribes int
+	}
+
+	// Whether one recipient left a group (`Client.subscriptions`).
+	struct Subscription {
+		id int
+		name string
+		description string
+		@json("is_default")
+		isDefault bool
+		suppressed bool
+	}
+
+	// A mail send body naming addresses.
+	internal struct Recipients {
+		@json("recipient_emails")
+		emails string[]
+	}
+
+	internal struct Emails {
+		emails string[]
+	}
+
+	internal struct Subscriptions {
+		suppressions Subscription[]
+	}
+
+	// Suppressions.
+	partial type Client {
+		// The addresses on `list` added between `since` and `until` (none:
+		// no bound), 500 a page.
+		def suppressions(list SuppressionList, since ?time.Time = none, until ?time.Time = none) Pages<Suppression> {
+			let query string[] = []
+			query.push("start_time={unixOf(since)}") unless since is none
+			query.push("end_time={unixOf(until)}") unless until is none
+			let path = "/v3/suppression/{list.value}" + (query.len() > 0 ?? ("?" + query.join("&"), ""))
+			return offsetPages<Suppression>(self, path, 500)
+		}
+
+		// `email`'s entry on `list`, none when it is not there.
+		// Fails as every call does.
+		def suppression(list SuppressionList, email string) !?Suppression {
+			if list == SuppressionList.Unsubscribes {
+				let reply = try call(self, http.Method.GET, "/v3/asm/suppressions/global/{segment(email)}")
+				let found = try parsed(reply.data)
+				return none unless found is map<string, any> && textAt(found, "recipient_email").len() > 0
+				return Suppression{email: textAt(found, "recipient_email")}
+			}
+			let reply = try call(self, http.Method.GET, "/v3/suppression/{list.value}/{segment(email)}")
+			let found = try listOf<Suppression>(reply.data)
+			return found.len() > 0 ?? (found[0], none)
+		}
+
+		// Takes `emails` off `list`, so mail reaches them again.
+		// Fails as every call does.
+		def unsuppress(list SuppressionList, emails ...string) !none {
+			if list == SuppressionList.Unsubscribes {
+				for let email in emails {
+					try call(self, http.Method.DELETE, "/v3/asm/suppressions/global/{segment(email)}")
+				}
+				return none
+			}
+			return none when emails.len() == 0
+			try call(self, http.Method.DELETE, "/v3/suppression/{list.value}", Emails{emails: emails})
+			return none
+		}
+
+		// Empties `list`. Fails with Invalid for the global unsubscribes,
+		// which SendGrid takes off one address at a time.
+		def unsuppressAll(list SuppressionList) !none {
+			fail invalid("the global unsubscribes are removed one address at a time") when list == SuppressionList.Unsubscribes
+			try call(self, http.Method.DELETE, "/v3/suppression/{list.value}", map<string, any>{"delete_all": true})
+			return none
+		}
+
+		// Adds `emails` to the global unsubscribes: no mail of the account
+		// reaches them.
+		// Fails as every call does.
+		def unsubscribe(emails ...string) !none {
+			return none when emails.len() == 0
+			try call(self, http.Method.POST, "/v3/asm/suppressions/global", Recipients{emails: emails})
+			return none
+		}
+
+		// The unsubscribe groups.
+		// Fails as every call does.
+		def groups() !Group[] {
+			let reply = try call(self, http.Method.GET, "/v3/asm/groups")
+			return try listOf<Group>(reply.data)
+		}
+
+		// The unsubscribe group `id`.
+		// Fails as every call does.
+		def group(id int) !Group {
+			let reply = try call(self, http.Method.GET, "/v3/asm/groups/{id}")
+			let found = Group{}
+			try decodeInto(reply.data, found)
+			return found
+		}
+
+		// Creates an unsubscribe group; `isDefault` makes it the group of
+		// messages that name none.
+		// Fails as every call does.
+		def createGroup(name string, description string = "", isDefault bool = false) !Group {
+			let reply = try call(self, http.Method.POST, "/v3/asm/groups", map<string, any>{"name": name, "description": description, "is_default": isDefault})
+			let made = Group{}
+			try decodeInto(reply.data, made)
+			return made
+		}
+
+		// Saves the name, description and default flag of `group`.
+		// Fails as every call does.
+		def updateGroup(group Group) !Group {
+			let reply = try call(self, http.Method.PATCH, "/v3/asm/groups/{group.id}", map<string, any>{"name": group.name, "description": group.description, "is_default": group.isDefault})
+			let saved = Group{}
+			try decodeInto(reply.data, saved)
+			return saved
+		}
+
+		// Removes unsubscribe group `id`; its suppressions go with it.
+		// Fails as every call does.
+		def deleteGroup(id int) !none {
+			try call(self, http.Method.DELETE, "/v3/asm/groups/{id}")
+			return none
+		}
+
+		// The addresses that left group `id`.
+		// Fails as every call does.
+		def groupSuppressions(id int) !string[] {
+			let reply = try call(self, http.Method.GET, "/v3/asm/groups/{id}/suppressions")
+			return try listOf<string>(reply.data)
+		}
+
+		// Takes `emails` out of group `id`: its mail no longer reaches them.
+		// Fails as every call does.
+		def suppress(id int, emails ...string) !none {
+			return none when emails.len() == 0
+			try call(self, http.Method.POST, "/v3/asm/groups/{id}/suppressions", Recipients{emails: emails})
+			return none
+		}
+
+		// Puts `emails` back into group `id`.
+		// Fails as every call does.
+		def unsuppress(id int, emails ...string) !none {
+			for let email in emails {
+				try call(self, http.Method.DELETE, "/v3/asm/groups/{id}/suppressions/{segment(email)}")
+			}
+			return none
+		}
+
+		// Every group, and whether `email` left it.
+		// Fails as every call does.
+		def subscriptions(email string) !Subscription[] {
+			let reply = try call(self, http.Method.GET, "/v3/asm/suppressions/{segment(email)}")
+			let found = Subscriptions{}
+			try decodeInto(reply.data, found)
+			return found.suppressions
+		}
+	}
+}

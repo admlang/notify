@@ -1,0 +1,504 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.time
+		std.net.http
+		std.formats.mail
+		std.data.encoding::(JSON, json, base64encode)
+	)
+
+	// The most personalizations, and recipients in all, one send takes.
+	internal const maxPersonalizations = 1000
+
+	// The most categories a message carries.
+	internal const maxCategories = 10
+
+	// The longest category, in characters.
+	internal const maxCategoryLength = 255
+
+	// The size of the custom arguments of a message, in bytes of JSON.
+	internal const maxArgsBytes = 10000
+
+	// How far ahead a send may be scheduled.
+	internal const maxSchedule = 72h
+
+	// The largest mail send request SendGrid accepts, attachments counted.
+	internal const maxRequestBytes = 30 * 1024 * 1024
+
+	// The recipients of one copy of a message and what is personal to
+	// them: their subject, headers, template data, substitutions, custom
+	// arguments and send time, each replacing the message's own. Addresses
+	// are mailboxes as std.formats.mail parses them (`Ana <ana@example.net>`).
+	struct Personalization {
+		to            string[]
+		cc            string[]
+		bcc           string[]
+		// A sender for this copy in place of the message's.
+		from          string              = ""
+		subject       string              = ""
+		headers       map<string, string>
+		// The dynamic template's data (`dynamic_template_data`).
+		data          map<string, any>
+		// Tags replaced in the content of a legacy template (`-name-`).
+		substitutions map<string, string>
+		// Custom arguments, handed back in every event of this copy.
+		args          map<string, string>
+		sendAt        ?time.Time          = none
+	}
+
+	// What SendGrid tracks of a message; none keeps the account's setting.
+	struct Tracking {
+		// Links are rewritten to count clicks; `clicksInText` also in the
+		// plain-text body.
+		clicks           ?bool  = none
+		clicksInText     ?bool  = none
+		// An invisible image counts opens; `openTag` places it where the
+		// tag stands in the body instead of at its end.
+		opens            ?bool  = none
+		openTag          string = ""
+		// A subscription management link is added: `subscriptionText` and
+		// `subscriptionHtml` hold it with `<% %>` around the link text, or
+		// it goes where `subscriptionTag` stands.
+		subscription     ?bool  = none
+		subscriptionText string = ""
+		subscriptionHtml string = ""
+		subscriptionTag  string = ""
+		// Google Analytics parameters are added to the links.
+		analytics        ?bool  = none
+		utmSource        string = ""
+		utmMedium        string = ""
+		utmTerm          string = ""
+		utmContent       string = ""
+		utmCampaign      string = ""
+	}
+
+	// How a message goes out besides its content.
+	struct Options {
+		// Up to ten categories, the names statistics group by.
+		categories         string[]
+		// Custom arguments, handed back in every event of the message.
+		args               map<string, string>
+		// When SendGrid sends it: at most 72 hours ahead.
+		sendAt             ?time.Time          = none
+		// The batch it belongs to (`Client.newBatch`), to pause or cancel
+		// it before `sendAt`.
+		batch              string              = ""
+		// The unsubscribe group the message's unsubscribe link leaves, and
+		// the groups the preferences page shows.
+		group              int                 = 0
+		groupsToDisplay    int[]
+		// The IP pool it goes out from.
+		ipPool             string              = ""
+		tracking           Tracking            = Tracking{}
+		// SendGrid validates the request and delivers nothing.
+		sandbox            bool                = false
+		// Deliver to recipients on the suppression lists: every list,
+		// spam reports, bounces, or the global unsubscribes.
+		bypassLists        bool                = false
+		bypassSpamReports  bool                = false
+		bypassBounces      bool                = false
+		bypassUnsubscribes bool                = false
+		// A footer added to the plain-text and HTML bodies.
+		footerText         string              = ""
+		footerHtml         string              = ""
+		// The copies to send, in place of the one the message's To, Cc and
+		// Bcc make. A template's copies are its own.
+		personalizations   Personalization[]
+	}
+
+	// A file sent with a message: attached, or inline where the HTML body
+	// refers to `cid:<contentId>`.
+	struct Attachment {
+		name      string
+		data      byte[]
+		// The media type: guessed from the name by SendGrid when "".
+		mediaType string = ""
+		contentId string = ""
+	}
+
+	// A message made from a dynamic template (`d-...`): one copy per
+	// personalization, each with its own data.
+	//
+	// ```
+	// let welcome = new sendgrid.Template("d-1234", to = "ana@example.net", data = {"name": "Ana"}, from = "Shop <orders@example.com>")
+	// welcome.add("ben@example.net", {"name": "Ben"})
+	// try sg.send(welcome)
+	// ```
+	type Template {
+		id               string
+		// The sender, a mailbox (`Shop <orders@example.com>`).
+		from             string
+		replyTo          string              = ""
+		personalizations Personalization[]
+		attachments      Attachment[]
+		// Headers of every copy.
+		headers          map<string, string>
+
+		// A template message with one copy to `to` (a mailbox, or several
+		// separated by commas) filled with `data`, or none when `to` is "".
+		def new(id string, to string = "", data map<string, any> = new map<string, any>(), from string = "") {
+			self.id = id
+			self.from = from
+			add(to, data) when to.len() > 0
+		}
+
+		// Adds a copy to `to` (a mailbox, or several separated by commas)
+		// filled with `data`, and returns it for the rest of its settings.
+		def add(to string, data map<string, any> = new map<string, any>()) Personalization {
+			let p = Personalization{to: [to], data: data}
+			personalizations.push(p)
+			return p
+		}
+
+		// Attaches `data` as `name`; with a `contentId`, inline where the
+		// template's HTML refers to `cid:<contentId>`.
+		def attach(name string, data byte[], mediaType string = "", contentId string = "") Template {
+			attachments.push(Attachment{name: name, data: data, mediaType: mediaType, contentId: contentId})
+			return self
+		}
+	}
+
+	// Mail send.
+	partial type Client {
+		// Sends `message`: From, Reply-To, To, Cc, Bcc, Subject, the text
+		// and HTML bodies, attachments and inline parts, and the other
+		// headers. Returns the id SendGrid gave it (`X-Message-Id`), "" in
+		// the sandbox mode. Fails with Invalid when the message has no
+		// author, no recipient or no body, or breaks a limit of `options`,
+		// and as every call does.
+		def send(message mail.Message, options Options = Options{}) !string {
+			let body = try bodyOf(message, options)
+			return try deliver(self, body)
+		}
+
+		// Sends the copies of `template`. Returns the id SendGrid gave the
+		// request, "" in the sandbox mode. Fails with Invalid when it has no
+		// sender or no copy, or breaks a limit of `options`, and as every
+		// call does.
+		def send(template Template, options Options = Options{}) !string {
+			fail invalid("template {template.id} has no sender") when template.from.len() == 0
+			let body = new map<string, any>()
+			body.set("from", try mailbox(template.from))
+			body.set("reply_to", try mailbox(template.replyTo)) when template.replyTo.len() > 0
+			body.set("template_id", template.id)
+			body.set("headers", template.headers) when template.headers.len() > 0
+			let files any[] = []
+			for let a in template.attachments {
+				files.push(attachmentOf(a))
+			}
+			body.set("attachments", files) when files.len() > 0
+			try settle(body, template.personalizations, options)
+			return try deliver(self, body)
+		}
+
+		// A new batch id: messages sent with it (`Options.batch`) and a
+		// `sendAt` can be paused or cancelled together until they go out.
+		// Fails as every call does.
+		def newBatch() !string {
+			let reply = try call(self, http.Method.POST, "/v3/mail/batch")
+			let found = BatchStatus{}
+			try decodeInto(reply.data, found)
+			return found.batch
+		}
+
+		// Holds the scheduled messages of `batch` back until `resume`.
+		// Fails as every call does.
+		def pause(batch string) !none {
+			return try schedule(self, batch, "pause")
+		}
+
+		// Cancels the scheduled messages of `batch`: they are never sent.
+		// Fails as every call does.
+		def cancel(batch string) !none {
+			return try schedule(self, batch, "cancel")
+		}
+
+		// Lets the paused or cancelled messages of `batch` go out at their
+		// time again.
+		// Fails as every call does.
+		def resume(batch string) !none {
+			try call(self, http.Method.DELETE, "/v3/user/scheduled_sends/{segment(batch)}")
+			return none
+		}
+
+		// The batches paused or cancelled.
+		// Fails as every call does.
+		def scheduled() !BatchStatus[] {
+			let reply = try call(self, http.Method.GET, "/v3/user/scheduled_sends")
+			return try listOf<BatchStatus>(reply.data)
+		}
+	}
+
+	// A batch of scheduled messages and what was done to it: `pause` or
+	// `cancel` ("" for a new batch).
+	struct BatchStatus {
+		@json("batch_id")
+		batch string
+		status string
+	}
+
+	// Pauses or cancels `batch`: SendGrid creates a batch's status once and
+	// changes it after.
+	internal def schedule(client Client, batch string, status string) !none {
+		let path = "/v3/user/scheduled_sends"
+		let reply = try call(client, http.Method.GET, "{path}/{segment(batch)}")
+		let known = try listOf<BatchStatus>(reply.data)
+		if known.len() == 0 {
+			try call(client, http.Method.POST, path, map<string, any>{"batch_id": batch, "status": status})
+		} else {
+			try call(client, http.Method.PATCH, "{path}/{segment(batch)}", map<string, any>{"status": status})
+		}
+		return none
+	}
+
+	// Posts a mail send body. Returns the message id. Fails with Invalid
+	// when it is larger than SendGrid takes, and as every call does.
+	internal def deliver(client Client, body map<string, any>) !string {
+		let size = (new JSON()).encode(body).len()
+		fail invalid("the message is {size} bytes, more than the {maxRequestBytes} SendGrid takes") when size > maxRequestBytes
+		let reply = try call(client, http.Method.POST, "/v3/mail/send", body)
+		return reply.messageId
+	}
+
+	// The mail send body of a std message under `options`.
+	internal def bodyOf(message mail.Message, options Options) !map<string, any> {
+		let body = new map<string, any>()
+		let authors = message.from() onerror (err error) {
+			fail invalid("From does not parse: {err.message}")
+		}
+		fail invalid("the message has no From") when authors.len() == 0
+		body.set("from", addressOf(authors[0]))
+		let replies = message.replyTo() onerror (err error) {
+			fail invalid("Reply-To does not parse: {err.message}")
+		}
+		if replies.len() == 1 {
+			body.set("reply_to", addressOf(replies[0]))
+		} else if replies.len() > 1 {
+			let list any[] = []
+			for let a in replies {
+				list.push(addressOf(a))
+			}
+			body.set("reply_to_list", list)
+		}
+		let subject = message.subject()
+		body.set("subject", subject) when subject.len() > 0
+		let content any[] = []
+		let text = message.text()
+		content.push(map<string, any>{"type": "text/plain", "value": text}) unless text is none || text.len() == 0
+		let html = message.html()
+		content.push(map<string, any>{"type": "text/html", "value": html}) unless html is none || html.len() == 0
+		fail invalid("the message has no text or HTML body") when content.len() == 0
+		body.set("content", content)
+		let files any[] = []
+		for let part in message.body.walk() {
+			continue when part.isMultipart()
+			let name = part.filename()
+			let cid = part.contentId()
+			if part.isAttachment() {
+				files.push(attachmentOf(Attachment{name: name is none ?? ("attachment", name), data: part.data(), mediaType: part.contentType().essence()}))
+			} else if !(cid is none) {
+				files.push(attachmentOf(Attachment{name: name is none ?? (cid, name), data: part.data(), mediaType: part.contentType().essence(), contentId: cid}))
+			}
+		}
+		body.set("attachments", files) when files.len() > 0
+		let headers = new map<string, string>()
+		for let name in message.header.names() {
+			continue when reservedHeader(name)
+			let value = message.header.get(name)
+			headers.set(name, value) unless value is none
+		}
+		body.set("headers", headers) when headers.len() > 0
+		let copies = options.personalizations
+		if copies.len() == 0 {
+			let one = Personalization{}
+			for let a in try addressesOf(message, "To") {
+				one.to.push(a.str())
+			}
+			for let a in try addressesOf(message, "Cc") {
+				one.cc.push(a.str())
+			}
+			for let a in try addressesOf(message, "Bcc") {
+				one.bcc.push(a.str())
+			}
+			copies = [one]
+		}
+		try settle(body, copies, options)
+		return body
+	}
+
+	internal def addressesOf(message mail.Message, field string) !mail.Address[] {
+		return message.header.addresses(field) onerror (err error) {
+			fail invalid("{field} does not parse: {err.message}")
+		}
+	}
+
+	// Headers mail send sets from its own fields, or refuses.
+	internal def reservedHeader(name string) bool {
+		let lower = name.lower()
+		return lower.startsWith("content-") || (lower := "from" || "to" || "cc" || "bcc" || "reply-to" || "subject" || "date" || "mime-version" || "x-sg-id" || "x-sg-eid" || "received" || "dkim-signature")
+	}
+
+	// Adds the personalizations and the settings of `options` to a mail
+	// send body, checking SendGrid's limits first.
+	internal def settle(body map<string, any>, copies Personalization[], options Options) !none {
+		fail invalid("the message has no recipient") when copies.len() == 0
+		fail invalid("{copies.len()} personalizations, more than the {maxPersonalizations} SendGrid takes") when copies.len() > maxPersonalizations
+		let recipients = 0
+		let list any[] = []
+		for let p in copies {
+			let entry = try personalizationOf(p)
+			for let field in ["to", "cc", "bcc"] {
+				let addresses = entry.get(field)
+				recipients += addresses.len() when addresses is any[]
+			}
+			list.push(entry)
+		}
+		fail invalid("{recipients} recipients, more than the {maxPersonalizations} SendGrid takes") when recipients > maxPersonalizations
+		body.set("personalizations", list)
+		fail invalid("{options.categories.len()} categories, more than {maxCategories}") when options.categories.len() > maxCategories
+		for let c in options.categories {
+			fail invalid("category \"{c}\" is longer than {maxCategoryLength} characters") when c.len() > maxCategoryLength
+		}
+		body.set("categories", texts(options.categories)) when options.categories.len() > 0
+		if options.args.len() > 0 {
+			let size = (new JSON()).encode(options.args).len()
+			fail invalid("the custom arguments are {size} bytes, more than {maxArgsBytes}") when size > maxArgsBytes
+			body.set("custom_args", options.args)
+		}
+		let at = options.sendAt
+		body.set("send_at", try sendAtOf(at)) unless at is none
+		body.set("batch_id", options.batch) when options.batch.len() > 0
+		if options.group > 0 {
+			let asm = map<string, any>{"group_id": options.group}
+			let shown any[] = []
+			for let g in options.groupsToDisplay {
+				shown.push(g)
+			}
+			asm.set("groups_to_display", shown) when shown.len() > 0
+			body.set("asm", asm)
+		}
+		body.set("ip_pool_name", options.ipPool) when options.ipPool.len() > 0
+		let settings = new map<string, any>()
+		settings.set("sandbox_mode", enabled(true)) when options.sandbox
+		settings.set("bypass_list_management", enabled(true)) when options.bypassLists
+		settings.set("bypass_spam_management", enabled(true)) when options.bypassSpamReports
+		settings.set("bypass_bounce_management", enabled(true)) when options.bypassBounces
+		settings.set("bypass_unsubscribe_management", enabled(true)) when options.bypassUnsubscribes
+		if options.footerText.len() > 0 || options.footerHtml.len() > 0 {
+			let footer = enabled(true)
+			footer.set("text", options.footerText) when options.footerText.len() > 0
+			footer.set("html", options.footerHtml) when options.footerHtml.len() > 0
+			settings.set("footer", footer)
+		}
+		body.set("mail_settings", settings) when settings.len() > 0
+		let tracking = trackingOf(options.tracking)
+		body.set("tracking_settings", tracking) when tracking.len() > 0
+		return none
+	}
+
+	internal def personalizationOf(p Personalization) !map<string, any> {
+		let out = new map<string, any>()
+		let to = try mailboxes(p.to)
+		fail invalid("a personalization has no To") when to.len() == 0
+		out.set("to", to)
+		out.set("cc", try mailboxes(p.cc)) when p.cc.len() > 0
+		out.set("bcc", try mailboxes(p.bcc)) when p.bcc.len() > 0
+		out.set("from", try mailbox(p.from)) when p.from.len() > 0
+		out.set("subject", p.subject) when p.subject.len() > 0
+		out.set("headers", p.headers) when p.headers.len() > 0
+		out.set("dynamic_template_data", p.data) when p.data.len() > 0
+		out.set("substitutions", p.substitutions) when p.substitutions.len() > 0
+		out.set("custom_args", p.args) when p.args.len() > 0
+		let at = p.sendAt
+		out.set("send_at", try sendAtOf(at)) unless at is none
+		return out
+	}
+
+	internal def sendAtOf(at time.Time) !int64 {
+		fail invalid("send at {at.str()} is more than 72 hours ahead") when at.since(time.now()) > maxSchedule
+		return unixOf(at)
+	}
+
+	// The settings objects of mail send: `{"enable": on}`.
+	internal def enabled(on bool) map<string, any> {
+		return map<string, any>{"enable": on}
+	}
+
+	internal def trackingOf(t Tracking) map<string, any> {
+		let out = new map<string, any>()
+		let clicks = t.clicks
+		if !(clicks is none) {
+			let s = enabled(clicks)
+			let inText = t.clicksInText
+			s.set("enable_text", inText) unless inText is none
+			out.set("click_tracking", s)
+		}
+		let opens = t.opens
+		if !(opens is none) {
+			let s = enabled(opens)
+			s.set("substitution_tag", t.openTag) when t.openTag.len() > 0
+			out.set("open_tracking", s)
+		}
+		let subscription = t.subscription
+		if !(subscription is none) {
+			let s = enabled(subscription)
+			s.set("text", t.subscriptionText) when t.subscriptionText.len() > 0
+			s.set("html", t.subscriptionHtml) when t.subscriptionHtml.len() > 0
+			s.set("substitution_tag", t.subscriptionTag) when t.subscriptionTag.len() > 0
+			out.set("subscription_tracking", s)
+		}
+		let analytics = t.analytics
+		if !(analytics is none) {
+			let s = enabled(analytics)
+			s.set("utm_source", t.utmSource) when t.utmSource.len() > 0
+			s.set("utm_medium", t.utmMedium) when t.utmMedium.len() > 0
+			s.set("utm_term", t.utmTerm) when t.utmTerm.len() > 0
+			s.set("utm_content", t.utmContent) when t.utmContent.len() > 0
+			s.set("utm_campaign", t.utmCampaign) when t.utmCampaign.len() > 0
+			out.set("ganalytics", s)
+		}
+		return out
+	}
+
+	internal def attachmentOf(a Attachment) map<string, any> {
+		let out = map<string, any>{"content": base64encode(a.data), "filename": a.name}
+		out.set("type", a.mediaType) when a.mediaType.len() > 0
+		if a.contentId.len() > 0 {
+			out.set("disposition", "inline")
+			out.set("content_id", a.contentId)
+		} else {
+			out.set("disposition", "attachment")
+		}
+		return out
+	}
+
+	// A mailbox as mail send names it: `{"email", "name"}`.
+	internal def addressOf(a mail.Address) map<string, any> {
+		let out = map<string, any>{"email": a.address}
+		out.set("name", a.name) when a.name.len() > 0
+		return out
+	}
+
+	// `text`, one mailbox, as mail send names it. Fails with Invalid when
+	// it does not parse.
+	internal def mailbox(text string) !map<string, any> {
+		let a = mail.parseAddress(text) onerror (err error) {
+			fail invalid("\"{text}\" is not a mailbox: {err.message}")
+		}
+		return addressOf(a)
+	}
+
+	// Mailboxes as mail send names them; an entry may hold several
+	// separated by commas. Fails with Invalid when one does not parse.
+	internal def mailboxes(list string[]) !any[] {
+		let out any[] = []
+		for let text in list {
+			let parsed = mail.parseAddressList(text) onerror (err error) {
+				fail invalid("\"{text}\" is not a mailbox: {err.message}")
+			}
+			for let a in parsed {
+				out.push(addressOf(a))
+			}
+		}
+		return out
+	}
+}

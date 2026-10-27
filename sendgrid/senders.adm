@@ -1,0 +1,237 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.net.http
+		std.data.encoding::(json)
+	)
+
+	// A verified sender: an address the account may send from once its
+	// owner followed the link SendGrid mailed, with the postal address
+	// CAN-SPAM asks of commercial mail.
+	struct Sender {
+		id int
+		nickname string
+		@json("from_email")
+		fromEmail string
+		@json("from_name")
+		fromName string
+		@json("reply_to")
+		replyTo string
+		@json("reply_to_name")
+		replyToName string
+		address string
+		address2 string
+		city string
+		state string
+		zip string
+		country string
+		verified bool
+		locked bool
+	}
+
+	internal struct SenderPage {
+		results Sender[]
+	}
+
+	// A DNS record SendGrid asks for to authenticate a domain, and whether
+	// it found it.
+	struct DomainRecord {
+		valid bool
+		// `cname`, `txt` or `mx`.
+		@json("type")
+		kind string
+		host string
+		data string
+	}
+
+	// The records of an authenticated domain: `mailCname`, `dkim1` and
+	// `dkim2` under automatic security, `mailServer`, `subdomainSpf` and
+	// `dkim` without it.
+	struct DomainRecords {
+		@json("mail_cname")
+		mailCname DomainRecord
+		dkim1 DomainRecord
+		dkim2 DomainRecord
+		@json("mail_server")
+		mailServer DomainRecord
+		@json("subdomain_spf")
+		subdomainSpf DomainRecord
+		dkim DomainRecord
+	}
+
+	// A domain the account sends as: the records to publish and whether
+	// SendGrid found them all (`valid`).
+	struct Domain {
+		id int
+		@json("user_id")
+		userId int
+		domain string
+		subdomain string
+		username string
+		ips string[]
+		@json("custom_spf")
+		customSpf bool
+		// The domain the account's mail goes out as when the sender's own
+		// is not authenticated.
+		@json("default")
+		isDefault bool
+		legacy bool
+		@json("automatic_security")
+		automaticSecurity bool
+		valid bool
+		dns DomainRecords
+	}
+
+	// What SendGrid found of one record when it checked a domain.
+	struct RecordCheck {
+		valid  bool
+		// Why it is not valid; none when it is.
+		reason ?string = none
+	}
+
+	// The result of checking a domain's records.
+	struct DomainCheck {
+		id int
+		valid bool
+		@json("validation_results")
+		results DomainChecks
+	}
+
+	// The record checks of a domain, named as DomainRecords names them.
+	struct DomainChecks {
+		@json("mail_cname")
+		mailCname RecordCheck
+		dkim1 RecordCheck
+		dkim2 RecordCheck
+		spf RecordCheck
+		@json("mail_server")
+		mailServer RecordCheck
+		@json("subdomain_spf")
+		subdomainSpf RecordCheck
+		dkim RecordCheck
+	}
+
+	// Senders and domain authentication.
+	partial type Client {
+		// The verified senders, 100 a page.
+		def senders() Pages<Sender> {
+			return new Pages<Sender>(def (cursor string) !(Sender[], string) {
+				let after = cursor.len() > 0 ?? ("&lastSeenID={cursor}", "")
+				let reply = try call(self, http.Method.GET, "/v3/verified_senders?limit=100{after}")
+				let page = SenderPage{}
+				try decodeInto(reply.data, page)
+				let found = page.results
+				return (found, found.len() < 100 ?? ("", "{found[-1].id}"))
+			})
+		}
+
+		// Adds `sender`; SendGrid mails its address a link that verifies it.
+		// Fails as every call does.
+		def createSender(sender Sender) !Sender {
+			let reply = try call(self, http.Method.POST, "/v3/verified_senders", senderBody(sender))
+			let made = Sender{}
+			try decodeInto(reply.data, made)
+			return made
+		}
+
+		// Saves `sender` (its `id` names it).
+		// Fails as every call does.
+		def updateSender(sender Sender) !Sender {
+			let reply = try call(self, http.Method.PATCH, "/v3/verified_senders/{sender.id}", senderBody(sender))
+			let saved = Sender{}
+			try decodeInto(reply.data, saved)
+			return saved
+		}
+
+		// Removes sender `id`.
+		// Fails as every call does.
+		def deleteSender(id int) !none {
+			try call(self, http.Method.DELETE, "/v3/verified_senders/{id}")
+			return none
+		}
+
+		// Mails the verification link of sender `id` again.
+		// Fails as every call does.
+		def resendVerification(id int) !none {
+			try call(self, http.Method.POST, "/v3/verified_senders/resend/{id}")
+			return none
+		}
+
+		// Verifies a sender by the token of the link SendGrid mailed.
+		// Fails as every call does.
+		def verifySender(token string) !none {
+			try call(self, http.Method.GET, "/v3/verified_senders/verify/{segment(token)}")
+			return none
+		}
+
+		// The authenticated domains, 100 a page.
+		def domains() Pages<Domain> {
+			return offsetPages<Domain>(self, "/v3/whitelabel/domains", 100)
+		}
+
+		// The authenticated domain `id`.
+		// Fails as every call does.
+		def domain(id int) !Domain {
+			let reply = try call(self, http.Method.GET, "/v3/whitelabel/domains/{id}")
+			let found = Domain{}
+			try decodeInto(reply.data, found)
+			return found
+		}
+
+		// Starts authenticating `domain`: the result names the DNS records
+		// to publish, then `validateDomain` checks them. `subdomain` is the
+		// return-path's ("" lets SendGrid pick), `automaticSecurity` has
+		// SendGrid manage SPF and DKIM through CNAMEs, `dkimSelector`
+		// replaces the `s1`/`s2` selectors, `ips` are dedicated IPs and
+		// `username` the subuser the domain is for.
+		// Fails as every call does.
+		def authenticate(domain string, subdomain string = "", automaticSecurity bool = true, customSpf bool = false, isDefault bool = false, dkimSelector string = "", ips string[] = [], username string = "") !Domain {
+			let body = map<string, any>{"domain": domain, "automatic_security": automaticSecurity, "custom_spf": customSpf, "default": isDefault}
+			body.set("subdomain", subdomain) when subdomain.len() > 0
+			body.set("custom_dkim_selector", dkimSelector) when dkimSelector.len() > 0
+			body.set("ips", texts(ips)) when ips.len() > 0
+			body.set("username", username) when username.len() > 0
+			let reply = try call(self, http.Method.POST, "/v3/whitelabel/domains", body)
+			let made = Domain{}
+			try decodeInto(reply.data, made)
+			return made
+		}
+
+		// Changes whether domain `id` is the default and uses a custom SPF
+		// record; none leaves a setting as it is.
+		// Fails as every call does.
+		def updateDomain(id int, isDefault ?bool = none, customSpf ?bool = none) !Domain {
+			let body = new map<string, any>()
+			body.set("default", isDefault) unless isDefault is none
+			body.set("custom_spf", customSpf) unless customSpf is none
+			let reply = try call(self, http.Method.PATCH, "/v3/whitelabel/domains/{id}", body)
+			let saved = Domain{}
+			try decodeInto(reply.data, saved)
+			return saved
+		}
+
+		// Removes the authentication of domain `id`.
+		// Fails as every call does.
+		def deleteDomain(id int) !none {
+			try call(self, http.Method.DELETE, "/v3/whitelabel/domains/{id}")
+			return none
+		}
+
+		// Has SendGrid look up the DNS records of domain `id`.
+		// Fails as every call does.
+		def validateDomain(id int) !DomainCheck {
+			let reply = try call(self, http.Method.POST, "/v3/whitelabel/domains/{id}/validate")
+			let found = DomainCheck{}
+			try decodeInto(reply.data, found)
+			return found
+		}
+	}
+
+	// The fields of a sender SendGrid takes.
+	internal def senderBody(s Sender) map<string, any> {
+		let out = map<string, any>{"nickname": s.nickname, "from_email": s.fromEmail, "from_name": s.fromName, "reply_to": s.replyTo, "reply_to_name": s.replyToName, "address": s.address, "city": s.city, "country": s.country}
+		out.set("address2", s.address2) when s.address2.len() > 0
+		out.set("state", s.state) when s.state.len() > 0
+		out.set("zip", s.zip) when s.zip.len() > 0
+		return out
+	}
+}

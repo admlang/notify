@@ -1,3 +1,284 @@
+// A SendGrid client over std.net.http: mail send v3 from std.formats.mail
+// messages or dynamic templates (personalizations, attachments and inline
+// images, categories, custom arguments, scheduling, batches, tracking and
+// the sandbox mode), suppressions and unsubscribe groups, templates,
+// verified senders, domain authentication, statistics and the activity
+// feed; a handler for the event webhook that checks its ECDSA signature,
+// and one for inbound parse that hands out std.formats.mail messages.
+//
+// ```
+// let sg = new sendgrid.Client(apiKey)              // SENDGRID_API_KEY when left out
+// let message = new mail.Message()
+//     .from("orders@example.com", "Shop")
+//     .to("ana@example.net")
+//     .subject("Your order")
+//     .text("Thanks, Ana.")
+// try sg.send(message)
+//
+// try sg.send(new sendgrid.Template("d-1234", to = "ana@example.net", data = {"name": "Ana"}, from = "orders@example.com"))
+// ```
 partial module adm.notify.sendgrid {
-	// SendGrid over std.net.http: mail send v3 from std.formats.mail messages or templates, personalizations, attachments, categories, suppressions, event webhooks with signature verification, inbound parse
+	use (
+		std.errors
+		std.time
+		std.net.http
+		std.net.url
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON)
+	)
+
+	// SendGrid's API address; `baseURL` replaces it for a proxy or a test
+	// server.
+	const apiURL = "https://api.sendgrid.com"
+
+	// The API address of an account whose data stays in the EU.
+	const euURL = "https://api.eu.sendgrid.com"
+
+	// The library's version, in the User-Agent of every request.
+	const libraryVersion = "0.1.0"
+
+	// What went wrong, for the caller that acts on it.
+	enum ErrorKind {
+		// The API key is missing, wrong or revoked (401), or lacks the
+		// scope the call needs (403).
+		Auth        = "auth",
+		// SendGrid refused the pace: `retryAfter` says how long to wait.
+		RateLimited = "ratelimited",
+		// The request breaks a rule: a field SendGrid rejects, a limit of
+		// mail send checked before sending, a body too large (400, 413).
+		Invalid     = "invalid",
+		// No template, sender, domain, group or message of that id (404).
+		NotFound    = "notfound",
+		// SendGrid could not be reached, or the connection dropped.
+		Transport   = "transport",
+		// SendGrid failed, or answered with something that is not its API.
+		Server      = "server",
+	}
+
+	// One problem SendGrid names in a refusal: its text, the field of the
+	// request it is about (`personalizations.0.to`), and the address of
+	// its documentation.
+	struct Problem {
+		message string
+		field   string
+		help    string
+	}
+
+	// The failure of every call here. `problems` are the entries of
+	// SendGrid's `errors` array, `status` the HTTP status (0 when none came
+	// back) and `retryAfter` the pause a rate limit asked for.
+	struct SendGridError {
+		message    string
+		code       string
+		cause      ?error
+		stack      errors.StackTrace
+		kind       ErrorKind
+		status     int
+		problems   Problem[]
+		retryAfter ?duration
+	}
+
+	// A connection to the SendGrid v3 API as one API key. It waits out the
+	// rate limit SendGrid reports for an endpoint once its requests are
+	// spent, and every 429 it answers, and holds no connection of its own
+	// (std.net.http keeps them), so any number of tasks may share one.
+	//
+	// Calls fail with SendGridError: Auth for a key SendGrid refuses or a
+	// scope it lacks, NotFound for an unknown id, Invalid for a request
+	// SendGrid or the local checks of mail send refuse, RateLimited once
+	// `rateLimitRetries` waits were spent, Server and Transport.
+	partial type Client {
+		apiKey           ?Secret<string>
+		// The API's base: `https://api.sendgrid.com`, `euURL`, or a
+		// proxy's.
+		baseURL          string
+		// The subuser the calls act for (`on-behalf-of`); "" acts for the
+		// key's own account.
+		onBehalfOf       string          = ""
+		// How often a call refused with 429 is sent again after the wait
+		// SendGrid asked for, before it fails with RateLimited.
+		rateLimitRetries int             = 5
+		// The HTTP client requests go through: timeouts, a transport.
+		httpClient       http.Client
+		internal limits  Limiter
+
+		// A client with `apiKey` (else `SENDGRID_API_KEY`), of the API at
+		// `baseURL` (else `SENDGRID_API_URL`, else SendGrid's).
+		def new(apiKey ?Secret<string> = none, baseURL string = "") {
+			let env = Runtime.getEnv("SENDGRID_API_KEY")
+			self.apiKey = apiKey is none ?? (env is none ?? (none, env), apiKey)
+			let envURL = Runtime.getEnv("SENDGRID_API_URL")
+			let base = baseURL.len() > 0 ?? (baseURL, envURL is none ?? (apiURL, envURL))
+			self.baseURL = base.trimEnd("/")
+			httpClient = new http.Client()
+			httpClient.userAgent = "adm.notify.sendgrid/{libraryVersion}"
+			httpClient.retry = http.RetryPolicy{attempts: 2, statuses: [502, 503, 504]}
+			limits = new Limiter()
+		}
+	}
+
+	// What an API call answered: its status, body and the id SendGrid gave
+	// a sent message (`X-Message-Id`).
+	internal struct Reply {
+		status    int
+		data      byte[]
+		messageId string = ""
+	}
+
+	// Sends `method` to `path` (with its query) on the v3 API, `body` as
+	// JSON when given, waiting first for the endpoint's rate limit and again
+	// for every 429 (up to `rateLimitRetries`). Returns the reply of a 2xx
+	// status. Fails with the SendGridError the reply describes otherwise.
+	internal def call(client Client, method http.Method, path string, body ?any = none) !Reply {
+		let endpoint = method.name + " " + path.split("?")[0]
+		let attempt = 0
+		for {
+			let wait = client.limits.waitFor(endpoint)
+			for wait > 0s {
+				time.sleep(wait)
+				wait = client.limits.waitFor(endpoint)
+			}
+			let req = try client.httpClient.request(method, client.baseURL + path)
+			let key = client.apiKey
+			req.headers.set("Authorization", "Bearer " + key.reveal()) unless key is none
+			req.headers.set("on-behalf-of", client.onBehalfOf) when client.onBehalfOf.len() > 0
+			if !(body is none) {
+				req.replaceBody((new JSON()).encode(body))
+				req.headers.set("Content-Type", "application/json")
+			}
+			let res = client.httpClient.do(req) onerror (err error) {
+				fail SendGridError{message: "sendgrid: {endpoint}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+			}
+			let reset = resetOf(res)
+			client.limits.block(endpoint, reset) when res.status == 429 || (res.header("X-RateLimit-Remaining") == "0" && reset > 0s)
+			if res.status == 429 {
+				res.close() onerror recover none
+				if attempt < client.rateLimitRetries {
+					attempt++
+					continue
+				}
+				fail SendGridError{message: "sendgrid: {endpoint}: rate limited", code: ErrorKind.RateLimited.value, kind: ErrorKind.RateLimited, status: 429, retryAfter: reset}
+			}
+			let data = res.bytes() onerror (err error) {
+				fail SendGridError{message: "sendgrid: {endpoint}: the reply was cut short: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport, status: res.status}
+			}
+			fail failureOf(endpoint, res, data) unless res.ok()
+			return Reply{status: res.status, data: data, messageId: res.header("X-Message-Id")}
+		}
+		fail "sendgrid: unreachable"
+	}
+
+	// The wait until the rate limit of a reply resets: `X-RateLimit-Reset`
+	// (Unix seconds), else `Retry-After`; 1s for a 429 that names neither,
+	// 0s otherwise.
+	internal def resetOf(res http.Response) duration {
+		let reset = res.header("X-RateLimit-Reset")
+		if reset.len() > 0 && reset.isNumeric() {
+			let left = reset.toInt<int64>() * 1000000000 - time.now().unixNs()
+			return left > 0 ?? (duration(left), 0s)
+		}
+		let after = res.retryAfter()
+		return after unless after is none
+		return res.status == 429 ?? (1s, 0s)
+	}
+
+	// The SendGridError of a reply that is not 2xx: its `errors` array, or
+	// the body's text when it holds none.
+	internal def failureOf(endpoint string, res http.Response, data byte[]) SendGridError {
+		let kind = kindOfStatus(res.status)
+		let failure = SendGridError{message: "", code: kind.value, kind: kind, status: res.status}
+		let box = Problems{}
+		let codec = new JSON()
+		codec.decode(data, box) onerror recover none
+		failure.problems = box.errors
+		let texts string[] = []
+		for let p in box.errors {
+			texts.push(p.field.len() > 0 ?? ("{p.field}: {p.message}", p.message))
+		}
+		let text = string(data).trim()
+		let detail = texts.len() > 0 ?? (texts.join("; "), text.len() > 0 && text.len() <= 200 ?? (text, res.reason))
+		failure.message = "sendgrid: {endpoint}: {res.status} {detail}"
+		return failure
+	}
+
+	// The body of a refusal: `{"errors": [{"message", "field", "help"}]}`.
+	internal struct Problems {
+		errors Problem[]
+	}
+
+	internal def kindOfStatus(status int) ErrorKind {
+		return ErrorKind.Auth when status := 401 || 403
+		return ErrorKind.NotFound when status := 404 || 410
+		return ErrorKind.RateLimited when status == 429
+		return ErrorKind.Server when status >= 500
+		return ErrorKind.Invalid
+	}
+
+	// A failure raised before anything is sent: a limit the request breaks.
+	internal def invalid(message string) SendGridError {
+		return SendGridError{message: "sendgrid: {message}", code: ErrorKind.Invalid.value, kind: ErrorKind.Invalid}
+	}
+
+	// Binds the JSON of a reply onto `target`. Fails with SendGridError
+	// Server when it is not of that shape.
+	internal def decodeInto(data byte[], target any) !none {
+		(new JSON()).decode(data, target) onerror (err error) {
+			fail SendGridError{message: "sendgrid: the reply is not what the API sends: {err.message}", code: ErrorKind.Server.value, cause: err, kind: ErrorKind.Server}
+		}
+		return none
+	}
+
+	// The body an array is bound through: the JSON codec binds objects onto
+	// typed values, not a top-level array.
+	internal struct Items<T> {
+		items T[]
+	}
+
+	// A reply that is a JSON array, as T[]. Fails as `decodeInto` does.
+	internal def listOf<T>(data byte[]) !T[] {
+		let box = Items<T>{}
+		let text = string(data).trim()
+		return box.items when text.len() == 0
+		try decodeInto("\{\"items\":{text}}".bytes(), box)
+		return box.items
+	}
+
+	// A reply's JSON as a value: maps, arrays, text, numbers. Fails as
+	// `decodeInto` does.
+	internal def parsed(data byte[]) !any {
+		return (new JSON()).parse(string(data)) onerror (err error) {
+			fail SendGridError{message: "sendgrid: the reply is not JSON: {err.message}", code: ErrorKind.Server.value, cause: err, kind: ErrorKind.Server}
+		}
+	}
+
+	// `text` escaped for one segment of a path.
+	internal def segment(text string) string {
+		return url.pathEscape(text)
+	}
+
+	// A time as Unix seconds, the form SendGrid's times take.
+	internal def unixOf(at time.Time) int64 {
+		return at.unixNs() / 1000000000
+	}
+
+	// The text of `key` in an object; "" when absent or not text.
+	internal def textAt(object map<string, any>, key string) string {
+		let v = object.get(key)
+		return v when v is string
+		return "{v}" when v is int || v is int64
+		return ""
+	}
+
+	internal def objectAt(object map<string, any>, key string) map<string, any> {
+		let v = object.get(key)
+		return v is map<string, any> ?? (v, new map<string, any>())
+	}
+
+	internal def texts(list string[]) any[] {
+		let out any[] = []
+		for let s in list {
+			out.push(s)
+		}
+		return out
+	}
 }

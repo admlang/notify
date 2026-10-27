@@ -1,0 +1,150 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.testing
+		std.crypto::(p256, generateECDSAKey, marshalPKIXPublicKey, marshalECDSASignature)
+		std.crypto.hash::(Hash, digest)
+		std.net.http
+		std.net.http.httptest
+		std.data.encoding::(JSON, base64encode)
+	)
+
+	// A key, a body, a timestamp and the signature OpenSSL made of them
+	// (`openssl dgst -sha256 -sign`), as SendGrid signs: the timestamp
+	// followed by the body.
+	internal const vectorKey = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAELC3R5V/Y4ymUwUMLdKSlDAxfp0hOiUast8yuff9BfH3W1xrDw17gjKUw06IS5AWU/ttrumQvYMntt4tyLr3RAw=="
+	internal const vectorBody = "[{\"email\":\"ana@example.net\",\"event\":\"delivered\",\"sg_event_id\":\"e1\",\"sg_message_id\":\"m1.filter\",\"timestamp\":1700000000,\"response\":\"250 OK\",\"tls\":1,\"category\":[\"receipt\",\"shop\"],\"order\":\"7\"}]"
+	internal const vectorStamp = "1700000001"
+	internal const vectorSignature = "MEUCIC1YT1VPLOiirbjs2zNXO96FbGwE2lKN8U3oYgtylrpIAiEAlS8rJeAuk7MFQH7tK9Tz+3ouYTI+FI5ja2ia8Eh1lTA="
+
+	// Serves `handler` at /events and returns its address.
+	internal def eventServer(handler http.Handler) !(httptest.Server, string) {
+		let mux = new http.ServeMux()
+		try mux.handle("/events", handler)
+		let server = new httptest.Server(mux)
+		try server.start()
+		return (server, "http://{server.address().str()}/events")
+	}
+
+	// Posts `body` with the signature headers (left out when "").
+	internal def postEvents(target string, body string, signature string, stamp string, method http.Method = http.Method.POST) !http.Response {
+		let client = new http.Client()
+		let req = try client.request(method, target)
+		req.headers.set("Content-Type", "application/json")
+		req.headers.set(signatureHeader, signature) when signature.len() > 0
+		req.headers.set(timestampHeader, stamp) when stamp.len() > 0
+		req.replaceBody(body.bytes())
+		return try client.do(req)
+	}
+
+	check "SendGrid event webhook" {
+		// A batch OpenSSL signed verifies; a changed body, a changed
+		// timestamp, a missing signature and another key do not.
+		@test()
+		def TestSignature() !none {
+			let got Event[] = []
+			let handler = try events(vectorKey, def (event Event) !none {
+				got.push(event)
+				return none
+			})
+			let (server, target) = try eventServer(handler)
+			let ok = try postEvents(target, vectorBody, vectorSignature, vectorStamp)
+			assert ok.status == 200 && got.len() == 1
+			let e = got[0]
+			assert e.kind == EventKind.Delivered && e.email == "ana@example.net" && e.id == "e1" && e.messageId == "m1.filter"
+			assert e.timestamp == 1700000000 && e.response == "250 OK" && e.tls
+			assert e.categories.join(",") == "receipt,shop" && e.args.len() == 1 && "{e.args.get("order")}" == "7"
+			assert (try postEvents(target, vectorBody.replace("250 OK", "250 Ok"), vectorSignature, vectorStamp)).status == 401
+			assert (try postEvents(target, vectorBody, vectorSignature, "1700000002")).status == 401
+			assert (try postEvents(target, vectorBody, "", vectorStamp)).status == 401
+			assert (try postEvents(target, vectorBody, "bm90IGEgc2lnbmF0dXJl", vectorStamp)).status == 401
+			assert (try postEvents(target, vectorBody, vectorSignature, vectorStamp, method = http.Method.GET)).status == 405
+			let recorder = new httptest.ResponseRecorder()
+			try handler.serve(recorder.context(try httptest.newRequest(http.Method.PUT, "/events")))
+			assert recorder.result().status == 405
+			assert got.len() == 1
+			let other = try generateECDSAKey(p256)
+			let (stranger, strangerTarget) = try eventServer(try events(base64encode(marshalPKIXPublicKey(other.publicKey())), def (event Event) !none {
+				return none
+			}))
+			assert (try postEvents(strangerTarget, vectorBody, vectorSignature, vectorStamp)).status == 401
+			try stranger.close()
+			try server.close()
+			return none
+		}
+
+		// Every kind of event comes out typed, with the fields of its kind;
+		// a batch `handle` fails on is answered 500; a body that is not a
+		// batch 400; without a key nothing is checked.
+		@test()
+		def TestEvents() !none {
+			let key = try generateECDSAKey(p256)
+			let got Event[] = []
+			let handler = try events(base64encode(marshalPKIXPublicKey(key.publicKey())), def (event Event) !none {
+				fail "refused" when event.email == "fail@example.net"
+				got.push(event)
+				return none
+			})
+			let (server, target) = try eventServer(handler)
+			let batch = [
+				map<string, any>{"event": "processed", "email": "a@example.net", "timestamp": 1, "category": "receipt", "pool": map<string, any>{"name": "transactional", "id": 3}, "sg_template_id": "d-1"},
+				map<string, any>{"event": "dropped", "email": "a@example.net", "timestamp": 2, "reason": "Bounced Address", "status": "5.0.0"},
+				map<string, any>{"event": "deferred", "email": "a@example.net", "timestamp": 3, "response": "400 try again", "attempt": "5"},
+				map<string, any>{"event": "bounce", "email": "a@example.net", "timestamp": 4, "type": "blocked", "reason": "550 spam", "status": "5.7.1", "bounce_classification": "Reputation"},
+				map<string, any>{"event": "open", "email": "a@example.net", "timestamp": 5, "useragent": "Mail", "ip": "10.0.0.2", "sg_machine_open": true},
+				map<string, any>{"event": "click", "email": "a@example.net", "timestamp": 6, "url": "https://example.com/p", "url_offset": map<string, any>{"index": 2, "type": "html"}},
+				map<string, any>{"event": "spamreport", "email": "a@example.net", "timestamp": 7},
+				map<string, any>{"event": "unsubscribe", "email": "a@example.net", "timestamp": 8},
+				map<string, any>{"event": "group_unsubscribe", "email": "a@example.net", "timestamp": 9, "asm_group_id": 42},
+				map<string, any>{"event": "group_resubscribe", "email": "a@example.net", "timestamp": 10, "asm_group_id": 42},
+				map<string, any>{"event": "account_status_change", "email": "a@example.net", "timestamp": 11, "user": "u-1", "attempt": 1},
+			]
+			let body = string((new JSON()).encode(batch))
+			let stamp = "1700000000"
+			let (r, s) = try key.sign(digest(Hash.SHA256, stamp.bytes() + body.bytes()))
+			let signature = base64encode(marshalECDSASignature(r, s))
+			assert (try postEvents(target, body, signature, stamp)).status == 200
+			assert got.len() == 11
+			assert got[0].kind == EventKind.Processed && got[0].categories.join(",") == "receipt" && got[0].ipPool == "transactional" && got[0].templateId == "d-1" && got[0].args.len() == 0
+			assert got[1].kind == EventKind.Dropped && got[1].reason == "Bounced Address" && got[1].status == "5.0.0"
+			assert got[2].kind == EventKind.Deferred && got[2].attempt == 5 && got[2].response == "400 try again"
+			assert got[3].kind == EventKind.Bounce && got[3].bounceType == "blocked" && got[3].classification == "Reputation"
+			assert got[4].kind == EventKind.Open && got[4].machineOpen && got[4].userAgent == "Mail" && got[4].ip == "10.0.0.2"
+			assert got[5].kind == EventKind.Click && got[5].url == "https://example.com/p" && got[5].urlIndex == 2
+			assert got[6].kind == EventKind.SpamReport && got[7].kind == EventKind.Unsubscribe
+			assert got[8].kind == EventKind.GroupUnsubscribe && got[8].group == 42 && got[9].kind == EventKind.GroupResubscribe
+			assert got[10].kind == EventKind.Other && got[10].event == "account_status_change" && "{got[10].args.get("user")}" == "u-1" && got[10].attempt == 1
+			let failing = string((new JSON()).encode([map<string, any>{"event": "open", "email": "fail@example.net"}]))
+			let (fr, fs) = try key.sign(digest(Hash.SHA256, stamp.bytes() + failing.bytes()))
+			assert (try postEvents(target, failing, base64encode(marshalECDSASignature(fr, fs)), stamp)).status == 500
+			let notBatch = "\{\"event\": \"open\"}"
+			let (nr, ns) = try key.sign(digest(Hash.SHA256, stamp.bytes() + notBatch.bytes()))
+			assert (try postEvents(target, notBatch, base64encode(marshalECDSASignature(nr, ns)), stamp)).status == 400
+			let open = try events("", def (event Event) !none {
+				got.push(event)
+				return none
+			})
+			assert open.key is none
+			let (plain, plainTarget) = try eventServer(open)
+			assert (try postEvents(plainTarget, vectorBody, "", "")).status == 200 && got.len() == 12
+			try plain.close()
+			try server.close()
+			return none
+		}
+
+		// A key that is not base64 or not an ECDSA public key is refused.
+		@test()
+		def TestWebhookKeys() !none {
+			let handle = def (event Event) !none {
+				return none
+			}
+			for let text in ["not base64!", base64encode("not der".bytes())] {
+				let failure = caught(def () !none {
+					try events(text, handle)
+					return none
+				})
+				fail "key {text} was taken" unless !(failure is none) && failure.kind == ErrorKind.Invalid
+			}
+			return none
+		}
+	}
+}

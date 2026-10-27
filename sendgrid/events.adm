@@ -1,0 +1,248 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.crypto
+		std.crypto::(ECDSAPublicKey, parsePKIXPublicKey, parseECDSASignature)
+		std.crypto.hash::(Hash, digest)
+		std.net.http
+		std.data.encoding::(JSON, base64decode)
+	)
+
+	// The header holding the event webhook's signature: base64 of a DER
+	// ECDSA signature over the timestamp and the body.
+	const signatureHeader = "X-Twilio-Email-Event-Webhook-Signature"
+
+	// The header holding the time the event webhook signed the request.
+	const timestampHeader = "X-Twilio-Email-Event-Webhook-Timestamp"
+
+	// What happened to a message.
+	enum EventKind {
+		// SendGrid took the message and will send it.
+		Processed        = "processed",
+		// SendGrid did not send it (`reason`: a suppression, an invalid
+		// address, ...).
+		Dropped          = "dropped",
+		// The receiving server accepted it (`response`).
+		Delivered        = "delivered",
+		// The receiving server refused it for now; SendGrid tries again
+		// (`attempt`, `response`).
+		Deferred         = "deferred",
+		// The receiving server refused it for good (`bounceType` `bounce`)
+		// or for a reason that may pass (`blocked`).
+		Bounce           = "bounce",
+		Open             = "open",
+		// The recipient followed `url`.
+		Click            = "click",
+		SpamReport       = "spamreport",
+		// The recipient left all mail of the account.
+		Unsubscribe      = "unsubscribe",
+		// The recipient left the unsubscribe group `group`, or came back.
+		GroupUnsubscribe = "group_unsubscribe",
+		GroupResubscribe = "group_resubscribe",
+		// An event this version does not know; `event` names it.
+		Other            = "other",
+	}
+
+	// An event of the event webhook: one step of one message to one
+	// recipient. Fields that do not belong to the event's kind are empty.
+	// `args` holds the custom arguments the message was sent with.
+	struct Event {
+		kind           EventKind
+		// SendGrid's name of the event (`delivered`, `group_unsubscribe`).
+		event          string
+		email          string
+		// When it happened, in Unix seconds.
+		timestamp      int64
+		// The event's own id (`sg_event_id`), the same in a delivery
+		// SendGrid repeats: the key to drop duplicates by.
+		id             string
+		// The message's id (`sg_message_id`): the id `send` returned,
+		// followed by a part naming the recipient.
+		messageId      string
+		smtpId         string
+		categories     string[]
+		args           map<string, string>
+		// Dropped, Bounce: why; Bounce, Dropped: the status code.
+		reason         string
+		status         string
+		// Delivered, Deferred: the receiving server's answer.
+		response       string
+		attempt        int
+		// Bounce: `bounce` or `blocked`, and SendGrid's classification of
+		// the reason (`Invalid Address`, `Reputation`, ...).
+		bounceType     string
+		classification string
+		// Click: the address followed and its place among the links.
+		url            string
+		urlIndex       int
+		// Open, Click: the recipient's client.
+		userAgent      string
+		ip             string
+		// Open: the open came from a mail privacy proxy, not a person.
+		machineOpen    bool
+		// GroupUnsubscribe, GroupResubscribe, and messages sent with one.
+		group          int
+		// Delivered: whether the connection was TLS, and its certificate
+		// was not trusted.
+		tls            bool
+		certError      bool
+		ipPool         string
+		templateId     string
+		templateName   string
+	}
+
+	// The fields of an event that are not custom arguments.
+	internal const eventFields = ["event", "email", "timestamp", "sg_event_id", "sg_message_id", "smtp-id", "category", "reason", "status", "response", "attempt", "type", "bounce_classification", "url", "url_offset", "useragent", "ip", "sg_machine_open", "asm_group_id", "tls", "cert_err", "pool", "sg_template_id", "sg_template_name", "sg_content_type", "marketing_campaign_id", "marketing_campaign_name", "marketing_campaign_version", "marketing_campaign_split_id", "singlesend_id", "singlesend_name", "template_id", "template_version_id", "phase_id", "send_at", "sg_user_id", "newsletter"]
+
+	// The event webhook receiver, an http.Handler: it checks the request's
+	// signature with `key` (none checks nothing), and hands each event of
+	// the batch to `handle` in order. A request without a valid signature
+	// is answered 401; a batch `handle` fails on is answered 500, which
+	// SendGrid delivers again later, the events already handled included
+	// (`Event.id` tells them apart).
+	//
+	// ```
+	// let key = try sg.webhookKey()
+	// server.handle("POST /sendgrid/events", try sendgrid.events(key, def (event sendgrid.Event) !none {
+	//     ...
+	// }))
+	// ```
+	type EventHandler {
+		key             ?ECDSAPublicKey
+		internal handle def(Event) !none
+
+		def new(key ?ECDSAPublicKey, handle def(Event) !none) {
+			self.key = key
+			self.handle = handle
+		}
+
+		// Implements http.Handler. Fails when the body cannot be read, the
+		// answer cannot be written, or `handle` fails on an event.
+		def serve(ctx http.Context) !none {
+			return ctx.text(405, "sendgrid events come by POST") unless ctx.method() == http.Method.POST
+			let body = try ctx.bytes()
+			let verifier = key
+			if !(verifier is none) {
+				let signature = ctx.header(signatureHeader)
+				let stamp = ctx.header(timestampHeader)
+				return ctx.text(401, "missing signature") when signature.len() == 0 || stamp.len() == 0
+				return ctx.text(401, "signature does not verify") unless verifies(verifier, signature, stamp, body)
+			}
+			let parsed = (new JSON()).parse(string(body)) onerror recover none
+			return ctx.text(400, "not a batch of SendGrid events") unless parsed is any[]
+			for let item in parsed {
+				continue unless item is map<string, any>
+				try handle(eventOf(item))
+			}
+			return ctx.text(200, "")
+		}
+	}
+
+	// An event webhook receiver checking signatures with `publicKey`, the
+	// base64 DER key SendGrid shows for the signed webhook
+	// (`Client.webhookKey`); "" checks nothing, which lets anyone who finds
+	// the address post events. Fails with Invalid when the key is not a
+	// base64 ECDSA public key.
+	def events(publicKey string, handle def(Event) !none) !EventHandler {
+		return new EventHandler(none, handle) when publicKey.trim().len() == 0
+		return new EventHandler(try webhookKeyOf(publicKey), handle)
+	}
+
+	// The ECDSA key of a base64 DER SubjectPublicKeyInfo. Fails with
+	// Invalid when it is not one.
+	internal def webhookKeyOf(publicKey string) !ECDSAPublicKey {
+		let der = base64decode(publicKey.trim()) onerror (err error) {
+			fail invalid("the webhook key is not base64: {err.message}")
+		}
+		let key = parsePKIXPublicKey(der) onerror (err error) {
+			fail invalid("the webhook key is not a public key: {err.message}")
+		}
+		fail invalid("the webhook key is not an ECDSA key") unless key is ECDSAPublicKey
+		return key
+	}
+
+	// Whether `signature` (base64 DER) signs the timestamp followed by the
+	// body, with SHA-256. A signature that does not parse is (0, 0), which
+	// `verify` refuses.
+	internal def verifies(key ECDSAPublicKey, signature string, stamp string, body byte[]) bool {
+		let der = base64decode(signature.trim()) onerror recover []
+		return false when der.len() == 0
+		let (r, s) = parseECDSASignature(der) onerror recover (bigint(0), bigint(0))
+		return key.verify(digest(Hash.SHA256, stamp.bytes() + body), r, s)
+	}
+
+	internal def eventOf(raw map<string, any>) Event {
+		let name = textAt(raw, "event")
+		let e = Event{kind: kindOfEvent(name), event: name, email: textAt(raw, "email"), timestamp: int64At(raw, "timestamp"), id: textAt(raw, "sg_event_id"), messageId: textAt(raw, "sg_message_id"), smtpId: textAt(raw, "smtp-id")}
+		let category = raw.get("category")
+		if category is string {
+			e.categories.push(category)
+		} else if category is any[] {
+			for let c in category {
+				e.categories.push(c) when c is string
+			}
+		}
+		e.reason = textAt(raw, "reason")
+		e.status = textAt(raw, "status")
+		e.response = textAt(raw, "response")
+		e.attempt = int(int64At(raw, "attempt"))
+		e.bounceType = textAt(raw, "type")
+		e.classification = textAt(raw, "bounce_classification")
+		e.url = textAt(raw, "url")
+		e.urlIndex = int(int64At(objectAt(raw, "url_offset"), "index"))
+		e.userAgent = textAt(raw, "useragent")
+		e.ip = textAt(raw, "ip")
+		e.machineOpen = int64At(raw, "sg_machine_open") != 0
+		e.group = int(int64At(raw, "asm_group_id"))
+		e.tls = int64At(raw, "tls") != 0
+		e.certError = int64At(raw, "cert_err") != 0
+		e.ipPool = textAt(objectAt(raw, "pool"), "name")
+		e.templateId = textAt(raw, "sg_template_id")
+		e.templateName = textAt(raw, "sg_template_name")
+		for let (key, value) in raw {
+			continue when eventFields.indexOf(key) >= 0
+			e.args.set(key, value is string ?? (value, string((new JSON()).encode(value))))
+		}
+		return e
+	}
+
+	internal def kindOfEvent(name string) EventKind {
+		switch name {
+			case "processed":
+				return EventKind.Processed
+			case "dropped":
+				return EventKind.Dropped
+			case "delivered":
+				return EventKind.Delivered
+			case "deferred":
+				return EventKind.Deferred
+			case "bounce", "blocked":
+				return EventKind.Bounce
+			case "open":
+				return EventKind.Open
+			case "click":
+				return EventKind.Click
+			case "spamreport":
+				return EventKind.SpamReport
+			case "unsubscribe":
+				return EventKind.Unsubscribe
+			case "group_unsubscribe":
+				return EventKind.GroupUnsubscribe
+			case "group_resubscribe":
+				return EventKind.GroupResubscribe
+			default:
+				return EventKind.Other
+		}
+	}
+
+	// A number of an object, whether SendGrid sent it as a number, text
+	// or a bool; 0 when absent.
+	internal def int64At(object map<string, any>, key string) int64 {
+		let v = object.get(key)
+		return int64(v) when v is int
+		return v when v is int64
+		return int64(v) when v is float
+		return v ?? (int64(1), int64(0)) when v is bool
+		return v.toInt<int64>() when v is string && v.isNumeric()
+		return 0
+	}
+}

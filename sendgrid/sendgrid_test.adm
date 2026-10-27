@@ -1,0 +1,570 @@
+partial module adm.notify.sendgrid {
+	use (
+		std.time
+		std.testing
+		std.formats::(MediaType)
+		std.formats.mail
+		std.net.http
+		std.net.http.httptest
+		std.data.encoding::(JSON, base64decode)
+	)
+
+	// An API key and a verified sender for the live test, which sends in
+	// the sandbox mode (validated, never delivered) and reads templates,
+	// suppressions, groups and statistics.
+	@env("ADM_TEST_SENDGRID_KEY")
+	internal const liveKey string
+
+	@env("ADM_TEST_SENDGRID_FROM")
+	internal const liveFrom string
+
+	// What the loopback server was asked, and what it answers.
+	internal type Seen {
+		// `METHOD /path?query` of each request.
+		calls    string[]
+		// The JSON body of each request; empty for one without.
+		bodies   map<string, any>[]
+		auth     string[]
+		agents   string[]
+		subusers string[]
+		// The reply of `METHOD /path` (no query): its JSON text.
+		replies  map<string, string>
+		// The status of `METHOD /path` when not 200.
+		statuses map<string, int>
+		// How many times `METHOD /path` answers 429 before it answers.
+		limited  map<string, int>
+		// The base address of the server.
+		base     string              = ""
+
+		def new() {}
+	}
+
+	// `value` as JSON text.
+	internal def json(value ?any) string {
+		return value is none ?? ("null", string((new JSON()).encode(value)))
+	}
+
+	// A server that answers as the v3 API: a reply set for the request's
+	// method and path, else `{}` (204 for DELETE). Mail send answers 202
+	// with an `X-Message-Id`.
+	internal def apiServer(seen Seen, extra ?def (http.ServeMux) !none = none) !httptest.Server {
+		let mux = new http.ServeMux()
+		let more = extra
+		try more(mux) unless more is none
+		try mux.handle("/v3/", def (ctx http.Context) !none {
+			let method = ctx.method().value
+			let address = ctx.url()
+			let query = address.rawQuery
+			let path = address.rawPath.len() > 0 ?? (address.rawPath, ctx.path())
+			seen.calls.push("{method} {path}" + (query.len() > 0 ?? ("?" + query, "")))
+			let text = try ctx.text()
+			let parsed = text.len() > 0 ?? (try (new JSON()).parse(text), none)
+			seen.bodies.push(parsed is map<string, any> ?? (parsed, new map<string, any>()))
+			seen.auth.push(ctx.header("Authorization"))
+			seen.agents.push(ctx.header("User-Agent"))
+			seen.subusers.push(ctx.header("on-behalf-of"))
+			let key = "{method} {ctx.path()}"
+			let left = seen.limited.get(key)
+			if !(left is none) && left > 0 {
+				seen.limited.set(key, left - 1)
+				ctx.setHeader("X-RateLimit-Remaining", "0")
+				ctx.setHeader("X-RateLimit-Reset", "{time.now().unixNs() / 1000000000}")
+				return try ctx.text(429, json(map<string, any>{"errors": [map<string, any>{"message": "too many requests"}]}))
+			}
+			let status = seen.statuses.get(key)
+			let reply = seen.replies.get(key)
+			if key == "POST /v3/mail/send" && status is none {
+				ctx.setHeader("X-Message-Id", "msg-{seen.calls.len()}")
+				return try ctx.text(202, "")
+			}
+			return try ctx.noContent(204) when method == "DELETE" && reply is none && status is none
+			ctx.setHeader("Content-Type", "application/json")
+			return try ctx.text(status is none ?? (200, status), reply is none ?? ("\{}", reply))
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		seen.base = "http://{server.address().str()}"
+		return server
+	}
+
+	// Records a request a test's own handler answered, which has no body.
+	internal def note(seen Seen, call string) {
+		seen.calls.push(call)
+		seen.bodies.push(new map<string, any>())
+	}
+
+	internal def clientOf(seen Seen) Client {
+		return new Client("SG.test", seen.base)
+	}
+
+	// The JSON body of request `at` as an object.
+	internal def bodyAt(seen Seen, at int) map<string, any> {
+		return seen.bodies[at]
+	}
+
+	// The value at a path of objects and arrays (`personalizations.0.to.1.email`);
+	// none when one step is missing.
+	internal def at(value ?any, path string) ?any {
+		let current = value
+		for let step in path.split(".") {
+			if current is map<string, any> {
+				current = current.get(step)
+			} else if current is any[] && step.isNumeric() {
+				let i = step.toInt<int>()
+				return none when i >= current.len()
+				current = current[i]
+			} else {
+				return none
+			}
+		}
+		return current
+	}
+
+	internal def textOf(value ?any, path string) string {
+		let v = at(value, path)
+		return v when v is string
+		return "{v}" when v is int || v is int64 || v is bool
+		return ""
+	}
+
+	// The SendGridError `call` fails with; none when it succeeds or fails
+	// otherwise.
+	internal def caught(call def () !none) ?SendGridError {
+		let found ?SendGridError = none
+		call() onerror (err error) {
+			found = err when err is SendGridError
+			recover none
+		}
+		return found
+	}
+
+	check "SendGrid mail send" {
+		// A std message becomes mail send's JSON: sender, reply-to,
+		// recipients, subject, both bodies, attachments, inline parts,
+		// headers, and every setting of the options.
+		@test()
+		def TestSendMessage() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let sg = clientOf(seen)
+			sg.onBehalfOf = "shop-eu"
+			let message = new mail.Message()
+				.from("orders@example.com", "Shop")
+				.replyTo("help@example.com")
+				.to("ana@example.net", "Ana")
+				.to("ben@example.net")
+				.cc("carla@example.net")
+				.bcc("audit@example.com")
+				.subject("Your order")
+				.text("Thanks, Ana.")
+				.html("<p>Thanks, <b>Ana</b>.</p><img src=\"cid:logo\">")
+			message.attach("receipt.txt", "total 7".bytes())
+			message.embed("logo", byte[137, 80, 78, 71], new MediaType("image", "png"))
+			message.header.set("X-Order", "7")
+			message.header.set("List-Unsubscribe", "<mailto:leave@example.com>")
+			let later = time.now() + 1h
+			let id = try sg.send(message, Options{categories: ["receipt"], args: {"order": "7"}, sendAt: later, batch: "B1", group: 42, groupsToDisplay: [42, 43], ipPool: "transactional", tracking: Tracking{clicks: false, opens: true, openTag: "%open%", analytics: true, utmSource: "mail"}, sandbox: true, bypassBounces: true, footerText: "-- Shop"})
+			assert id == "msg-1"
+			assert seen.calls[0] == "POST /v3/mail/send"
+			assert seen.auth[0] == "Bearer SG.test" && seen.agents[0].startsWith("adm.notify.sendgrid/") && seen.subusers[0] == "shop-eu"
+			let body = bodyAt(seen, 0)
+			assert textOf(body, "from.email") == "orders@example.com" && textOf(body, "from.name") == "Shop"
+			assert textOf(body, "reply_to.email") == "help@example.com"
+			assert textOf(body, "subject") == "Your order"
+			assert textOf(body, "personalizations.0.to.0.email") == "ana@example.net" && textOf(body, "personalizations.0.to.0.name") == "Ana"
+			assert textOf(body, "personalizations.0.to.1.email") == "ben@example.net"
+			assert textOf(body, "personalizations.0.cc.0.email") == "carla@example.net" && textOf(body, "personalizations.0.bcc.0.email") == "audit@example.com"
+			assert textOf(body, "content.0.type") == "text/plain" && textOf(body, "content.0.value") == "Thanks, Ana."
+			assert textOf(body, "content.1.type") == "text/html" && textOf(body, "content.1.value").contains("cid:logo")
+			let files = at(body, "attachments")
+			assert files is any[] && files.len() == 2
+			let receipt = textOf(body, "attachments.0.disposition") == "attachment" ?? (0, 1)
+			assert textOf(body, "attachments.{receipt}.filename") == "receipt.txt"
+			assert string(try base64decode(textOf(body, "attachments.{receipt}.content"))) == "total 7"
+			let logo = 1 - receipt
+			assert textOf(body, "attachments.{logo}.disposition") == "inline" && textOf(body, "attachments.{logo}.content_id") == "logo" && textOf(body, "attachments.{logo}.type") == "image/png"
+			assert textOf(body, "headers.X-Order") == "7" && textOf(body, "headers.List-Unsubscribe") == "<mailto:leave@example.com>"
+			assert at(body, "headers.Subject") is none && at(body, "headers.Date") is none
+			assert textOf(body, "categories.0") == "receipt" && textOf(body, "custom_args.order") == "7"
+			assert textOf(body, "send_at") == "{later.unixNs() / 1000000000}" && textOf(body, "batch_id") == "B1"
+			assert textOf(body, "asm.group_id") == "42" && textOf(body, "asm.groups_to_display.1") == "43"
+			assert textOf(body, "ip_pool_name") == "transactional"
+			assert textOf(body, "mail_settings.sandbox_mode.enable") == "true" && textOf(body, "mail_settings.bypass_bounce_management.enable") == "true"
+			assert at(body, "mail_settings.bypass_list_management") is none
+			assert textOf(body, "mail_settings.footer.text") == "-- Shop"
+			assert textOf(body, "tracking_settings.click_tracking.enable") == "false" && textOf(body, "tracking_settings.open_tracking.substitution_tag") == "%open%"
+			assert textOf(body, "tracking_settings.ganalytics.utm_source") == "mail" && at(body, "tracking_settings.subscription_tracking") is none
+			try server.close()
+			return none
+		}
+
+		// A template goes as its id with a personalization per copy, each
+		// with its data; options' personalizations replace a message's
+		// recipients.
+		@test()
+		def TestSendTemplate() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let sg = clientOf(seen)
+			let welcome = new Template("d-1234", to = "Ana <ana@example.net>", data = {"name": "Ana", "items": [1, 2]}, from = "Shop <orders@example.com>")
+			let ben = welcome.add("ben@example.net, cleo@example.net", {"name": "Ben"})
+			ben.subject = "Hi Ben"
+			ben.args.set("user", "b")
+			welcome.attach("terms.pdf", "%PDF".bytes(), mediaType = "application/pdf")
+			try sg.send(welcome, Options{sandbox: true})
+			let body = bodyAt(seen, 0)
+			assert textOf(body, "template_id") == "d-1234" && textOf(body, "from.name") == "Shop"
+			assert textOf(body, "personalizations.0.to.0.name") == "Ana" && textOf(body, "personalizations.0.dynamic_template_data.name") == "Ana"
+			assert textOf(body, "personalizations.0.dynamic_template_data.items.1") == "2"
+			assert textOf(body, "personalizations.1.to.1.email") == "cleo@example.net" && textOf(body, "personalizations.1.subject") == "Hi Ben"
+			assert textOf(body, "personalizations.1.custom_args.user") == "b"
+			assert textOf(body, "attachments.0.type") == "application/pdf" && at(body, "content") is none
+			let note = new mail.Message().from("news@example.com").subject("News").text("Hello -name-")
+			try sg.send(note, Options{personalizations: [Personalization{to: ["a@example.net"], substitutions: {"-name-": "A"}}, Personalization{to: ["b@example.net"], substitutions: {"-name-": "B"}}]})
+			let second = bodyAt(seen, 1)
+			assert textOf(second, "personalizations.1.to.0.email") == "b@example.net" && textOf(second, "personalizations.1.substitutions.-name-") == "B"
+			try server.close()
+			return none
+		}
+
+		// Requests that break a rule of mail send fail with Invalid before
+		// anything is sent.
+		@test()
+		def TestSendLimits() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let sg = clientOf(seen)
+			let base = def () mail.Message {
+				return new mail.Message().from("a@example.com").to("b@example.net").subject("s").text("t")
+			}
+			let noAuthor = new mail.Message().to("b@example.net").text("t")
+			let noRecipient = new mail.Message().from("a@example.com").text("t")
+			let noBody = new mail.Message().from("a@example.com").to("b@example.net")
+			let many string[] = []
+			for let i in 0..11 {
+				many.push("c{i}")
+			}
+			let crowd Personalization[] = []
+			for let i in 0..1001 {
+				crowd.push(Personalization{to: ["r{i}@example.net"]})
+			}
+			let cases = [
+				caught(def () !none { try sg.send(noAuthor); return none }),
+				caught(def () !none { try sg.send(noRecipient); return none }),
+				caught(def () !none { try sg.send(noBody); return none }),
+				caught(def () !none { try sg.send(base(), Options{categories: many}); return none }),
+				caught(def () !none { try sg.send(base(), Options{sendAt: time.now() + 100h}); return none }),
+				caught(def () !none { try sg.send(base(), Options{personalizations: crowd}); return none }),
+				caught(def () !none { try sg.send(new Template("d-1", to = "b@example.net")); return none }),
+				caught(def () !none { try sg.send(new Template("d-1", from = "a@example.com")); return none }),
+				caught(def () !none { try sg.send(new Template("d-1", to = "not an address", from = "a@example.com")); return none }),
+			]
+			for let (i, failure) in cases {
+				fail "case {i} did not fail with Invalid" unless !(failure is none) && failure.kind == ErrorKind.Invalid
+			}
+			assert seen.calls.len() == 0
+			try server.close()
+			return none
+		}
+
+		// SendGrid's refusals map to their kinds with its problems kept; a
+		// 429 is waited out until the retries are spent.
+		@test()
+		def TestErrors() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let sg = clientOf(seen)
+			let message = new mail.Message().from("a@example.com").to("b@example.net").subject("s").text("t")
+			seen.statuses.set("POST /v3/mail/send", 400)
+			seen.replies.set("POST /v3/mail/send", json(map<string, any>{"errors": [map<string, any>{"message": "The from address does not match a verified Sender Identity.", "field": "from", "help": "https://sendgrid.com/docs"}]}))
+			let refused = caught(def () !none { try sg.send(message); return none })
+			fail "the refusal did not fail" when refused is none
+			assert refused.kind == ErrorKind.Invalid && refused.status == 400
+			assert refused.problems.len() == 1 && refused.problems[0].field == "from" && refused.message.contains("verified Sender")
+			let kinds = map<int, ErrorKind>{401: ErrorKind.Auth, 403: ErrorKind.Auth, 404: ErrorKind.NotFound, 413: ErrorKind.Invalid, 500: ErrorKind.Server}
+			for let (status, kind) in kinds {
+				seen.statuses.set("GET /v3/asm/groups/1", status)
+				seen.replies.set("GET /v3/asm/groups/1", "oops")
+				let failure = caught(def () !none { try sg.group(1); return none })
+				fail "status {status} gave no {kind.value}" unless !(failure is none) && failure.kind == kind && failure.status == status
+			}
+			seen.statuses.set("GET /v3/asm/groups/1", 200)
+			seen.replies.set("GET /v3/asm/groups/1", "not json")
+			let garbled = caught(def () !none { try sg.group(1); return none })
+			assert !(garbled is none) && garbled.kind == ErrorKind.Server
+			seen.limited.set("GET /v3/asm/groups", 2)
+			seen.replies.set("GET /v3/asm/groups", json([map<string, any>{"id": 5, "name": "News"}]))
+			let from = seen.calls.len()
+			let groups = try sg.groups()
+			assert groups.len() == 1 && groups[0].name == "News" && seen.calls.len() - from == 3
+			sg.rateLimitRetries = 1
+			seen.limited.set("GET /v3/asm/groups", 5)
+			let limited = caught(def () !none { try sg.groups(); return none })
+			assert !(limited is none) && limited.kind == ErrorKind.RateLimited && limited.status == 429
+			let unreachable = caught(def () !none { try (new Client("SG.x", "http://127.0.0.1:1")).groups(); return none })
+			assert !(unreachable is none) && unreachable.kind == ErrorKind.Transport
+			try server.close()
+			return none
+		}
+
+		// Batches: a new id, pause (created), cancel (changed), resume, and
+		// the list.
+		@test()
+		def TestBatches() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let sg = clientOf(seen)
+			seen.replies.set("POST /v3/mail/batch", json(map<string, any>{"batch_id": "B7"}))
+			seen.replies.set("GET /v3/user/scheduled_sends/B7", "[]")
+			let batch = try sg.newBatch()
+			assert batch == "B7"
+			try sg.pause(batch)
+			seen.replies.set("GET /v3/user/scheduled_sends/B7", json([map<string, any>{"batch_id": "B7", "status": "pause"}]))
+			try sg.cancel(batch)
+			try sg.resume(batch)
+			seen.replies.set("GET /v3/user/scheduled_sends", json([map<string, any>{"batch_id": "B7", "status": "cancel"}]))
+			let known = try sg.scheduled()
+			assert known.len() == 1 && known[0].batch == "B7" && known[0].status == "cancel"
+			let calls = seen.calls.join(",")
+			assert calls == "POST /v3/mail/batch,GET /v3/user/scheduled_sends/B7,POST /v3/user/scheduled_sends,GET /v3/user/scheduled_sends/B7,PATCH /v3/user/scheduled_sends/B7,DELETE /v3/user/scheduled_sends/B7,GET /v3/user/scheduled_sends"
+			assert textOf(bodyAt(seen, 2), "batch_id") == "B7" && textOf(bodyAt(seen, 2), "status") == "pause"
+			assert textOf(bodyAt(seen, 4), "status") == "cancel"
+			try server.close()
+			return none
+		}
+	}
+
+	check "SendGrid account" {
+		// Suppression lists page by offset; entries are looked up, removed
+		// and emptied; global unsubscribes and groups go to the asm routes.
+		@test()
+		def TestSuppressions() !none {
+			let seen = new Seen()
+			let rows any[] = []
+			for let i in 0..500 {
+				rows.push(map<string, any>{"email": "b{i}@example.net", "created": 1700000000, "reason": "550 no such user", "status": "5.1.1"})
+			}
+			let server = try apiServer(seen, def (mux http.ServeMux) !none {
+				try mux.handle("GET /v3/suppression/bounces", def (ctx http.Context) !none {
+					note(seen, "GET /v3/suppression/bounces?{ctx.url().rawQuery}")
+					let offset = ctx.query("offset", "0")
+					return try ctx.text(offset == "0" ?? (json(rows), json([map<string, any>{"email": "last@example.net", "created": 1700000001}])))
+				})
+				return none
+			})
+			let sg = clientOf(seen)
+			let since = time.fromUnixNs(1600000000 * 1000000000)
+			let bounces = try sg.suppressions(SuppressionList.Bounces, since = since).all()
+			assert bounces.len() == 501 && bounces[0].status == "5.1.1" && bounces[500].email == "last@example.net" && bounces[500].created == 1700000001
+			assert seen.calls[0] == "GET /v3/suppression/bounces?start_time=1600000000&limit=500&offset=0"
+			assert seen.calls[1] == "GET /v3/suppression/bounces?start_time=1600000000&limit=500&offset=500"
+			seen.replies.set("GET /v3/suppression/spam_reports/ana@example.net", json([map<string, any>{"email": "ana@example.net", "ip": "10.0.0.1", "created": 1}]))
+			let report = try sg.suppression(SuppressionList.SpamReports, "ana@example.net")
+			assert !(report is none) && report.ip == "10.0.0.1"
+			seen.replies.set("GET /v3/suppression/blocks/ben@example.net", "[]")
+			assert try sg.suppression(SuppressionList.Blocks, "ben@example.net") is none
+			seen.replies.set("GET /v3/asm/suppressions/global/cleo@example.net", json(map<string, any>{"recipient_email": "cleo@example.net"}))
+			let global = try sg.suppression(SuppressionList.Unsubscribes, "cleo@example.net")
+			assert !(global is none) && global.email == "cleo@example.net"
+			assert try sg.suppression(SuppressionList.Unsubscribes, "dan@example.net") is none
+			let from = seen.calls.len()
+			try sg.unsuppress(SuppressionList.Bounces, "a@example.net", "b@example.net")
+			try sg.unsuppressAll(SuppressionList.InvalidEmails)
+			try sg.unsubscribe("x@example.net", "y@example.net")
+			try sg.unsuppress(SuppressionList.Unsubscribes, "x@example.net")
+			let wrong = caught(def () !none { try sg.unsuppressAll(SuppressionList.Unsubscribes); return none })
+			assert !(wrong is none) && wrong.kind == ErrorKind.Invalid
+			assert seen.calls[from:].join(",") == "DELETE /v3/suppression/bounces,DELETE /v3/suppression/invalid_emails,POST /v3/asm/suppressions/global,DELETE /v3/asm/suppressions/global/x@example.net"
+			assert textOf(bodyAt(seen, from), "emails.1") == "b@example.net" && textOf(bodyAt(seen, from + 1), "delete_all") == "true"
+			assert textOf(bodyAt(seen, from + 2), "recipient_emails.1") == "y@example.net"
+			seen.replies.set("POST /v3/asm/groups", json(map<string, any>{"id": 9, "name": "News", "description": "Weekly", "is_default": true}))
+			seen.replies.set("PATCH /v3/asm/groups/9", json(map<string, any>{"id": 9, "name": "Newsletter", "description": "Weekly"}))
+			seen.replies.set("GET /v3/asm/groups/9/suppressions", json(["x@example.net"]))
+			seen.replies.set("GET /v3/asm/suppressions/x@example.net", json(map<string, any>{"suppressions": [map<string, any>{"id": 9, "name": "Newsletter", "suppressed": true, "is_default": false}]}))
+			let made = try sg.createGroup("News", "Weekly", isDefault = true)
+			assert made.id == 9 && made.isDefault
+			made.name = "Newsletter"
+			let saved = try sg.updateGroup(made)
+			assert saved.name == "Newsletter"
+			try sg.suppress(9, "x@example.net")
+			let left = try sg.groupSuppressions(9)
+			assert left.len() == 1 && left[0] == "x@example.net"
+			try sg.unsuppress(9, "x@example.net")
+			let subs = try sg.subscriptions("x@example.net")
+			assert subs.len() == 1 && subs[0].suppressed && subs[0].name == "Newsletter"
+			try sg.deleteGroup(9)
+			let groupCalls = seen.calls[seen.calls.len() - 7:].join(",")
+			assert groupCalls == "POST /v3/asm/groups,PATCH /v3/asm/groups/9,POST /v3/asm/groups/9/suppressions,GET /v3/asm/groups/9/suppressions,DELETE /v3/asm/groups/9/suppressions/x@example.net,GET /v3/asm/suppressions/x@example.net,DELETE /v3/asm/groups/9"
+			try server.close()
+			return none
+		}
+
+		// Templates page by token; templates and versions are made, read,
+		// changed, copied, activated and deleted.
+		@test()
+		def TestTemplates() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen, def (mux http.ServeMux) !none {
+				try mux.handle("GET /v3/templates", def (ctx http.Context) !none {
+					note(seen, "GET /v3/templates?{ctx.url().rawQuery}")
+					return try ctx.text(json(map<string, any>{"result": [map<string, any>{"id": "d-1", "name": "Welcome", "generation": "dynamic"}], "_metadata": map<string, any>{"next": "https://api.sendgrid.com/v3/templates?page_token=T%2F2&page_size=200", "count": 2}})) when ctx.query("page_token", "").len() == 0
+					return try ctx.text(json(map<string, any>{"result": [map<string, any>{"id": "d-2", "name": "Receipt", "generation": "dynamic"}], "_metadata": map<string, any>{"count": 2}}))
+				})
+				return none
+			})
+			let sg = clientOf(seen)
+			let all = try sg.templates().all()
+			assert all.len() == 2 && all[1].id == "d-2"
+			assert seen.calls[0] == "GET /v3/templates?generations=dynamic&page_size=200" && seen.calls[1] == "GET /v3/templates?generations=dynamic&page_size=200&page_token=T%2F2"
+			let version = map<string, any>{"id": "v1", "template_id": "d-1", "name": "First", "subject": "\{\{subject}}", "html_content": "<p>\{\{name}}</p>", "plain_content": "\{\{name}}", "active": 1, "editor": "code", "test_data": "\{\"name\":\"Ana\"}"}
+			seen.replies.set("POST /v3/templates", json(map<string, any>{"id": "d-3", "name": "Fresh", "generation": "legacy"}))
+			seen.replies.set("GET /v3/templates/d-1", json(map<string, any>{"id": "d-1", "name": "Welcome", "generation": "dynamic", "versions": [version]}))
+			seen.replies.set("PATCH /v3/templates/d-1", json(map<string, any>{"id": "d-1", "name": "Hello"}))
+			seen.replies.set("POST /v3/templates/d-1", json(map<string, any>{"id": "d-4", "name": "Copy"}))
+			seen.replies.set("POST /v3/templates/d-1/versions", json(version))
+			seen.replies.set("GET /v3/templates/d-1/versions/v1", json(version))
+			seen.replies.set("PATCH /v3/templates/d-1/versions/v1", json(version))
+			seen.replies.set("POST /v3/templates/d-1/versions/v1/activate", json(version))
+			let fresh = try sg.createTemplate("Fresh", dynamic = false)
+			assert fresh.generation == "legacy"
+			let found = try sg.template("d-1")
+			assert found.versions.len() == 1 && found.versions[0].html == "<p>\{\{name}}</p>" && found.versions[0].active == 1 && found.versions[0].testData == "\{\"name\":\"Ana\"}"
+			assert (try sg.renameTemplate("d-1", "Hello")).name == "Hello"
+			assert (try sg.duplicateTemplate("d-1", "Copy")).id == "d-4"
+			let draft = TemplateVersion{name: "First", subject: "\{\{subject}}", html: "<p>\{\{name}}</p>", generateText: true, active: 1}
+			let added = try sg.createVersion("d-1", draft)
+			assert added.id == "v1"
+			let read = try sg.version("d-1", "v1")
+			read.subject = "Hi"
+			try sg.updateVersion(read)
+			try sg.activate("d-1", "v1")
+			try sg.deleteVersion("d-1", "v1")
+			try sg.deleteTemplate("d-3")
+			let from = 2
+			assert seen.calls[from:].join(",") == "POST /v3/templates,GET /v3/templates/d-1,PATCH /v3/templates/d-1,POST /v3/templates/d-1,POST /v3/templates/d-1/versions,GET /v3/templates/d-1/versions/v1,PATCH /v3/templates/d-1/versions/v1,POST /v3/templates/d-1/versions/v1/activate,DELETE /v3/templates/d-1/versions/v1,DELETE /v3/templates/d-3"
+			assert textOf(bodyAt(seen, from), "generation") == "legacy"
+			assert textOf(bodyAt(seen, from + 4), "generate_plain_content") == "true" && textOf(bodyAt(seen, from + 4), "active") == "1" && at(bodyAt(seen, from + 4), "editor") is none
+			assert textOf(bodyAt(seen, from + 6), "subject") == "Hi" && textOf(bodyAt(seen, from + 6), "editor") == "code"
+			try server.close()
+			return none
+		}
+
+		// Verified senders page by the last id; domains are authenticated,
+		// read, changed, validated and deleted.
+		@test()
+		def TestSendersAndDomains() !none {
+			let seen = new Seen()
+			let first any[] = []
+			for let i in 1..101 {
+				first.push(map<string, any>{"id": i, "from_email": "s{i}@example.com", "verified": true})
+			}
+			let server = try apiServer(seen, def (mux http.ServeMux) !none {
+				try mux.handle("GET /v3/verified_senders", def (ctx http.Context) !none {
+					note(seen, "GET /v3/verified_senders?{ctx.url().rawQuery}")
+					let after = ctx.query("lastSeenID", "")
+					return try ctx.text(json(map<string, any>{"results": after.len() == 0 ?? (first, [map<string, any>{"id": 101, "from_email": "last@example.com"}])}))
+				})
+				return none
+			})
+			let sg = clientOf(seen)
+			let senders = try sg.senders().all()
+			assert senders.len() == 101 && senders[0].verified && senders[100].fromEmail == "last@example.com"
+			assert seen.calls[1] == "GET /v3/verified_senders?limit=100&lastSeenID=100"
+			seen.replies.set("POST /v3/verified_senders", json(map<string, any>{"id": 7, "nickname": "Orders", "from_email": "orders@example.com", "locked": false}))
+			seen.replies.set("PATCH /v3/verified_senders/7", json(map<string, any>{"id": 7, "nickname": "Shop orders", "from_email": "orders@example.com"}))
+			let made = try sg.createSender(Sender{nickname: "Orders", fromEmail: "orders@example.com", fromName: "Shop", replyTo: "help@example.com", address: "1 Main St", city: "Cluj", country: "Romania"})
+			assert made.id == 7
+			made.nickname = "Shop orders"
+			assert (try sg.updateSender(made)).nickname == "Shop orders"
+			try sg.resendVerification(7)
+			try sg.verifySender("tok/1")
+			try sg.deleteSender(7)
+			let from = 2
+			assert seen.calls[from:].join(",") == "POST /v3/verified_senders,PATCH /v3/verified_senders/7,POST /v3/verified_senders/resend/7,GET /v3/verified_senders/verify/tok%2F1,DELETE /v3/verified_senders/7"
+			assert textOf(bodyAt(seen, from), "from_name") == "Shop" && at(bodyAt(seen, from), "zip") is none
+			let domain = map<string, any>{"id": 3, "domain": "example.com", "subdomain": "em", "valid": false, "automatic_security": true, "default": true, "dns": map<string, any>{"mail_cname": map<string, any>{"valid": false, "type": "cname", "host": "em.example.com", "data": "u1.wl.sendgrid.net"}, "dkim1": map<string, any>{"type": "cname", "host": "s1._domainkey.example.com", "data": "s1.domainkey.u1.wl.sendgrid.net"}}}
+			seen.replies.set("POST /v3/whitelabel/domains", json(domain))
+			seen.replies.set("GET /v3/whitelabel/domains", json([domain]))
+			seen.replies.set("GET /v3/whitelabel/domains/3", json(domain))
+			seen.replies.set("PATCH /v3/whitelabel/domains/3", json(domain))
+			seen.replies.set("POST /v3/whitelabel/domains/3/validate", json(map<string, any>{"id": 3, "valid": false, "validation_results": map<string, any>{"mail_cname": map<string, any>{"valid": false, "reason": "Expected CNAME to match"}, "dkim1": map<string, any>{"valid": true, "reason": none}}}))
+			let authenticated = try sg.authenticate("example.com", subdomain = "em", dkimSelector = "adm")
+			assert authenticated.id == 3 && authenticated.isDefault && authenticated.dns.mailCname.host == "em.example.com" && authenticated.dns.dkim1.kind == "cname"
+			let listed = try sg.domains().all()
+			assert listed.len() == 1
+			assert (try sg.domain(3)).domain == "example.com"
+			try sg.updateDomain(3, customSpf = true)
+			let result = try sg.validateDomain(3)
+			assert !result.valid && !result.results.mailCname.valid && result.results.dkim1.valid && result.results.dkim1.reason is none
+			let reason = result.results.mailCname.reason
+			assert !(reason is none) && reason.contains("CNAME")
+			try sg.deleteDomain(3)
+			let start = seen.calls.len() - 6
+			assert seen.calls[start:].join(",") == "POST /v3/whitelabel/domains,GET /v3/whitelabel/domains?limit=100&offset=0,GET /v3/whitelabel/domains/3,PATCH /v3/whitelabel/domains/3,POST /v3/whitelabel/domains/3/validate,DELETE /v3/whitelabel/domains/3"
+			let asked = bodyAt(seen, start)
+			assert textOf(asked, "custom_dkim_selector") == "adm" && textOf(asked, "automatic_security") == "true" && at(asked, "ips") is none
+			let changed = bodyAt(seen, start + 3)
+			assert textOf(changed, "custom_spf") == "true" && at(changed, "default") is none
+			try server.close()
+			return none
+		}
+
+		// Statistics go to the route of their breakdown with its filter;
+		// the activity feed takes a query; the webhook key is read and set.
+		@test()
+		def TestStatsAndActivity() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let sg = clientOf(seen)
+			let rows = json([map<string, any>{"date": "2026-10-01", "stats": [map<string, any>{"type": "category", "name": "receipt", "metrics": map<string, any>{"delivered": 40, "opens": 12, "unique_opens": 9, "bounces": 1}}]}])
+			seen.replies.set("GET /v3/stats", rows)
+			seen.replies.set("GET /v3/categories/stats", rows)
+			seen.replies.set("GET /v3/geo/stats", rows)
+			let global = try sg.stats(new time.Date(2026, 10, 1), until = new time.Date(2026, 10, 7))
+			assert global.len() == 1 && global[0].stats[0].metrics.uniqueOpens == 9 && global[0].stats[0].kind == "category"
+			try sg.stats(new time.Date(2026, 10, 1), by = Period.Week, breakdown = Breakdown.Categories, names = ["receipt", "news"])
+			try sg.stats(new time.Date(2026, 10, 1), by = Period.Month, breakdown = Breakdown.Geo, names = ["US"])
+			assert seen.calls[0] == "GET /v3/stats?aggregated_by=day&end_date=2026-10-07&start_date=2026-10-01"
+			assert seen.calls[1] == "GET /v3/categories/stats?aggregated_by=week&categories=receipt&categories=news&start_date=2026-10-01"
+			assert seen.calls[2] == "GET /v3/geo/stats?aggregated_by=month&country=US&start_date=2026-10-01"
+			let noFilter = caught(def () !none { try sg.stats(new time.Date(2026, 10, 1), breakdown = Breakdown.Devices, names = ["Phone"]); return none })
+			assert !(noFilter is none) && noFilter.kind == ErrorKind.Invalid
+			let noCategory = caught(def () !none { try sg.stats(new time.Date(2026, 10, 1), breakdown = Breakdown.Categories); return none })
+			assert !(noCategory is none) && noCategory.kind == ErrorKind.Invalid
+			seen.replies.set("GET /v3/messages", json(map<string, any>{"messages": [map<string, any>{"msg_id": "m1", "from_email": "a@example.com", "to_email": "b@example.net", "subject": "s", "status": "delivered", "opens_count": 2, "clicks_count": 1, "last_event_time": "2026-10-01T10:00:00Z"}]}))
+			seen.replies.set("GET /v3/messages/m1", json(map<string, any>{"msg_id": "m1", "status": "delivered", "asm_group_id": 4, "categories": ["receipt"], "unique_args": map<string, any>{"order": "7"}, "events": [map<string, any>{"event_name": "processed", "processed": "2026-10-01T09:59:58Z"}, map<string, any>{"event_name": "delivered", "mx_server": "mx.example.net", "attempt_num": 1}]}))
+			let feed = try sg.activity("to_email=\"b@example.net\"", limit = 20)
+			assert feed.len() == 1 && feed[0].opens == 2 && feed[0].to == "b@example.net"
+			assert seen.calls[3] == "GET /v3/messages?limit=20&query=to_email%3D%22b%40example.net%22"
+			let detail = try sg.activityOf("m1")
+			assert detail.events.len() == 2 && detail.events[1].mxServer == "mx.example.net" && detail.group == 4 && textOf(detail.args, "order") == "7"
+			seen.replies.set("GET /v3/user/webhooks/event/settings/signed", json(map<string, any>{"public_key": "PK"}))
+			seen.replies.set("PATCH /v3/user/webhooks/event/settings/signed", json(map<string, any>{"public_key": "PK2"}))
+			assert try sg.webhookKey() == "PK"
+			assert try sg.signWebhook(true) == "PK2"
+			assert textOf(bodyAt(seen, seen.calls.len() - 1), "enabled") == "true"
+			try server.close()
+			return none
+		}
+
+		// Against SendGrid itself, when a key and a verified sender are
+		// given: a message and a template check in the sandbox mode,
+		// reading templates, groups, bounces and statistics.
+		@test()
+		def TestLive() !none {
+			return none when liveKey.len() == 0 || liveFrom.len() == 0
+			let sg = new Client(liveKey)
+			let message = new mail.Message().from(liveFrom).to(liveFrom).subject("adm.notify.sendgrid test").text("Sent in the sandbox mode.")
+			message.attach("note.txt", "hello from adm".bytes())
+			try sg.send(message, Options{sandbox: true, categories: ["adm-test"], args: {"run": "live"}})
+			let bad = caught(def () !none { try sg.send(new mail.Message().from(liveFrom).to("not-an-address@").subject("s").text("t"), Options{sandbox: true}); return none })
+			assert !(bad is none)
+			try sg.templates().next()
+			try sg.groups()
+			try sg.suppressions(SuppressionList.Bounces).next()
+			let today = time.now()
+			try sg.stats(new time.Date(today.year(), 1, 1))
+			return none
+		}
+	}
+}
