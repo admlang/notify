@@ -1,0 +1,505 @@
+partial module adm.notify.telegram {
+	use (
+		std.os
+		std.bytes
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.net.multipart
+		std.data.encoding::(JSON)
+	)
+
+	// A bot token and a chat for the live test, which sends, edits, uploads
+	// to and deletes in a real chat.
+	@env("ADM_TEST_TELEGRAM_TOKEN")
+	internal const liveToken string
+
+	@env("ADM_TEST_TELEGRAM_CHAT")
+	internal const liveChat string
+
+	// A file part the loopback server received.
+	internal struct Received {
+		filename    string
+		contentType string
+		data        byte[]
+	}
+
+	// What the loopback server was asked, and what it answers.
+	internal type Seen {
+		methods string[]
+		tokens  string[]
+		types   string[]
+		lengths string[]
+		sizes   int[]
+		// The JSON body of each call, or its form fields as text.
+		bodies  map<string, any>[]
+		files   map<string, Received>[]
+		// The answer of a method: its JSON text; `{"ok":true,"result":true}`
+		// when none.
+		replies map<string, string>
+		// Answers given in turn before `replies` takes over.
+		queued  map<string, string[]>
+		// The files served under /file/, by path.
+		served  map<string, byte[]>
+		base    string                  = ""
+
+		def new() {}
+	}
+
+	internal def json(value any) string {
+		return string((new JSON()).encode(value))
+	}
+
+	internal def ok(result any) string {
+		return json(map<string, any>{"ok": true, "result": result})
+	}
+
+	internal const messageReply = "\{\"ok\":true,\"result\":\{\"message_id\":7,\"date\":1700000000,\"chat\":\{\"id\":42,\"type\":\"private\",\"first_name\":\"Ada\"},\"from\":\{\"id\":1,\"is_bot\":true,\"first_name\":\"Bot\"},\"text\":\"hi\"}}"
+
+	// A server that answers as the Bot API under /tg/: methods at
+	// `/tg/bot<token>/<method>`, files at `/tg/file/bot<token>/<path>`.
+	internal def telegramServer(seen Seen) !httptest.Server {
+		let mux = new http.ServeMux()
+		try mux.handle("/tg/", def (ctx http.Context) !none {
+			let rest = ctx.path()[4:]
+			if rest.startsWith("file/bot") {
+				let path = rest[rest.indexOf("/", 5) + 1:]
+				let found = seen.served.get(path)
+				return try ctx.text(404, "\{\"ok\":false,\"error_code\":404,\"description\":\"Not Found\"}") when found is none
+				return try ctx.blob(200, "application/octet-stream", found)
+			}
+			let slash = rest.lastIndexOf("/")
+			let method = rest[slash + 1:]
+			seen.methods.push(method)
+			seen.tokens.push(rest[3:rest.indexOf("/")])
+			let kind = ctx.header("Content-Type")
+			seen.types.push(kind)
+			seen.lengths.push(ctx.header("Content-Length"))
+			let data = try ctx.bytes()
+			seen.sizes.push(data.len())
+			let fields = new map<string, any>()
+			let files = new map<string, Received>()
+			if kind.startsWith("multipart/") {
+				let reader = try multipart.readerFor(new bytes.Buffer(data), kind)
+				for {
+					let part = try reader.nextPart()
+					break when part is none
+					let name = part.fileName()
+					if name is none {
+						fields.set(part.formName(), try part.text())
+					} else {
+						files.set(part.formName(), Received{filename: name, contentType: part.header("Content-Type"), data: try part.bytes()})
+					}
+				}
+			} else {
+				let parsed = try (new JSON()).parse(string(data))
+				fields = parsed is map<string, any> ?? (parsed, fields)
+			}
+			seen.bodies.push(fields)
+			seen.files.push(files)
+			let waiting = seen.queued.get(method)
+			if !(waiting is none) && waiting.len() > 0 {
+				let next = waiting.shift()
+				let parsed = try (new JSON()).parse(next)
+				let status = parsed is map<string, any> && !boolAt(parsed, "ok") ?? (intAt(parsed, "error_code"), 200)
+				return try ctx.text(status, next)
+			}
+			let reply = seen.replies.get(method)
+			return try ctx.text(reply is none ?? ("\{\"ok\":true,\"result\":true}", reply))
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		seen.base = "http://{server.address().str()}/tg"
+		return server
+	}
+
+	internal def botOf(seen Seen) Bot {
+		let bot = new Bot("123:abc", seen.base)
+		bot.paced = false
+		return bot
+	}
+
+	// The text of field `key` of call `at`.
+	internal def field(seen Seen, at int, key string) string {
+		let v = seen.bodies[at].get(key)
+		return "" when v is none
+		return v when v is string
+		return json(v)
+	}
+
+	// Fails unless the last call was of `method` with each of `keys`.
+	internal def calledWith(seen Seen, method string, keys string[]) !none {
+		let at = seen.methods.len() - 1
+		fail "{method} was not called" when at < 0 || seen.methods[at] != method
+		for let key in keys {
+			fail "{method} was called without {key}" when seen.bodies[at].get(key) is none
+		}
+		return none
+	}
+
+	// The TelegramError `run` fails with. Fails when it succeeds or fails
+	// otherwise.
+	internal def failureOf(run def() !none) !TelegramError {
+		let result = run()
+		if result is error {
+			return result when result is TelegramError
+			fail "failed with \"{result.message}\", not a TelegramError"
+		}
+		fail "did not fail"
+	}
+
+	check "Telegram Bot API" {
+		// A message goes out as JSON with the token in the path; the
+		// keyboard, the reply and the preview options are objects and
+		// unset options are left out; the answer comes back typed.
+		@test()
+		def TestSendMessage() !none {
+			let seen = new Seen()
+			seen.replies.set("sendMessage", messageReply)
+			let server = try telegramServer(seen)
+			let bot = botOf(seen)
+			let keyboard = new InlineKeyboard()
+			keyboard.button("Approve", callback = "approve:42").button("Reject", callback = "reject:42", variant = "danger")
+			keyboard.row().button("Notes", url = "https://example.com/notes")
+			assert keyboard.markup().inlineKeyboard.len() == 2
+			let sent = try bot.send(42, "*Release*", parseMode = ParseMode.MarkdownV2, keyboard = keyboard, replyTo = 5, preview = false)
+			assert sent.messageId == 7 && sent.chat.id == 42 && sent.chat.kind == "private" && sent.text == "hi"
+			let from = sent.from
+			assert !(from is none) && from.isBot && from.firstName == "Bot"
+			assert seen.methods.join(",") == "sendMessage"
+			assert seen.tokens[0] == "123:abc" && seen.types[0] == "application/json"
+			assert field(seen, 0, "chat_id") == "42" && field(seen, 0, "text") == "*Release*" && field(seen, 0, "parse_mode") == "MarkdownV2"
+			assert field(seen, 0, "reply_markup") == "\{\"inline_keyboard\":[[\{\"text\":\"Approve\",\"callback_data\":\"approve:42\"},\{\"text\":\"Reject\",\"style\":\"danger\",\"callback_data\":\"reject:42\"}],[\{\"text\":\"Notes\",\"url\":\"https://example.com/notes\"}]]}"
+			assert field(seen, 0, "reply_parameters") == "\{\"message_id\":5,\"allow_sending_without_reply\":true}"
+			assert field(seen, 0, "link_preview_options") == "\{\"is_disabled\":true}"
+			assert seen.bodies[0].get("disable_notification") is none
+			try server.close()
+			return none
+		}
+
+		// A method answering `true` returns true; an edit answering `true`
+		// (an inline message) returns none, one answering the message
+		// returns it.
+		@test()
+		def TestResultShapes() !none {
+			let seen = new Seen()
+			let server = try telegramServer(seen)
+			let bot = botOf(seen)
+			assert try bot.deleteMessage("@channel", 9)
+			assert try bot.editMessageText(inlineMessageId = "AAA", text = "new") is none
+			seen.replies.set("editMessageText", messageReply)
+			let edited = try bot.editMessageText(chatId = 42, messageId = 7, text = "new")
+			assert !(edited is none) && edited.messageId == 7
+			seen.replies.set("getChatMemberCount", ok(12))
+			assert try bot.chatMemberCount(-100) == 12
+			seen.replies.set("getChatMember", ok(map<string, any>{"status": "administrator", "user": map<string, any>{"id": 3, "is_bot": false, "first_name": "Eve"}, "can_delete_messages": true}))
+			let member = try bot.chatMember(-100, 3)
+			assert member.status == "administrator" && member.canDeleteMessages
+			seen.replies.set("getMyCommands", ok([map<string, any>{"command": "start", "description": "Start"}]))
+			let commands = try bot.myCommands()
+			assert commands.len() == 1 && commands[0].command == "start"
+			assert field(seen, 0, "chat_id") == "@channel" && field(seen, 1, "inline_message_id") == "AAA"
+			try bot.sendPhoto(42, fileURL("https://example.com/a.png"))
+			assert field(seen, seen.methods.len() - 1, "photo") == "https://example.com/a.png"
+			try server.close()
+			return none
+		}
+
+		// Telegram's errors come back with their kind: a missing chat, a
+		// blocked bot, a refused token, a group that moved, a conflict.
+		@test()
+		def TestErrors() !none {
+			let seen = new Seen()
+			let server = try telegramServer(seen)
+			let bot = botOf(seen)
+			let cases = [
+				("\{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: chat not found\"}", ErrorKind.NotFound),
+				("\{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message text is empty\"}", ErrorKind.Invalid),
+				("\{\"ok\":false,\"error_code\":403,\"description\":\"Forbidden: bot was blocked by the user\"}", ErrorKind.Forbidden),
+				("\{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}", ErrorKind.Auth),
+				("\{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: group chat was upgraded to a supergroup chat\",\"parameters\":\{\"migrate_to_chat_id\":-1001234}}", ErrorKind.Migrated),
+				("\{\"ok\":false,\"error_code\":409,\"description\":\"Conflict: terminated by other getUpdates request\"}", ErrorKind.Conflict),
+			]
+			for let (_, entry) in cases {
+				let (answer, want) = entry
+				seen.queued.set("sendMessage", [answer])
+				let got = try failureOf(def () !none {
+					try bot.send(42, "hi")
+					return none
+				})
+				assert got.kind == want
+				assert got.migrateToChatId == -1001234 when want == ErrorKind.Migrated
+				assert got.description.len() > 0 && got.errorCode > 0
+			}
+			try server.close()
+			return none
+		}
+
+		// A 429 is waited out for the time Telegram asked and sent again.
+		@test()
+		def TestRateLimitIsWaitedOut() !none {
+			let seen = new Seen()
+			seen.queued.set("sendMessage", ["\{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests: retry after 1\",\"parameters\":\{\"retry_after\":1}}"])
+			seen.replies.set("sendMessage", messageReply)
+			let server = try telegramServer(seen)
+			let bot = botOf(seen)
+			let sent = try bot.send(42, "hi")
+			assert sent.messageId == 7 && seen.methods.len() == 2
+			bot.rateLimitRetries = 0
+			seen.queued.set("sendMessage", ["\{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests: retry after 3\",\"parameters\":\{\"retry_after\":3}}"])
+			let refused = try failureOf(def () !none {
+				try bot.send(42, "hi")
+				return none
+			})
+			let after = refused.retryAfter
+			assert refused.kind == ErrorKind.RateLimited && !(after is none) && after == 3s
+			try server.close()
+			return none
+		}
+
+		// An upload goes as multipart/form-data with a Content-Length: the
+		// file under the parameter's name with its name and type, the other
+		// parameters as text or JSON. A file given by path is streamed.
+		@test()
+		def TestUploads() !none {
+			let seen = new Seen()
+			seen.replies.set("sendPhoto", messageReply)
+			seen.replies.set("sendDocument", messageReply)
+			let server = try telegramServer(seen)
+			let bot = botOf(seen)
+			let png = [byte(0x89), byte(0x50), byte(0x4E), byte(0x47), byte(0), byte(1)]
+			try bot.sendPhoto(42, upload("chart.png", png), caption = "This week", replyMarkup = removeKeyboard())
+			assert seen.types[0].startsWith("multipart/form-data; boundary=")
+			assert seen.lengths[0] == "{seen.sizes[0]}"
+			let photo = seen.files[0].get("photo")
+			assert !(photo is none) && photo.filename == "chart.png" && photo.contentType == "image/png" && photo.data.equals(png)
+			assert field(seen, 0, "chat_id") == "42" && field(seen, 0, "caption") == "This week"
+			assert field(seen, 0, "reply_markup") == "\{\"remove_keyboard\":true}"
+			let temp = try os.tempFile("adm-telegram-")
+			let path = temp.path()
+			let content = "report line\n".repeat(20000).bytes()
+			try temp.write(content)
+			try temp.close()
+			try bot.sendDocument(42, upload(path, name = "report.txt"))
+			os.remove(path) onerror recover none
+			let document = seen.files[1].get("document")
+			assert !(document is none) && document.filename == "report.txt" && document.data.equals(content)
+			assert seen.lengths[1] == "{seen.sizes[1]}" && seen.sizes[1] > content.len()
+			try server.close()
+			return none
+		}
+
+		// A media group sends its uploads as parts named by the `attach://`
+		// names its objects carry, and its file ids as they are.
+		@test()
+		def TestMediaGroup() !none {
+			let seen = new Seen()
+			seen.replies.set("sendMediaGroup", "\{\"ok\":true,\"result\":[" + messageReply[20:messageReply.len() - 1] + "]}")
+			let server = try telegramServer(seen)
+			let bot = botOf(seen)
+			let media any[] = [
+				InputMediaPhoto{kind: "photo", media: fileId("AgAD-old"), caption: "before"},
+				InputMediaPhoto{kind: "photo", media: upload("after.jpg", [byte(1), byte(2), byte(3)]), caption: "after"},
+			]
+			let sent = try bot.sendMediaGroup(42, media)
+			assert sent.len() == 1 && sent[0].messageId == 7
+			assert field(seen, 0, "media") == "[\{\"type\":\"photo\",\"media\":\"AgAD-old\",\"caption\":\"before\"},\{\"type\":\"photo\",\"media\":\"attach://file0\",\"caption\":\"after\"}]"
+			let part = seen.files[0].get("file0")
+			assert !(part is none) && part.filename == "after.jpg" && part.data.len() == 3
+			try server.close()
+			return none
+		}
+
+		// A local Bot API server gets a file given by path as its
+		// `file://` address, in JSON, instead of an upload.
+		@test()
+		def TestLocalServerPassesPaths() !none {
+			let seen = new Seen()
+			seen.replies.set("sendVideo", messageReply)
+			let server = try telegramServer(seen)
+			let bot = botOf(seen)
+			bot.local = true
+			try bot.sendVideo(42, upload("/srv/videos/demo.mp4"))
+			assert seen.types[0] == "application/json"
+			assert field(seen, 0, "video") == "file:///srv/videos/demo.mp4"
+			try bot.sendVideo(42, upload("clip.mp4", [byte(9)]))
+			assert !(seen.files[1].get("video") is none)
+			try server.close()
+			return none
+		}
+
+		// Long polling hands out the updates in order, asks from the one
+		// after the last, and ends on a failure waiting does not cure.
+		@test()
+		def TestUpdates() !none {
+			let seen = new Seen()
+			seen.queued.set("getUpdates", [
+				ok([map<string, any>{"update_id": 10, "message": map<string, any>{"message_id": 1, "date": 1, "chat": map<string, any>{"id": 42, "type": "private"}, "text": "one"}}, map<string, any>{"update_id": 11, "callback_query": map<string, any>{"id": "q1", "from": map<string, any>{"id": 42, "is_bot": false, "first_name": "Ada"}, "chat_instance": "c", "data": "approve:42"}}]),
+				"\{\"ok\":false,\"error_code\":409,\"description\":\"Conflict: can't use getUpdates method while webhook is active\"}",
+			])
+			let server = try telegramServer(seen)
+			let bot = botOf(seen)
+			let stream = try bot.updates(timeout = 30s, allowed = ["message", "callback_query"])
+			let got string[] = []
+			let first = stream.iterate()
+			fail "no first update" when first is none
+			assert first.updateId == 10
+			let opening = first.message
+			got.push(opening.text) unless opening is none
+			for let update in stream {
+				let message = update.message
+				let query = update.callbackQuery
+				got.push(message.text) unless message is none
+				got.push(query.data) unless query is none
+			}
+			assert got.join(",") == "one,approve:42"
+			let failure = stream.failure
+			assert !(failure is none) && failure.kind == ErrorKind.Conflict
+			assert field(seen, 0, "timeout") == "30" && field(seen, 0, "allowed_updates") == "[\"message\",\"callback_query\"]"
+			assert field(seen, 0, "offset") == "" && field(seen, 1, "offset") == "12"
+			try stream.confirm()
+			assert field(seen, 2, "offset") == "12" && field(seen, 2, "timeout") == "0"
+			stream.stop()
+			assert try stream.next() is none
+			try server.close()
+			return none
+		}
+
+		// The webhook takes a posted update with the secret, refuses one
+		// without it or that is no update, and fails when the handler does.
+		@test()
+		def TestWebhook() !none {
+			let got string[] = []
+			let hook = webhook("s3cret", def (update Update) !none {
+				let message = update.message
+				fail "handler failed" when !(message is none) && message.text == "boom"
+				got.push(message.text) unless message is none
+				return none
+			})
+			let update = "\{\"update_id\":1,\"message\":\{\"message_id\":1,\"date\":1,\"chat\":\{\"id\":42,\"type\":\"private\"},\"text\":\"hello\"}}"
+			let send = def (method http.Method, secret string, body string) !int {
+				let req = try httptest.newRequest(method, "/hook", body)
+				req.headers.set("Content-Type", "application/json")
+				req.headers.set("X-Telegram-Bot-Api-Secret-Token", secret) when secret.len() > 0
+				let recorder = new httptest.ResponseRecorder()
+				let served = hook.serve(recorder.context(req))
+				return -1 when served is error
+				return recorder.result().status
+			}
+			assert try send(http.Method.POST, "s3cret", update) == 200
+			assert try send(http.Method.POST, "wrong", update) == 401
+			assert try send(http.Method.POST, "", update) == 401
+			assert try send(http.Method.POST, "s3cret", "not json") == 400
+			assert try send(http.Method.POST, "s3cret", update.replace("hello", "boom")) == -1
+			assert try send(http.Method.GET, "s3cret", "") == 405
+			assert got.join(",") == "hello"
+			return none
+		}
+
+		// A download asks for the file's path, then reads it from /file/,
+		// whole or into a file.
+		@test()
+		def TestDownload() !none {
+			let seen = new Seen()
+			seen.replies.set("getFile", ok(map<string, any>{"file_id": "F1", "file_unique_id": "u", "file_size": 4, "file_path": "photos/a.jpg"}))
+			seen.served.set("photos/a.jpg", [byte(1), byte(2), byte(3), byte(4)])
+			let server = try telegramServer(seen)
+			let bot = botOf(seen)
+			let data = try bot.download("F1")
+			assert data.len() == 4 && data[3] == byte(4)
+			let temp = try os.tempFile("adm-telegram-")
+			let path = temp.path()
+			try temp.close()
+			try bot.download("F1", path)
+			let written = try os.readFile(path)
+			os.remove(path) onerror recover none
+			assert written.len() == 4
+			seen.replies.set("getFile", ok(map<string, any>{"file_id": "F2", "file_unique_id": "v", "file_path": "gone.jpg"}))
+			let missing = try failureOf(def () !none {
+				try bot.download("F2")
+				return none
+			})
+			assert missing.kind == ErrorKind.NotFound
+			let address = try bot.fileAddress(File{fileId: "F1", fileUniqueId: "u", filePath: "photos/a.jpg"})
+			assert address == "{seen.base}/file/bot123:abc/photos/a.jpg"
+			try server.close()
+			return none
+		}
+
+		// Reply keyboards, forced replies and the call without a token.
+		@test()
+		def TestKeyboardsAndToken() !none {
+			let keyboard = new ReplyKeyboard()
+			keyboard.button("Share my number", contact = true).row().button("Quiz", poll = "quiz").button("Cancel")
+			keyboard.oneTime = true
+			keyboard.placeholder = "Pick one"
+			assert keyboard.markup().keyboard[1].len() == 2
+			assert string(keyboard.json()) == "\{\"keyboard\":[[\{\"text\":\"Share my number\",\"request_contact\":true}],[\{\"text\":\"Quiz\",\"request_poll\":\{\"type\":\"quiz\"}},\{\"text\":\"Cancel\"}]],\"resize_keyboard\":true,\"one_time_keyboard\":true,\"input_field_placeholder\":\"Pick one\"}"
+			assert json(forceReply("Your name")) == "\{\"force_reply\":true,\"input_field_placeholder\":\"Your name\"}"
+			let bot = new Bot(none, "http://127.0.0.1:1/tg")
+			bot.token = none
+			let failed = try failureOf(def () !none {
+				try bot.me()
+				return none
+			})
+			assert failed.kind == ErrorKind.Auth
+			return none
+		}
+
+		// MarkdownV2 and HTML escaping.
+		@test()
+		def TestEscaping() {
+			assert escapeMarkdown("v1.4 (beta) - 50% off!") == "v1\\.4 \\(beta\\) \\- 50% off\\!"
+			assert escapeMarkdown("a`b\\c*", MarkdownPart.Code) == "a\\`b\\\\c*"
+			assert escapeMarkdown("https://x.org/a_(b)", MarkdownPart.Link) == "https://x.org/a_(b\\)"
+			assert escapeMarkdown("plain") == "plain"
+			assert escapeHTML("<b>\"R&D\"</b>") == "&lt;b&gt;&quot;R&amp;D&quot;&lt;/b&gt;"
+		}
+
+		// Messages to one chat keep a second apart, a group's take a burst
+		// of twenty, and paid broadcasts skip the bot's own limit.
+		@test()
+		def TestPacing() {
+			let limits = new Limiter()
+			assert limits.waitFor("42", false) == 0s
+			let wait = limits.waitFor("42", false)
+			assert wait > 900ms && wait <= 1s
+			assert limits.waitFor("43", false) == 0s
+			for let i = 0; i < 20; i++ {
+				assert limits.waitFor("-100", false) == 0s
+			}
+			assert limits.waitFor("-100", false) > 2s
+			assert limits.waitFor("", false) == 0s
+			let busy = new Limiter()
+			for let i = 0; i < 30; i++ {
+				assert busy.waitFor("{i}", false) == 0s
+			}
+			assert busy.waitFor("31", false) > 0s
+			assert busy.waitFor("31", true) == 0s
+			busy.block("", 5s)
+			assert busy.waitFor("", false) > 4s
+		}
+
+		// Against a real bot and chat: send, edit, upload and delete.
+		@test()
+		def TestLive() !none {
+			return none when liveToken.len() == 0 || liveChat.len() == 0
+			let bot = new Bot(liveToken)
+			let me = try bot.me()
+			assert me.isBot
+			let chat = liveChat.isNumeric() || liveChat.startsWith("-") ?? (liveChat.toInt<int>(), liveChat)
+			let keyboard = new InlineKeyboard()
+			keyboard.button("adm", url = "https://adm-lang.dev")
+			let sent = try bot.send(chat, "adm\\.notify\\.telegram *test*", parseMode = ParseMode.MarkdownV2, keyboard = keyboard, silent = true)
+			let edited = try bot.editMessageText(chatId = chat, messageId = sent.messageId, text = "edited")
+			assert !(edited is none) && edited.text == "edited"
+			let doc = try bot.sendDocument(chat, upload("adm-test.txt", "hello from adm".bytes()), disableNotification = true)
+			let file = doc.document
+			fail "the document came back without its file" when file is none
+			let back = try bot.download(file.fileId)
+			assert string(back) == "hello from adm"
+			assert try bot.deleteMessages(chat, [sent.messageId, doc.messageId])
+			return none
+		}
+	}
+}

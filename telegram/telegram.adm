@@ -1,3 +1,436 @@
+// A Telegram Bot API client over std.net.http: every method of the Bot
+// API (`types.adm` and `methods.adm` hold its objects and methods, named
+// as the API names them), uploads streamed from files or bytes, keyboard
+// builders, updates by long polling or a webhook handler that checks the
+// secret token, MarkdownV2 and HTML escaping, file downloads, and a local
+// Bot API server through `baseURL`.
+//
+// ```
+// let bot = new telegram.Bot(token)                 // TELEGRAM_BOT_TOKEN when left out
+// try bot.send(chatId, "Release *1\\.4* is out", parseMode = telegram.ParseMode.MarkdownV2)
+// try bot.sendPhoto(chatId, telegram.upload("chart.png"), caption = "This week")
+//
+// for let update in bot.updates() {
+//     let message = update.message
+//     continue when message is none
+//     try bot.reply(message, "Got it")
+// }
+// ```
 partial module adm.notify.telegram {
-	// Telegram Bot API over std.net.http: send messages, media and files, keyboards, updates by long polling or webhook, inline queries, payments, a local Bot API server base URL
+	use (
+		std.bytes
+		std.errors
+		std.time
+		std.os
+		std.formats
+		std.reflection
+		std.reflection::(FieldKind)
+		std.net.http
+		std.net.multipart
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON)
+	)
+
+	// The Bot API's address; `baseURL` replaces it for a local Bot API
+	// server, a proxy or a test server.
+	const apiURL = "https://api.telegram.org"
+
+	// The library's version, in the User-Agent of every request.
+	const libraryVersion = "0.1.0"
+
+	// What went wrong, for the caller that acts on it.
+	enum ErrorKind {
+		// The token is missing or Telegram does not know it (401).
+		Auth        = "auth",
+		// The bot may not act in that chat: the user blocked it, it was
+		// removed from the group, or it lacks the rights (403).
+		Forbidden   = "forbidden",
+		// Telegram refused the pace: `retryAfter` says how long to wait.
+		RateLimited = "ratelimited",
+		// The request breaks a rule: an argument Telegram rejects, a message
+		// that cannot be edited, text that does not parse (400).
+		Invalid     = "invalid",
+		// No chat, message, user or file of that id.
+		NotFound    = "notfound",
+		// The group became a supergroup: `migrateToChatId` is its new id.
+		Migrated    = "migrated",
+		// Another poller or a webhook holds the bot's updates (409).
+		Conflict    = "conflict",
+		// Telegram could not be reached, or the connection dropped.
+		Transport   = "transport",
+		// Telegram failed, or answered with something that is not its API.
+		Server      = "server",
+	}
+
+	// The failure of every call here. `description` is Telegram's text
+	// (`Bad Request: chat not found`), `errorCode` its code, `status` the
+	// HTTP status (0 when none came back), `retryAfter` the pause a rate
+	// limit asked for and `migrateToChatId` the new id of a group that
+	// became a supergroup.
+	struct TelegramError {
+		message         string
+		code            string
+		cause           ?error
+		stack           errors.StackTrace
+		kind            ErrorKind
+		status          int
+		errorCode       int
+		description     string
+		retryAfter      ?duration
+		migrateToChatId int
+	}
+
+	// How the text of a message is formatted.
+	enum ParseMode {
+		// Telegram's MarkdownV2: `*bold*`, `_italic_`, `` `code` ``,
+		// `[text](url)`; `escapeMarkdown` makes text literal.
+		MarkdownV2 = "MarkdownV2",
+		// The HTML subset Telegram reads: `<b>`, `<i>`, `<code>`, `<a>`;
+		// `escapeHTML` makes text literal.
+		HTML       = "HTML",
+		// The older Markdown, kept for bots written for it.
+		Markdown   = "Markdown",
+	}
+
+	// A bot: a connection to the Bot API as one token. Every method of the
+	// API is a method of Bot with the API's name, less a `get` prefix
+	// (`sendMessage`, `chatMember` for getChatMember, ...), and its
+	// parameters: the required ones in order, the rest named, a
+	// chat as its id (int) or `@username` (string), a keyboard as a builder
+	// or a markup.
+	//
+	// Messages to one chat go out at most one a second, to a group or
+	// channel twenty a minute, and thirty a second in all (`paced`); a 429
+	// Telegram still answers is waited out and sent again. It holds no
+	// connection of its own (std.net.http keeps them), so any number of
+	// tasks may share one.
+	//
+	// Calls fail with TelegramError: Auth for a token Telegram refuses,
+	// Forbidden for a chat the bot may not write to, NotFound, Invalid,
+	// Migrated, Conflict, RateLimited once `rateLimitRetries` waits were
+	// spent, Server and Transport.
+	partial type Bot {
+		token            ?Secret<string>
+		// The API's base: `https://api.telegram.org`, or a local Bot API
+		// server's.
+		baseURL          string
+		// The Bot API server runs on this machine with `--local`: a file
+		// given by path is passed by its `file://` address instead of being
+		// uploaded, and a download reads the server's copy of the file.
+		local            bool            = false
+		// Calls go to Telegram's test environment.
+		testEnvironment  bool            = false
+		// Keep to Telegram's limits on messages before sending (see Bot).
+		paced            bool            = true
+		// How often a call refused with 429 is sent again after the wait
+		// Telegram asked for, before it fails with RateLimited.
+		rateLimitRetries int             = 5
+		// The HTTP client requests go through: timeouts, a transport.
+		httpClient       http.Client
+		internal limits  Limiter
+
+		// A bot with `token` (else `TELEGRAM_BOT_TOKEN`), of the API at
+		// `baseURL` (else `TELEGRAM_API_URL`, else Telegram's).
+		def new(token ?Secret<string> = none, baseURL string = "") {
+			let env = Runtime.getEnv("TELEGRAM_BOT_TOKEN")
+			self.token = token is none ?? (env is none ?? (none, env), token)
+			let envURL = Runtime.getEnv("TELEGRAM_API_URL")
+			let base = baseURL.len() > 0 ?? (baseURL, envURL is none ?? (apiURL, envURL))
+			self.baseURL = base.trimEnd("/")
+			httpClient = new http.Client()
+			httpClient.userAgent = "adm.notify.telegram/{libraryVersion}"
+			httpClient.retry = http.RetryPolicy{attempts: 2, statuses: [502, 503, 504]}
+			limits = new Limiter()
+		}
+	}
+
+	// The address of `path` under the bot's part of the API: `prefix` ""
+	// for a method, "file/" for a file. Fails with Auth when the bot has no
+	// token.
+	internal def addressOf(bot Bot, prefix string, path string) !string {
+		let key = bot.token
+		fail TelegramError{message: "telegram: no bot token: pass one or set TELEGRAM_BOT_TOKEN", code: ErrorKind.Auth.value, kind: ErrorKind.Auth} when key is none
+		let test = bot.testEnvironment ?? ("/test", "")
+		return "{bot.baseURL}/{prefix}bot{key.reveal()}{test}/{path}"
+	}
+
+	// The envelope of every Bot API answer: `{"ok": true, "result": ...}`.
+	type Reply<T> {
+		ok     bool
+		result T
+
+		def new() {}
+	}
+
+	// Calls `method` with `params` and binds the answer's result onto
+	// `reply`'s (none when the method answers `true` alone). Returns false
+	// when Telegram answered `true` where an object could have come (an
+	// edit of an inline message), true otherwise. `wait` is how long
+	// Telegram may hold the answer back (a long poll), beyond the client's
+	// timeout. Fails with the TelegramError the answer describes, after
+	// waiting out up to `rateLimitRetries` 429s.
+	internal def call(bot Bot, method string, params map<string, any>, reply ?any, wait duration = 0s) !bool {
+		let attempt = 0
+		let chat = paceKey(method, params)
+		let broadcast = params.get("allow_paid_broadcast")
+		let paid = broadcast is bool && broadcast
+		for {
+			if bot.paced {
+				let pause = bot.limits.waitFor(chat, paid)
+				for pause > 0s {
+					time.sleep(pause)
+					pause = bot.limits.waitFor(chat, paid)
+				}
+			}
+			let req = try requestOf(bot, method, params)
+			req.deadline = time.now() + wait + 30s when wait > 0s
+			let res = bot.httpClient.do(req) onerror (err error) {
+				fail TelegramError{message: "telegram: {method}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+			}
+			let text = res.text() onerror (err error) {
+				fail TelegramError{message: "telegram: {method}: the answer was cut short: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport, status: res.status}
+			}
+			let parsed = (new JSON()).parse(text) onerror recover none
+			if !(parsed is map<string, any>) {
+				let kind = kindOfStatus(res.status, "")
+				let shown = text.trim().len() > 0 ?? (text.trim(), res.reason)
+				fail TelegramError{message: "telegram: {method}: {res.status} {shown}", code: kind.value, kind: kind, status: res.status}
+			}
+			let body map<string, any> = parsed
+			if boolAt(body, "ok") {
+				return true when reply is none
+				let result = body.get("result")
+				return false when result is bool
+				(new JSON()).decode(text, reply) onerror (err error) {
+					fail TelegramError{message: "telegram: {method}: the answer is not what the API sends: {err.message}", code: ErrorKind.Server.value, cause: err, kind: ErrorKind.Server, status: res.status}
+				}
+				return true
+			}
+			let failure = errorOf(method, body, res.status)
+			let after = failure.retryAfter
+			if failure.kind == ErrorKind.RateLimited && !(after is none) && attempt < bot.rateLimitRetries {
+				attempt++
+				if bot.paced {
+					// Every task sending to that chat (to anything, for "")
+					// waits the pause out, not this call alone.
+					bot.limits.block(chat, after)
+				} else {
+					time.sleep(after)
+				}
+				continue
+			}
+			fail failure
+		}
+		fail "telegram: unreachable"
+	}
+
+	// The TelegramError of `{"ok": false, "error_code": ..., "description": ...}`.
+	internal def errorOf(method string, body map<string, any>, status int) TelegramError {
+		let description = textAt(body, "description")
+		let errorCode = intAt(body, "error_code")
+		let parameters = objectAt(body, "parameters")
+		let retry = intAt(parameters, "retry_after")
+		let migrated = intAt(parameters, "migrate_to_chat_id")
+		let code = errorCode != 0 ?? (errorCode, status)
+		let kind = migrated != 0 ?? (ErrorKind.Migrated, kindOfStatus(code, description))
+		let failure = TelegramError{message: "telegram: {method}: {description.len() > 0 ?? (description, "{status}")}", code: kind.value, kind: kind, status: status, errorCode: errorCode, description: description, migrateToChatId: migrated}
+		failure.retryAfter = 1s * float(retry) when retry > 0
+		failure.retryAfter = 1s when kind == ErrorKind.RateLimited && retry <= 0
+		return failure
+	}
+
+	// The kind of an error code; a 400's description tells NotFound from
+	// Invalid.
+	internal def kindOfStatus(status int, description string) ErrorKind {
+		return ErrorKind.Auth when status == 401
+		return ErrorKind.Forbidden when status == 403
+		return ErrorKind.NotFound when status == 404
+		return ErrorKind.Conflict when status == 409
+		return ErrorKind.RateLimited when status == 429
+		return ErrorKind.Server when status >= 500 || status == 0
+		let lower = description.lower()
+		return ErrorKind.NotFound when lower.contains("not found") || lower.contains("invalid file_id") || lower.contains("user_id_invalid")
+		return ErrorKind.Invalid
+	}
+
+	// The request of one call: JSON, or multipart/form-data streamed from
+	// the files and bytes it uploads.
+	internal def requestOf(bot Bot, method string, params map<string, any>) !http.Request {
+		let target = try addressOf(bot, "", method)
+		let uploads = try uploadsOf(bot, params)
+		if uploads == 0 {
+			let req = try bot.httpClient.request(http.Method.POST, target)
+			req.replaceBody((new JSON()).encode(params))
+			req.headers.set("Content-Type", "application/json")
+			return req
+		}
+		let sink = new UploadBody()
+		let form = new multipart.Writer(sink)
+		let codec = new JSON()
+		for let (key, value) in params {
+			if value is InputFile && sentAsFile(value) {
+				try filePart(form, sink, key, value)
+			} else if value is string {
+				try form.writeField(key, value)
+			} else if value is bool || value is int || value is int64 || value is float {
+				try form.writeField(key, "{value}")
+			} else {
+				try form.writeField(key, string(codec.encode(value)))
+			}
+		}
+		for let file in nestedUploads(params) {
+			try filePart(form, sink, file.attach, file)
+		}
+		try form.close()
+		sink.seal()
+		let req = try bot.httpClient.request(http.Method.POST, target, sink)
+		req.contentLength = sink.size
+		req.headers.set("Content-Type", form.formDataContentType())
+		return req
+	}
+
+	// Writes the part of one upload: its headers, then its bytes or the
+	// file it streams from.
+	internal def filePart(form multipart.Writer, sink UploadBody, field string, file InputFile) !none {
+		let kind = formats.typeByName(file.name)
+		let headers = map<string, string[]>{}
+		headers.set("Content-Disposition", ["form-data; name=\"{quoted(field)}\"; filename=\"{quoted(file.name)}\""])
+		headers.set("Content-Type", [kind is none ?? ("application/octet-stream", kind)])
+		try form.createPart(headers)
+		let data = file.data
+		if data is none {
+			let info = os.stat(file.path) onerror (err error) {
+				fail TelegramError{message: "telegram: cannot upload {file.path}: {err.message}", code: ErrorKind.Invalid.value, cause: err, kind: ErrorKind.Invalid}
+			}
+			sink.file(file.path, int(info.size))
+		} else {
+			sink.data(data)
+		}
+		return none
+	}
+
+	internal def quoted(text string) string {
+		return text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\r", "").replace("\n", " ")
+	}
+
+	// Marks every upload in `params` for this call and counts them: a
+	// parameter that is an InputFile goes as a part of its own name, one
+	// inside an object (a media group's) by an `attach://` name. On a local
+	// server a file given by path is passed by its address instead.
+	internal def uploadsOf(bot Bot, params map<string, any>) !int {
+		let count = 0
+		for let (key, value) in params {
+			if value is InputFile {
+				prepare(value, bot.local, key)
+				count++ when sentAsFile(value)
+			} else if isComposite(value) {
+				let found InputFile[] = []
+				collect(value, found, 0)
+				for let file in found {
+					prepare(file, bot.local, "file{count}")
+					count++ when sentAsFile(file)
+				}
+			}
+		}
+		return count
+	}
+
+	// The uploads inside the parameters' objects and arrays, as
+	// `uploadsOf` marked them.
+	internal def nestedUploads(params map<string, any>) InputFile[] {
+		let found InputFile[] = []
+		for let (_, value) in params {
+			collect(value, found, 0) when !(value is InputFile) && isComposite(value)
+		}
+		let out InputFile[] = []
+		for let file in found {
+			out.push(file) when sentAsFile(file)
+		}
+		return out
+	}
+
+	internal def isComposite(value any) bool {
+		let kind = reflection.kindOf(value)
+		return kind := FieldKind.Array || FieldKind.Map || FieldKind.Struct || FieldKind.Iface || FieldKind.Optional
+	}
+
+	// The InputFiles inside `value`, in the order the JSON codec writes
+	// them: through arrays, maps, objects and their optional fields.
+	internal def collect(value any, found InputFile[], depth int) {
+		return when depth > 32
+		if value is InputFile {
+			found.push(value)
+			return
+		}
+		let kind = reflection.kindOf(value)
+		if kind == FieldKind.Array {
+			for let e in reflection.elements(value) {
+				collect(e, found, depth + 1) unless e is none
+			}
+		} else if kind == FieldKind.Map {
+			for let key in reflection.keysOf(value) {
+				let e = reflection.entryOf(value, key)
+				collect(e, found, depth + 1) unless e is none
+			}
+		} else if kind := FieldKind.Struct || FieldKind.Iface || FieldKind.Optional {
+			for let (_, f) in reflection.fields(value) {
+				if f.kind == FieldKind.Array {
+					continue when isScalar(f.elemKind)
+					for let i = 0; i < f.len(); i++ {
+						let e = f.at(i).value()
+						collect(e, found, depth + 1) unless e is none
+					}
+				} else if f.kind == FieldKind.Map {
+					continue when isScalar(f.elemKind)
+					for let key in f.keys() {
+						let e = f.entry(key).value()
+						collect(e, found, depth + 1) unless e is none
+					}
+				} else if f.kind := FieldKind.Struct || FieldKind.Iface || FieldKind.Optional {
+					let e = f.value()
+					collect(e, found, depth + 1) unless e is none
+				}
+			}
+		}
+	}
+
+	internal def isScalar(kind FieldKind) bool {
+		return kind := FieldKind.Bool || FieldKind.Int || FieldKind.Uint || FieldKind.Float || FieldKind.String || FieldKind.Enum
+	}
+
+	// The chat a call sends a message to, which the pace is kept per: the
+	// `chat_id` of a send, copy or forward, "" for every other method.
+	internal def paceKey(method string, params map<string, any>) string {
+		return "" unless method.startsWith("send") || method.startsWith("copyMessage") || method.startsWith("forwardMessage")
+		return "" when method := "sendChatAction" || "sendGift" || "sendInvoice"
+		let chat = params.get("chat_id")
+		return "" when chat is none
+		return "{chat}"
+	}
+
+	// The text of `key` in an object; "" when absent or not text.
+	internal def textAt(object map<string, any>, key string) string {
+		let v = object.get(key)
+		return v when v is string
+		return "{v}" when v is int
+		return ""
+	}
+
+	internal def intAt(object map<string, any>, key string) int {
+		let v = object.get(key)
+		return v when v is int
+		return int(v) when v is int64
+		return int(v) when v is float
+		return 0
+	}
+
+	internal def boolAt(object map<string, any>, key string) bool {
+		let v = object.get(key)
+		return v is bool && v
+	}
+
+	internal def objectAt(object map<string, any>, key string) map<string, any> {
+		let v = object.get(key)
+		return v is map<string, any> ?? (v, new map<string, any>())
+	}
 }

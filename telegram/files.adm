@@ -1,0 +1,270 @@
+partial module adm.notify.telegram {
+	use (
+		std.io
+		std.os
+		std.bytes
+		std.net.http
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON)
+	)
+
+	// A file to send: one Telegram already holds, by its `file_id`; one it
+	// fetches from a URL; or one uploaded from a path or from bytes. A
+	// method's file parameter takes one, or the id or URL as text.
+	//
+	// ```
+	// try bot.sendDocument(chat, telegram.upload("report.pdf"))
+	// try bot.sendPhoto(chat, telegram.upload("chart.png", png))
+	// try bot.sendSticker(chat, telegram.fileId(sticker.fileId))
+	// ```
+	//
+	// An upload is streamed from its file as the request goes out, so a
+	// large video is never held in memory; a file given by path is read
+	// again when a call is sent again.
+	type InputFile {
+		// The name Telegram shows for an upload.
+		name               string  = ""
+		internal reference string  = ""
+		internal path      string  = ""
+		internal data      ?byte[] = none
+		// The part name an upload inside an object goes by in this call.
+		internal attach    string  = ""
+		// Passed by its `file://` address to a local Bot API server.
+		internal byAddress bool    = false
+
+		def new() {}
+
+		// Implements JSONEncoder: the id or URL, the `attach://` name of an
+		// upload, or the `file://` address a local server reads.
+		def json() byte[] {
+			let text = reference
+			if byAddress {
+				text = "file://" + os.absolute(path, Runtime.workingDir())
+			} else if path.len() > 0 || !(data is none) {
+				text = "attach://" + attach
+			}
+			return (new JSON()).encode(text)
+		}
+	}
+
+	// Whether a call carries the bytes of `file`.
+	internal def sentAsFile(file InputFile) bool {
+		return !file.byAddress && (file.path.len() > 0 || !(file.data is none))
+	}
+
+	// Readies `file` for one call: the part name it goes by and whether a
+	// local server reads it from its path.
+	internal def prepare(file InputFile, local bool, attach string) {
+		file.byAddress = local && file.path.len() > 0
+		file.attach = attach
+	}
+
+	// A file Telegram already holds, by its `file_id`.
+	def fileId(id string) InputFile {
+		let file = new InputFile()
+		file.reference = id
+		return file
+	}
+
+	// A file Telegram fetches from `address` (an `http` or `https` URL; 5
+	// MB for a photo, 20 MB for other files).
+	def fileURL(address string) InputFile {
+		let file = new InputFile()
+		file.reference = address
+		return file
+	}
+
+	// The file at `path`, uploaded under its own name (or `name`).
+	def upload(path string, name string = "") InputFile {
+		let file = new InputFile()
+		file.path = path
+		file.name = name.len() > 0 ?? (name, os.base(path))
+		return file
+	}
+
+	// `data` uploaded as a file called `name`; the name's extension gives
+	// its type.
+	def upload(name string, data byte[]) InputFile {
+		let file = new InputFile()
+		file.data = data
+		file.name = name
+		return file
+	}
+
+	// One stretch of an upload's body: bytes, or a file read when the
+	// body reaches it.
+	internal struct Piece {
+		data byte[] = []
+		path string = ""
+		size int    = 0
+	}
+
+	// The body of a multipart call: the framing the multipart writer
+	// writes into it, and the bytes and files of the uploads between, read
+	// in order as the request goes out. `size` is the whole length, so the
+	// request carries a Content-Length.
+	internal type UploadBody {
+		size             int          = 0
+		internal pieces  Piece[]      = []
+		internal pending bytes.Buffer
+		internal at      int          = 0
+		internal offset  int          = 0
+		internal current ?os.File     = none
+
+		def new() {
+			pending = new bytes.Buffer()
+		}
+
+		// Implements io.Writer: the multipart framing.
+		def write(buf byte[]) !int {
+			return try pending.write(buf)
+		}
+
+		// Appends the bytes of an upload.
+		def data(content byte[]) {
+			flush()
+			pieces.push(Piece{data: content, size: content.len()})
+		}
+
+		// Appends the file at `path`, of `size` bytes.
+		def file(path string, size int) {
+			flush()
+			pieces.push(Piece{path: path, size: size})
+		}
+
+		// Seals the body once the writer closed it.
+		def seal() {
+			flush()
+			size = 0
+			for let piece in pieces {
+				size += piece.size
+			}
+		}
+
+		internal def flush() {
+			return when pending.len() == 0
+			pieces.push(Piece{data: pending.bytes(), size: pending.len()})
+			pending = new bytes.Buffer()
+		}
+
+		// Implements io.Reader. Fails when a file cannot be read, or holds
+		// fewer bytes than when the call began.
+		def read(buf byte[]) !int {
+			return 0 when buf.len() == 0
+			for at < pieces.len() {
+				let piece = pieces[at]
+				let left = piece.size - offset
+				if left <= 0 {
+					try closeFile()
+					at++
+					offset = 0
+					continue
+				}
+				let want = buf.len() < left ?? (buf.len(), left)
+				if piece.path.len() == 0 {
+					piece.data[offset:offset + want].copy(buf)
+					offset += want
+					return want
+				}
+				let open = current
+				let file = open is none ?? (try os.open(piece.path), open)
+				current = file
+				let n = try file.read(buf[0:want])
+				fail TelegramError{message: "telegram: {piece.path} became shorter while it was uploaded", code: ErrorKind.Invalid.value, kind: ErrorKind.Invalid} when n == 0
+				offset += n
+				return n
+			}
+			return 0
+		}
+
+		internal def closeFile() !none {
+			let open = current
+			current = none
+			try open.close() unless open is none
+			return none
+		}
+	}
+
+	partial type Bot {
+		// The contents of the file with `fileId` (20 MB at most from
+		// Telegram's servers, any size from a local one). Fails with
+		// NotFound for an unknown id, Invalid for a file too big to
+		// download, and as every call does.
+		def download(fileId string) !byte[] {
+			let held = try self.file(fileId)
+			if local && held.filePath.startsWith("/") {
+				return os.readFile(held.filePath) onerror (err error) {
+					fail TelegramError{message: "telegram: cannot read {held.filePath}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+				}
+			}
+			let res = try fetchFile(self, held)
+			let content = res.bytes() onerror (err error) {
+				fail TelegramError{message: "telegram: download of {held.filePath} was cut short: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+			}
+			return content
+		}
+
+		// Writes the file with `fileId` to `to`, streamed; a download that
+		// fails leaves nothing at `to`. Fails as `download` does, and when
+		// `to` cannot be written.
+		def download(fileId string, to string) !none {
+			let held = try self.file(fileId)
+			let out = os.open(to, "w") onerror (err error) {
+				fail TelegramError{message: "telegram: cannot write {to}: {err.message}", code: ErrorKind.Invalid.value, cause: err, kind: ErrorKind.Invalid}
+			}
+			copyFile(self, held, out) onerror (err error) {
+				out.close() onerror recover none
+				os.remove(to) onerror recover none
+				fail err
+			}
+			try out.close()
+			return none
+		}
+
+		// The address Telegram serves a file at; it holds the bot's token,
+		// so it is for the bot's own use, and stays valid for an hour.
+		// Fails when the bot has no token.
+		def fileAddress(file File) !string {
+			return try addressOf(self, "file/", file.filePath)
+		}
+	}
+
+	// The answer of a file download. Fails with NotFound when Telegram
+	// no longer has the file, and with Transport.
+	internal def fetchFile(bot Bot, file File) !http.Response {
+		fail TelegramError{message: "telegram: file {file.fileId} has no path: it is too big to download", code: ErrorKind.Invalid.value, kind: ErrorKind.Invalid} when file.filePath.len() == 0
+		let res = bot.httpClient.get(try bot.fileAddress(file)) onerror (err error) {
+			fail TelegramError{message: "telegram: download of {file.filePath}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+		}
+		if !res.ok() {
+			res.close() onerror recover none
+			let kind = kindOfStatus(res.status, "")
+			fail TelegramError{message: "telegram: download of {file.filePath}: {res.status} {res.reason}", code: kind.value, kind: kind, status: res.status}
+		}
+		return res
+	}
+
+	// Copies a file the bot holds into `out`: from the local server's disk
+	// or over HTTP.
+	internal def copyFile(bot Bot, file File, out os.File) !none {
+		if bot.local && file.filePath.startsWith("/") {
+			let source = try os.open(file.filePath)
+			io.copy(source, out) onerror (err error) {
+				source.close() onerror recover none
+				fail err
+			}
+			try source.close()
+			return none
+		}
+		let res = try fetchFile(bot, file)
+		let body = res.body
+		if !(body is none) {
+			io.copy(body, out) onerror (err error) {
+				res.close() onerror recover none
+				fail TelegramError{message: "telegram: download of {file.filePath} was cut short: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+			}
+		}
+		res.close() onerror recover none
+		return none
+	}
+}

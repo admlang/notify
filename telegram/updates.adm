@@ -1,0 +1,193 @@
+partial module adm.notify.telegram {
+	use (
+		std.time
+		std.crypto
+		std.net.http
+		std.data.encoding::(JSON)
+	)
+
+	// The updates of a bot by long polling, in order. Iterating it waits
+	// for the next one; an update counts as handled at Telegram once the
+	// next is asked for (or `confirm` ran), so one a program did not get
+	// to is delivered again when it starts over.
+	//
+	// ```
+	// let stream = try bot.updates(allowed = ["message", "callback_query"])
+	// for let update in stream {
+	//     ...
+	// }
+	// print(stream.failure)              // why it ended, when it was not stop()
+	// ```
+	//
+	// A dropped connection or a failing Telegram is waited out (one
+	// second, doubling to a minute); iteration ends on a failure that
+	// waiting does not cure (a token Telegram refuses, a webhook or another
+	// poller holding the updates), which `failure` then holds. `next` fails
+	// on every failure instead.
+	type UpdateStream {
+		// Why iteration ended; none while it runs and after `stop`.
+		failure                 ?TelegramError = none
+		internal bot            Bot
+		internal offset         int            = 0
+		internal waitFor        int
+		internal allowed        string[]
+		internal batch          Update[]       = []
+		internal at             int            = 0
+		internal backoff        duration       = 0s
+		internal atomic stopped bool           = false
+
+		def new(bot Bot, timeout duration, allowed string[], offset int) {
+			self.bot = bot
+			self.waitFor = int(timeout / 1s)
+			self.allowed = allowed
+			self.offset = offset
+		}
+
+		// The next update, waiting for one; none after `stop`. Fails as
+		// `getUpdates` does.
+		def next() !?Update {
+			for at >= batch.len() {
+				return none when stopped
+				batch = try fetch(waitFor)
+				at = 0
+			}
+			let update = batch[at]
+			at++
+			offset = update.updateId + 1
+			return update
+		}
+
+		// Implements Iterator<Update>, as the stream's doc says.
+		def iterate() ?Update {
+			for {
+				let got = next()
+				if got is error {
+					if got is TelegramError && (got.kind := ErrorKind.Transport || ErrorKind.Server || ErrorKind.RateLimited) {
+						backoff = backoff == 0s ?? (1s, backoff + backoff)
+						backoff = 60s when backoff > 60s
+						time.sleep(backoff)
+						continue
+					}
+					failure = got is TelegramError ?? (got, TelegramError{message: "telegram: {got.message}", code: ErrorKind.Server.value, cause: got, kind: ErrorKind.Server})
+					return none
+				}
+				backoff = 0s
+				return got
+			}
+			return none
+		}
+
+		// Ends iteration once the poll under way returns.
+		def stop() {
+			stopped = true
+		}
+
+		// Tells Telegram every update handed out so far was handled, so a
+		// program that starts over does not get them again. Fails as
+		// `getUpdates` does.
+		def confirm() !none {
+			try fetch(0) when offset > 0
+			return none
+		}
+
+		// One getUpdates call from `offset`, Telegram holding it back up
+		// to `wait` seconds.
+		internal def fetch(wait int) !Update[] {
+			let params = new map<string, any>()
+			params.set("offset", offset) when offset != 0
+			params.set("timeout", wait)
+			params.set("limit", wait == 0 ?? (1, 100))
+			params.set("allowed_updates", allowed) when allowed.len() > 0
+			let reply = new Reply<Update[]>()
+			try call(bot, "getUpdates", params, reply, wait = 1s * float(wait))
+			return wait == 0 ?? ([], reply.result)
+		}
+	}
+
+	partial type Bot {
+		// The bot's updates by long polling: each poll waits up to `timeout`
+		// for one, `allowed` names the kinds wanted ("message",
+		// "callback_query", ...; empty: those of the previous call, at
+		// first all but chat members and reactions), and `offset` skips
+		// the updates before that id. Fails with Auth when the bot has no
+		// token; Telegram's own refusals come out of the stream.
+		def updates(timeout duration = 50s, allowed string[] = [], offset int = 0) !UpdateStream {
+			try addressOf(self, "", "getUpdates")
+			return new UpdateStream(self, timeout, allowed, offset)
+		}
+
+		// Sends `text` to `chat` (its id, or a channel's `@username`), with
+		// the formatting of `parseMode`, a keyboard (an InlineKeyboard, a
+		// ReplyKeyboard or any markup), as a reply to the message `replyTo`
+		// of that chat, without a sound (`silent`), and without a preview of
+		// its first link (`preview = false`). Fails as every call does.
+		def send(chat any, text string, parseMode ?ParseMode = none, keyboard ?any = none, replyTo int = 0, silent bool = false, preview bool = true) !Message {
+			let replying = replyTo != 0 ?? (ReplyParameters{messageId: replyTo, allowSendingWithoutReply: true}, none)
+			let quiet = silent ?? (true, none)
+			let previews = preview ?? (none, LinkPreviewOptions{isDisabled: true})
+			return try sendMessage(chat, text, parseMode = parseMode, replyMarkup = keyboard, replyParameters = replying, disableNotification = quiet, linkPreviewOptions = previews)
+		}
+
+		// Answers `message` with `text`, in its chat and topic and as a
+		// reply to it. Fails as every call does.
+		def reply(message Message, text string, parseMode ?ParseMode = none, keyboard ?any = none) !Message {
+			let topic = message.isTopicMessage ?? (message.messageThreadId, none)
+			return try sendMessage(message.chat.id, text, parseMode = parseMode, replyMarkup = keyboard, messageThreadId = topic, replyParameters = ReplyParameters{messageId: message.messageId, allowSendingWithoutReply: true})
+		}
+
+		// Answers the press of a button, which the user's app waits for:
+		// with nothing, a notice at the top of the chat, or an alert to
+		// dismiss (`alert`). Fails as every call does.
+		def answer(query CallbackQuery, text string = "", alert bool = false) !none {
+			let notice = text.len() > 0 ?? (text, none)
+			let shown = alert ?? (true, none)
+			try answerCallbackQuery(query.id, text = notice, showAlert = shown)
+			return none
+		}
+	}
+
+	// A webhook receiver for std.net.http: Telegram posts each update to
+	// it (set the address and the same secret with `setWebhook`), and it
+	// hands the update to `handle`. A request without the secret is
+	// answered 401; an update `handle` fails on is answered 500, which
+	// Telegram delivers again later.
+	//
+	// ```
+	// try bot.setWebhook("https://bot.example.com/telegram", secretToken = secret)
+	// server.handle("POST /telegram", telegram.webhook(secret, def (update telegram.Update) !none {
+	//     ...
+	// }))
+	// ```
+	type Webhook {
+		secretToken     ?Secret<string>
+		internal handle def(Update) !none
+
+		def new(secretToken ?Secret<string>, handle def(Update) !none) {
+			self.secretToken = secretToken
+			self.handle = handle
+		}
+
+		// Implements http.Handler. Fails when the body cannot be read, the
+		// answer cannot be written, or `handle` fails on the update.
+		def serve(ctx http.Context) !none {
+			return ctx.text(405, "telegram updates come by POST") unless ctx.method() == http.Method.POST
+			let secret = secretToken
+			if !(secret is none) {
+				let given = ctx.header("X-Telegram-Bot-Api-Secret-Token")
+				return ctx.text(401, "wrong secret token") unless crypto.constantTimeEqual(given.bytes(), secret.reveal().bytes())
+			}
+			let body = try ctx.bytes()
+			let update = Update{}
+			let decoded = (new JSON()).decode(body, update)
+			return ctx.text(400, "not a Telegram update") when decoded is error
+			try handle(update)
+			return ctx.text(200, "")
+		}
+	}
+
+	// A webhook receiver checking `secretToken` (none checks nothing, which
+	// lets anyone who finds the address post updates).
+	def webhook(secretToken ?Secret<string>, handle def(Update) !none) Webhook {
+		return new Webhook(secretToken, handle)
+	}
+}

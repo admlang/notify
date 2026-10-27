@@ -1,0 +1,143 @@
+partial module adm.notify.telegram {
+	use std.data.encoding::(JSON)
+
+	// Buttons under a message, row by row. A method's `replyMarkup` (and
+	// `send`'s `keyboard`) takes the builder itself.
+	//
+	// ```
+	// let keyboard = new telegram.InlineKeyboard()
+	// keyboard.button("Approve", callback = "approve:42").button("Reject", callback = "reject:42")
+	// keyboard.row().button("Release notes", url = "https://example.com/notes/1.4")
+	// try bot.send(chat, "Deploy 1.4?", keyboard = keyboard)
+	// ```
+	type InlineKeyboard {
+		rows InlineKeyboardButton[][] = []
+
+		def new() {}
+
+		// Adds a button to the last row. It does one thing: opens `url`,
+		// sends `callback` back to the bot (1 to 64 bytes, in a
+		// CallbackQuery's `data`), puts the bot's name and `switchInline` in
+		// the input field of a chat the user picks (`switchInlineHere`: of
+		// this chat), opens the Web App at `webApp`, copies `copy` to the
+		// clipboard, or pays an invoice (`pay`, first button of an invoice).
+		// `variant` colours it: "primary", "success" or "danger".
+		def button(text string, url string = "", callback string = "", switchInline ?string = none, switchInlineHere ?string = none, webApp string = "", copy string = "", pay bool = false, variant string = "") InlineKeyboard {
+			let b = InlineKeyboardButton{text: text, url: url, callbackData: callback, pay: pay, styleValue: variant}
+			b.switchInlineQuery = switchInline unless switchInline is none
+			b.switchInlineQueryCurrentChat = switchInlineHere unless switchInlineHere is none
+			b.webApp = WebAppInfo{url: webApp} when webApp.len() > 0
+			b.copyText = CopyTextButton{text: copy} when copy.len() > 0
+			rows.push([]) when rows.len() == 0
+			rows[rows.len() - 1].push(b)
+			return self
+		}
+
+		// Adds a button made in full, for what `button` does not cover (a
+		// login URL, a game).
+		def button(made InlineKeyboardButton) InlineKeyboard {
+			rows.push([]) when rows.len() == 0
+			rows[rows.len() - 1].push(made)
+			return self
+		}
+
+		// Starts a new row; the buttons after it go below.
+		def row() InlineKeyboard {
+			rows.push([]) unless rows.len() > 0 && rows[rows.len() - 1].len() == 0
+			return self
+		}
+
+		// The markup the API takes.
+		def markup() InlineKeyboardMarkup {
+			let out = InlineKeyboardMarkup{}
+			for let row in rows {
+				out.inlineKeyboard.push(row) when row.len() > 0
+			}
+			return out
+		}
+
+		// Implements JSONEncoder: the markup.
+		def json() byte[] {
+			return (new JSON()).encode(markup())
+		}
+	}
+
+	// Buttons in place of the user's keyboard, row by row; a press sends
+	// the button's text as a message. `send`'s `keyboard` takes the
+	// builder itself.
+	//
+	// ```
+	// let keyboard = new telegram.ReplyKeyboard()
+	// keyboard.button("Share my number", contact = true).row().button("Cancel")
+	// keyboard.oneTime = true
+	// ```
+	type ReplyKeyboard {
+		rows        KeyboardButton[][] = []
+		// Fit the keyboard to its buttons instead of the standard height.
+		resize      bool               = true
+		// Hide the keyboard once a button was pressed.
+		oneTime     bool               = false
+		// Keep showing the keyboard while the user's own one is open.
+		persistent  bool               = false
+		// The text in the input field while the keyboard shows.
+		placeholder string             = ""
+		// Show it only to the users the message mentions or replies to.
+		selective   bool               = false
+
+		def new() {}
+
+		// Adds a button to the last row: it sends its text, or the user's
+		// phone number (`contact`), location (`location`), or a poll they
+		// make (`poll`: "quiz", "regular", or "" for either), or opens the
+		// Web App at `webApp`. `style` colours it: "primary", "success" or
+		// "danger".
+		def button(text string, contact bool = false, location bool = false, poll ?string = none, webApp string = "", variant string = "") ReplyKeyboard {
+			let b = KeyboardButton{text: text, requestContact: contact, requestLocation: location, styleValue: variant}
+			b.requestPoll = KeyboardButtonPollType{kind: poll} unless poll is none
+			b.webApp = WebAppInfo{url: webApp} when webApp.len() > 0
+			rows.push([]) when rows.len() == 0
+			rows[rows.len() - 1].push(b)
+			return self
+		}
+
+		// Adds a button made in full, for what `button` does not cover
+		// (asking for users or a chat).
+		def button(made KeyboardButton) ReplyKeyboard {
+			rows.push([]) when rows.len() == 0
+			rows[rows.len() - 1].push(made)
+			return self
+		}
+
+		// Starts a new row; the buttons after it go below.
+		def row() ReplyKeyboard {
+			rows.push([]) unless rows.len() > 0 && rows[rows.len() - 1].len() == 0
+			return self
+		}
+
+		// The markup the API takes.
+		def markup() ReplyKeyboardMarkup {
+			let out = ReplyKeyboardMarkup{isPersistent: persistent, resizeKeyboard: resize, oneTimeKeyboard: oneTime, inputFieldPlaceholder: placeholder, selective: selective}
+			for let row in rows {
+				out.keyboard.push(row) when row.len() > 0
+			}
+			return out
+		}
+
+		// Implements JSONEncoder: the markup.
+		def json() byte[] {
+			return (new JSON()).encode(markup())
+		}
+	}
+
+	// Takes the reply keyboard away (only from the users the message
+	// mentions or replies to, with `selective`).
+	def removeKeyboard(selective bool = false) ReplyKeyboardRemove {
+		return ReplyKeyboardRemove{removeKeyboard: true, selective: selective}
+	}
+
+	// Opens a reply to the message in the user's app, as if they had
+	// chosen Reply, with `placeholder` in the input field.
+	def forceReply(placeholder string = "", selective bool = false) ForceReply {
+		return ForceReply{forceReply: true, inputFieldPlaceholder: placeholder, selective: selective}
+	}
+}

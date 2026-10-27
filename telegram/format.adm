@@ -1,0 +1,41 @@
+partial module adm.notify.telegram {
+	// Where text goes inside a MarkdownV2 message, which decides what has
+	// to be escaped.
+	enum MarkdownPart {
+		// Ordinary text, and the text of a link.
+		Text,
+		// Inside `` `code` `` or a ```` ``` ```` block.
+		Code,
+		// The address inside a link's `(...)`.
+		Link,
+	}
+
+	// `text` made literal for a MarkdownV2 message: each character
+	// Telegram reads as markup gets a backslash.
+	//
+	// ```
+	// try bot.send(chat, "*{telegram.escapeMarkdown(title)}*", parseMode = telegram.ParseMode.MarkdownV2)
+	// ```
+	def escapeMarkdown(text string, part MarkdownPart = MarkdownPart.Text) string {
+		let special = "_*[]()~`>#+-=|\{}.!\\"
+		if part == MarkdownPart.Code {
+			special = "`\\"
+		} else if part == MarkdownPart.Link {
+			special = ")\\"
+		}
+		let out = ""
+		let start = 0
+		for let i = 0; i < text.len(); i++ {
+			continue unless special.contains("{text[i]}")
+			out += text[start:i] + "\\" + text[i]
+			start = i + 1
+		}
+		return start == 0 ?? (text, out + text[start:])
+	}
+
+	// `text` made literal for an HTML message: `&`, `<`, `>` and `"` as
+	// entities.
+	def escapeHTML(text string) string {
+		return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+	}
+}

@@ -1,0 +1,100 @@
+partial module adm.notify.telegram {
+	use std.time
+
+	// The gap the bot keeps between two messages to one private chat:
+	// Telegram allows about one a second.
+	internal const chatGap = 1000000000
+
+	// The gap between messages to a group or channel once its burst is
+	// spent: twenty a minute.
+	internal const groupGap = 3000000000
+
+	// The messages a group or channel may take at once.
+	internal const groupBurst = 20
+
+	// The gap between any two messages of the bot once its burst is spent:
+	// thirty a second.
+	internal const globalGap = 33333334
+
+	// The messages the bot may send at once.
+	internal const globalBurst = 30
+
+	// A token bucket kept as the time it is full again: a message takes
+	// one gap from it, and it may run up to `burst` gaps ahead of now.
+	internal struct Bucket {
+		full int64 = 0
+	}
+
+	// The pace of one bot: a bucket for all its messages, one per chat,
+	// and the pause a 429 asked of the bot or a chat. Safe from many tasks.
+	internal type Limiter {
+		internal everything Bucket
+		internal chats      map<string, Bucket>
+		internal blocked    map<string, int64>
+		internal sweepAt    int64               = 0
+
+		def new() {
+			everything = Bucket{}
+		}
+
+		// How long a message to `chat` ("" for a call that is no message)
+		// has to wait before it may go out; 0s takes its place, and then
+		// the message counts. `paid` messages (paid broadcasts) skip the
+		// bot's own limit.
+		atomic def waitFor(chat string, paid bool) duration {
+			let now = time.monoNs()
+			let held = blocked.get("")
+			return duration(held - now) when !(held is none) && held > now
+			return 0s when chat.len() == 0
+			let until = blocked.get(chat)
+			return duration(until - now) when !(until is none) && until > now
+			let group = chat.startsWith("-") || chat.startsWith("@")
+			let gap = int64(group ?? (groupGap, chatGap))
+			let burst = int64(group ?? (groupBurst, 1))
+			let found = chats.get(chat)
+			let own = found is none ?? (Bucket{}, found)
+			let ownStart = own.full > now ?? (own.full, now)
+			let ownWait = ownStart + gap - now - burst * gap
+			return duration(ownWait) when ownWait > 0
+			let allStart = everything.full > now ?? (everything.full, now)
+			let allGap = int64(globalGap)
+			let allWait = allStart + allGap - now - int64(globalBurst) * allGap
+			return duration(allWait) when !paid && allWait > 0
+			everything.full = allStart + allGap unless paid
+			own.full = ownStart + gap
+			chats.set(chat, own)
+			sweep(now)
+			return 0s
+		}
+
+		// Holds back the messages to `chat` (every call of the bot for "")
+		// for `after`, as a 429 asked.
+		atomic def block(chat string, after duration) {
+			let until = time.monoNs() + int64(after)
+			let held = blocked.get(chat)
+			blocked.set(chat, until) when held is none || until > held
+		}
+
+		// Drops the chats whose buckets are full again and the pauses that
+		// ended, once a minute, so a bot that writes to many chats keeps
+		// no state for the quiet ones.
+		internal def sweep(now int64) {
+			return when now < sweepAt
+			sweepAt = now + 60000000000
+			let idle string[] = []
+			for let (chat, bucket) in chats {
+				idle.push(chat) when bucket.full <= now
+			}
+			for let chat in idle {
+				chats.delete(chat)
+			}
+			let ended string[] = []
+			for let (chat, until) in blocked {
+				ended.push(chat) when until <= now
+			}
+			for let chat in ended {
+				blocked.delete(chat)
+			}
+		}
+	}
+}
