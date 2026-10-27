@@ -1,0 +1,149 @@
+partial module adm.notify.slack {
+	use std.testing
+
+	// The problem of a message holding `block`, "" for none.
+	internal def problemOf(block Block) string {
+		let m = new Message("t")
+		m.add(block)
+		return m.problem()
+	}
+
+	check "Block Kit" {
+		// The builder's blocks become Slack's JSON; buttons share the
+		// actions block the message ends with.
+		@test()
+		def TestMessageBody() {
+			let m = new Message("Deploy 42 finished")
+			m.header("Deploy 42").section("*main* is live", fields = ["*By*\nana", "*Took*\n4 min"])
+			m.button("Open", url = "https://ci.example/42").button("Roll back", actionId = "rollback", value = "42", variant = ButtonStyle.Danger, confirm = Confirm{title: "Sure?", text: "This rolls back", danger: true})
+			m.divider().context("Ran by *ci*").image("https://ci.example/graph.png", "Graph").markdown("**Done**")
+			assert m.problem() == "" && m.blocks.len() == 7
+			let header = blockBody(m.blocks[0])
+			let headerText = header.get("text")
+			assert "{header.get("type")}" == "header" && headerText is map<string, any> && "{headerText.get("type")}" == "plain_text" && "{headerText.get("text")}" == "Deploy 42"
+			let actions = blockBody(m.blocks[2])
+			let elements = actions.get("elements")
+			assert "{actions.get("type")}" == "actions" && elements is any[] && elements.len() == 2
+			let undo = elementBody(Button{text: "Roll back", actionId: "rollback", value: "42", variant: ButtonStyle.Danger})
+			assert "{undo.get("style")}" == "danger" && "{undo.get("action_id")}" == "rollback" && "{undo.get("value")}" == "42"
+			let section = blockBody(m.blocks[1])
+			let fields = section.get("fields")
+			assert fields is any[] && fields.len() == 2
+			let text = section.get("text")
+			assert text is map<string, any> && "{text.get("type")}" == "mrkdwn"
+			let md = blockBody(m.blocks[6])
+			assert "{md.get("type")}" == "markdown" && "{md.get("text")}" == "**Done**"
+			let ctx = blockBody(m.blocks[4])
+			assert "{ctx.get("type")}" == "context"
+		}
+
+		// Every element becomes its own type with its options.
+		@test()
+		def TestElementBodies() {
+			let options = [option("One", "1"), option("Two", "2", description = "the second")]
+			let s = Select{actionId: "pick", placeholder: "Pick", options: options, initialOptions: [options[1]]}
+			let body = elementBody(s)
+			assert "{body.get("type")}" == "static_select" && body.hasKey("options") && body.hasKey("initial_option")
+			assert "{elementBody(Select{source: SelectSource.Users, multi: true, initialIds: ["U1"], maxSelected: 3}).get("type")}" == "multi_users_select"
+			let users = elementBody(Select{source: SelectSource.Users, multi: true, initialIds: ["U1"], maxSelected: 3})
+			assert users.hasKey("initial_users") && "{users.get("max_selected_items")}" == "3"
+			let convos = elementBody(Select{source: SelectSource.Conversations, filter: Filter{include: ["public", "im"], excludeBotUsers: true}, defaultToCurrent: true})
+			assert "{convos.get("type")}" == "conversations_select" && convos.hasKey("filter") && "{convos.get("default_to_current_conversation")}" == "true"
+			let external = elementBody(Select{source: SelectSource.External, minQueryLength: 2})
+			assert "{external.get("type")}" == "external_select" && "{external.get("min_query_length")}" == "2"
+			let grouped = elementBody(Select{groups: [OptionGroup{label: "A", options: options}]})
+			assert grouped.hasKey("option_groups") && !grouped.hasKey("options")
+			assert "{elementBody(Choices{options: options, radio: true, initialOptions: [options[0]]}).get("type")}" == "radio_buttons"
+			assert elementBody(Choices{options: options, initialOptions: options}).hasKey("initial_options")
+			let number = elementBody(TextInput{kind: InputKind.Number, actionId: "n", decimal: true, minValue: "0"})
+			assert "{number.get("type")}" == "number_input" && "{number.get("is_decimal_allowed")}" == "true" && "{number.get("min_value")}" == "0"
+			let multi = elementBody(TextInput{actionId: "t", multiline: true, maxLength: 500, dispatchOn: ["on_enter_pressed"]})
+			assert "{multi.get("type")}" == "plain_text_input" && "{multi.get("multiline")}" == "true" && multi.hasKey("dispatch_action_config")
+			assert "{elementBody(DatePicker{initialDate: "2026-11-01"}).get("initial_date")}" == "2026-11-01"
+			assert "{elementBody(TimePicker{initialTime: "09:30", timezone: "Europe/Bucharest"}).get("timezone")}" == "Europe/Bucharest"
+			assert "{elementBody(DatetimePicker{initial: 1800000000}).get("initial_date_time")}" == "1800000000"
+			assert elementBody(ImageElement{slackFile: "F1", alt: "a"}).hasKey("slack_file")
+			assert "{elementBody(FileInput{filetypes: ["pdf"], maxFiles: 2}).get("max_files")}" == "2"
+			let flow = elementBody(WorkflowButton{text: "Run", trigger: "https://slack.com/shortcuts/Ft1", inputs: map<string, string>{"x": "1"}})
+			assert "{flow.get("type")}" == "workflow_button" && json(flow).contains("customizable_input_parameters")
+			let picked = elementBody(menu("pick", options, placeholder = "Pick", multi = true))
+			let hint = picked.get("placeholder")
+			assert "{picked.get("type")}" == "multi_static_select" && hint is map<string, any> && "{hint.get("type")}" == "plain_text"
+			let label = textBody(plain("Hi :wave:", emoji = false))
+			assert "{label.get("type")}" == "plain_text" && "{label.get("emoji")}" == "false"
+			let overflow = elementBody(Overflow{options: options})
+			assert "{overflow.get("type")}" == "overflow"
+			let rich = RichText{parts: [paragraph(styled("Hello ", bold = true), mention("U1"), link("https://example.com", "site")), RichPart{kind: RichKind.List, items: [paragraph(styled("one")), paragraph(styled("two"))], ordered: true}]}
+			let richBody = json(blockBody(rich))
+			assert richBody.contains("\"rich_text_list\"") && richBody.contains("\"user_id\":\"U1\"") && richBody.contains("\"bold\":true") && richBody.contains("\"ordered\"")
+			assert "{elementBody(RichTextInput{actionId: "r", initialValue: rich}).get("type")}" == "rich_text_input"
+		}
+
+		// The limits Slack enforces are checked before sending, naming the
+		// block and the limit.
+		@test()
+		def TestLimits() {
+			let many = new Message("t")
+			for let k = 0; k < 51; k++ {
+				many.divider()
+			}
+			assert many.problem() == "51 blocks, at most 50"
+			assert problemOf(Header{text: "x".repeat(151)}).contains("at most 150")
+			assert problemOf(Section{}).contains("no text and no fields")
+			assert problemOf(Section{text: mrkdwn("x".repeat(3001))}).contains("at most 3000")
+			let fields Text[] = []
+			for let k = 0; k < 11; k++ {
+				fields.push(mrkdwn("f"))
+			}
+			assert problemOf(Section{fields: fields}).contains("11 fields")
+			assert problemOf(Section{text: mrkdwn("x"), accessory: TextInput{}}).contains("accessory")
+			assert problemOf(Actions{elements: [Button{text: "x".repeat(76)}]}).contains("text is 76 characters, at most 75")
+			assert problemOf(Actions{elements: [Button{text: "a", actionId: "same"}, Button{text: "b", actionId: "same"}]}).contains("repeats the action_id same")
+			assert problemOf(Actions{elements: [TextInput{}]}).contains("cannot hold element 0")
+			let six Option[] = []
+			for let k = 0; k < 6; k++ {
+				six.push(option("o", "{k}"))
+			}
+			assert problemOf(Actions{elements: [Overflow{options: six}]}).contains("1 to 5")
+			assert problemOf(Actions{elements: [Select{}]}).contains("offers no options")
+			assert problemOf(Actions{elements: [Button{text: "a", confirm: Confirm{title: "x".repeat(101), text: "t"}}]}).contains("confirm title")
+			assert problemOf(Input{label: "Who", element: Button{text: "no"}}).contains("cannot hold that element")
+			assert problemOf(Input{label: "When", element: DatePicker{initialDate: "11/01/2026"}}).contains("not YYYY-MM-DD")
+			assert problemOf(Image{alt: "a"}).contains("needs an image url")
+			assert problemOf(Context{}).contains("1 to 10")
+			let twice = new Message("t")
+			twice.add(Divider{blockId: "d"}).add(Divider{blockId: "d"})
+			assert twice.problem().contains("repeats the block_id d")
+			let long = new Message("t")
+			long.markdown("x".repeat(7000)).markdown("y".repeat(7000))
+			assert long.problem().contains("12000")
+			assert (new Message()).problem().contains("neither text nor blocks")
+			assert problemOf(Actions{elements: [Button{text: "fine"}]}) == ""
+		}
+
+		// A modal checks its title, buttons and 100 blocks; its JSON carries
+		// what comes back with the submission.
+		@test()
+		def TestView() !none {
+			let form = new View("New ticket", callbackId = "ticket", submit = "Create")
+			form.privateMetadata = "C1"
+			form.input("Title", TextInput{actionId: "title"}, blockId = "title-block")
+			form.input("Due", DatePicker{actionId: "due"}, optional = true)
+			let body = try viewBody(form)
+			assert "{body.get("type")}" == "modal" && "{body.get("callback_id")}" == "ticket" && "{body.get("private_metadata")}" == "C1" && body.hasKey("submit")
+			let blocks = body.get("blocks")
+			assert blocks is any[] && blocks.len() == 2
+			assert (new View("x".repeat(25))).problem().contains("title is 25 characters, at most 24")
+			let home = new View(kind = ViewKind.Home)
+			for let k = 0; k < 101; k++ {
+				home.divider()
+			}
+			assert home.problem() == "101 blocks, at most 100"
+			viewBody(new View("")) onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.Invalid
+				recover new map<string, any>()
+			}
+			return none
+		}
+	}
+}

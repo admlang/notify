@@ -1,0 +1,84 @@
+partial module adm.notify.slack {
+	partial type Client {
+		// Adds the emoji reaction `name` (without colons) to a message.
+		// Fails as every call does.
+		def react(channel string, ts string, name string) !none {
+			try api(self, "reactions.add", map<string, any>{"channel": channel, "timestamp": ts, "name": name.trim(":")})
+			return none
+		}
+
+		// Takes the token's reaction `name` off a message. Fails as every
+		// call does.
+		def unreact(channel string, ts string, name string) !none {
+			try api(self, "reactions.remove", map<string, any>{"channel": channel, "timestamp": ts, "name": name.trim(":")})
+			return none
+		}
+
+		// The reactions on a message. Fails as every call does.
+		def reactions(channel string, ts string) !Reaction[] {
+			let reply = try api(self, "reactions.get", map<string, any>{"channel": channel, "timestamp": ts, "full": true})
+			let message = Post{}
+			try decodeAt(reply, "message", message)
+			return message.reactions
+		}
+
+		// The messages and files a user reacted to; the token's user when
+		// `user` is "".
+		def reacted(user string = "") Pages<Item> {
+			let args = map<string, any>{"full": true}
+			args.set("user", user) when user.len() > 0
+			return pagesOf<Item>(self, "reactions.list", "items", args, 100)
+		}
+
+		// Pins a message to its channel. Fails as every call does.
+		def pin(channel string, ts string) !none {
+			try api(self, "pins.add", map<string, any>{"channel": channel, "timestamp": ts})
+			return none
+		}
+
+		// Unpins a message. Fails as every call does.
+		def unpin(channel string, ts string) !none {
+			try api(self, "pins.remove", map<string, any>{"channel": channel, "timestamp": ts})
+			return none
+		}
+
+		// The pinned messages and files of a channel. Fails as every call
+		// does.
+		def pins(channel string) !Item[] {
+			return try listAt<Item>(try api(self, "pins.list", map<string, any>{"channel": channel}), "items")
+		}
+
+		// Adds a link to the bookmarks at the top of a channel. Fails as
+		// every call does.
+		def bookmark(channel string, title string, link string, emoji string = "") !Bookmark {
+			let args = map<string, any>{"channel_id": channel, "title": title, "type": "link", "link": link}
+			args.set("emoji", emoji) when emoji.len() > 0
+			let out = Bookmark{}
+			try decodeAt(try api(self, "bookmarks.add", args), "bookmark", out)
+			return out
+		}
+
+		// Changes a bookmark; a "" argument stays as it is. Fails as every
+		// call does.
+		def editBookmark(channel string, id string, title string = "", link string = "", emoji string = "") !Bookmark {
+			let args = map<string, any>{"channel_id": channel, "bookmark_id": id}
+			args.set("title", title) when title.len() > 0
+			args.set("link", link) when link.len() > 0
+			args.set("emoji", emoji) when emoji.len() > 0
+			let out = Bookmark{}
+			try decodeAt(try api(self, "bookmarks.edit", args), "bookmark", out)
+			return out
+		}
+
+		// Removes a bookmark. Fails as every call does.
+		def removeBookmark(channel string, id string) !none {
+			try api(self, "bookmarks.remove", map<string, any>{"channel_id": channel, "bookmark_id": id})
+			return none
+		}
+
+		// The bookmarks of a channel. Fails as every call does.
+		def bookmarks(channel string) !Bookmark[] {
+			return try listAt<Bookmark>(try api(self, "bookmarks.list", map<string, any>{"channel_id": channel}), "bookmarks")
+		}
+	}
+}

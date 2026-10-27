@@ -1,0 +1,477 @@
+// What a person does with an app: slash commands, buttons and menus
+// (block actions), modal submissions and closings, shortcuts, and the
+// options an external select asks for. Each arrives at `App`, which runs
+// the program's callback on its own task and acknowledges Slack within its
+// three seconds (see `App` for which acknowledgements carry an answer);
+// other answers go to the interaction's `response_url`.
+partial module adm.notify.slack {
+	use (
+		std.net.http
+		std.data.encoding::(json)
+	)
+
+	// Who did something: a user's id and names, and their team.
+	struct Actor {
+		id string
+		username string
+		name string
+		@json("team_id")
+		teamId string
+	}
+
+	// A conversation an interaction happened in.
+	struct Place {
+		id     string
+		name   string
+		domain string
+	}
+
+	// Where an action's element is: a message or a view.
+	struct Container {
+		@json("type")
+		kind string
+		@json("message_ts")
+		messageTs string
+		@json("channel_id")
+		channelId string
+		@json("view_id")
+		viewId string
+		@json("is_ephemeral")
+		isEphemeral bool
+		@json("thread_ts")
+		threadTs string
+	}
+
+	// One action of a block action: the element, and the value it reports
+	// by its type.
+	struct ActionValue {
+		@json("action_id")
+		@json("action_id")
+		actionId string
+		@json("block_id")
+		@json("block_id")
+		blockId string
+		@json("type")
+		kind string
+		value string
+		@json("selected_option")
+		selectedOption Option
+		@json("selected_options")
+		selectedOptions Option[]
+		@json("selected_date")
+		selectedDate string
+		@json("selected_time")
+		selectedTime string
+		@json("selected_date_time")
+		selectedDateTime int64
+		@json("selected_user")
+		selectedUser string
+		@json("selected_users")
+		selectedUsers string[]
+		@json("selected_conversation")
+		selectedConversation string
+		@json("selected_conversations")
+		selectedConversations string[]
+		@json("selected_channel")
+		selectedChannel string
+		@json("selected_channels")
+		selectedChannels string[]
+		@json("action_ts")
+		actionTs string
+	}
+
+	// An answer the acknowledging request (or envelope) is waiting for:
+	// its body, none for an empty one.
+	internal struct Answer {
+		body ?map<string, any> = none
+	}
+
+	// The meeting point of the acknowledgement and the task running the
+	// program's callback: the first answer offered becomes the
+	// acknowledgement, and so does the callback's end (its failure with
+	// it), unless the wait ran out and the acknowledgement went out empty
+	// first.
+	internal type Exchange {
+		// 0 waiting, 1 answered, 2 acknowledged empty, 3 the callback
+		// ended first.
+		internal state   int           = 0
+		internal pending ?Answer       = none
+		internal failed  ?error        = none
+		ready            channel<none>
+
+		def new() {
+			ready = new channel<none>(1)
+		}
+
+		// Takes the answer while the acknowledgement still waits; false once
+		// it went out.
+		atomic def offer(a Answer) bool {
+			return false unless state == 0
+			state = 1
+			pending = a
+			ready.offer(none)
+			return true
+		}
+
+		// Tells the waiting acknowledgement the callback ended (with its
+		// failure); false when it no longer waits.
+		atomic def ended(err ?error) bool {
+			return false unless state == 0
+			state = 3
+			failed = err
+			ready.offer(none)
+			return true
+		}
+
+		// Ends the wait: the answer offered (none for an empty
+		// acknowledgement), and the callback's failure when it ended first.
+		atomic def close() (?Answer, ?error) {
+			state = 2 when state == 0
+			return (pending, failed)
+		}
+	}
+
+	// What an interaction answers through: the acknowledgement while it
+	// waits, else its response URL.
+	internal type Answering {
+		internal exchange    ?Exchange = none
+		internal client      ?Client   = none
+		internal responseURL string    = ""
+		internal what        string    = ""
+		// Slack shows the acknowledgement's body as a message (a slash
+		// command's); other acknowledgements carry none.
+		internal ackShows    bool      = false
+
+		def new() {}
+
+		// Offers `body` as the acknowledgement; true when it was taken.
+		def acknowledge(body ?map<string, any>) bool {
+			let x = exchange
+			return !(x is none) && x.offer(Answer{body: body})
+		}
+
+		// Answers with a message: in the acknowledgement while it waits and
+		// Slack shows it, else posted to the response URL. Fails with
+		// Invalid when neither is open, and as a webhook post does.
+		def message(body map<string, any>) !none {
+			return none when ackShows && acknowledge(body)
+			fail invalid("the {what} has no response URL to answer through after its acknowledgement") when responseURL.len() == 0
+			let c = client
+			let transport = c is none ?? (new http.Client(), c.httpClient)
+			return try postJSON(transport, responseURL, body, 5)
+		}
+	}
+
+	// The body of a message answer: its text and blocks, whether everyone
+	// in the channel sees it (else the user alone), and whether it replaces
+	// the message the interaction came from.
+	internal def answerBody(m Message, inChannel bool, replace bool) !map<string, any> {
+		let body = new map<string, any>()
+		try messageArgs(m, body)
+		body.set("response_type", inChannel ?? ("in_channel", "ephemeral")) unless replace
+		body.set("replace_original", true) when replace
+		return body
+	}
+
+	// A slash command someone typed: `/command text`.
+	//
+	// ```
+	// app.onCommand(def (c slack.Command) !none {
+	// 	return try c.respond("Deploying {c.text}…", inChannel = true)
+	// })
+	// ```
+	type Command {
+		command string
+		text string
+		userId string
+		userName string
+		channelId string
+		channelName string
+		teamId string
+		teamDomain string
+		enterpriseId string
+		@json("api_app_id")
+		apiAppId string
+		isEnterpriseInstall bool
+		// Opens a modal within three seconds (`Client.openView`).
+		@json("trigger_id")
+		triggerId string
+		// Takes five answers within half an hour.
+		@json("response_url")
+		responseURL string
+		internal answering Answering
+
+		def new() {
+			answering = new Answering()
+			answering.what = "command"
+			answering.ackShows = true
+		}
+
+		// Answers with `text`, seen by the user alone unless `inChannel`.
+		// Fails as a webhook post does once the acknowledgement went out.
+		def respond(text string, inChannel bool = false) !none {
+			return try respond(new Message(text), inChannel)
+		}
+
+		// Answers with a message of blocks. Fails with Invalid for a Block
+		// Kit limit, and as `respond` of text does.
+		def respond(message Message, inChannel bool = false) !none {
+			return try answering.message(try answerBody(message, inChannel, false))
+		}
+	}
+
+	// A person used a button, a menu, a date picker or another element of
+	// a message or a view (`block_actions`).
+	//
+	// ```
+	// app.onAction(def (a slack.BlockAction) !none {
+	// 	if a.actionId() == "approve" {
+	// 		try a.update(new slack.Message("Approved by <@{a.user.id}>"))
+	// 	}
+	// 	return none
+	// })
+	// ```
+	type BlockAction {
+		user Actor
+		team Place
+		channel Place
+		container Container
+		// The message the element is on (none of it for a view).
+		message Post
+		actions ActionValue[]
+		// The view the element is in, when it is in one.
+		view ViewInfo
+		// The inputs of the message, by block and action id.
+		state ViewState
+		@json("trigger_id")
+		triggerId string
+		@json("response_url")
+		responseURL string
+		@json("api_app_id")
+		apiAppId string
+		internal answering Answering
+
+		def new() {
+			self.view = new ViewInfo()
+			answering = new Answering()
+			answering.what = "block action"
+		}
+
+		// The action id of the first action.
+		def actionId() string {
+			return actions.len() > 0 ?? (actions[0].actionId, "")
+		}
+
+		// The value the first action reports: a button's value, a select's
+		// chosen option, a date, a user or a conversation.
+		def value() string {
+			return "" when actions.len() == 0
+			let a = actions[0]
+			return a.value when a.value.len() > 0
+			return a.selectedOption.value when a.selectedOption.value.len() > 0
+			for let (_, v) in [a.selectedDate, a.selectedTime, a.selectedUser, a.selectedConversation, a.selectedChannel] {
+				return v when v.len() > 0
+			}
+			return a.selectedDateTime > 0 ?? ("{a.selectedDateTime}", "")
+		}
+
+		// Answers with a new message, seen by the user alone unless
+		// `inChannel`. Fails as a webhook post does.
+		def respond(text string, inChannel bool = false) !none {
+			return try respond(new Message(text), inChannel)
+		}
+
+		// Answers with a new message of blocks. Fails with Invalid for a
+		// Block Kit limit, and as a webhook post does.
+		def respond(message Message, inChannel bool = false) !none {
+			return try answering.message(try answerBody(message, inChannel, false))
+		}
+
+		// Replaces the message the element is on. Fails as a webhook post
+		// does.
+		def update(message Message) !none {
+			return try answering.message(try answerBody(message, inChannel = false, replace = true))
+		}
+
+		// Deletes the message the element is on. Fails as a webhook post
+		// does.
+		def deleteOriginal() !none {
+			return try answering.message(map<string, any>{"delete_original": true})
+		}
+	}
+
+	// A modal submitted (`view_submission`). Returning without an answer
+	// closes it; `errors`, `update`, `push` and `clear` answer otherwise,
+	// within Slack's three seconds.
+	//
+	// ```
+	// app.onView(def (s slack.ViewSubmission) !none {
+	// 	let title = s.view.value("title")
+	// 	return try s.errors(map<string, string>{"title-block": "At least three characters"}) when title is none || title.value.len() < 3
+	// 	return none
+	// })
+	// ```
+	type ViewSubmission {
+		user Actor
+		team Place
+		view ViewInfo
+		@json("trigger_id")
+		triggerId string
+		@json("api_app_id")
+		apiAppId string
+		// The response URLs of conversation selects with
+		// `responseURLEnabled`: by the conversation chosen.
+		responseURLs map<string, string>
+		internal answering Answering
+
+		def new() {
+			self.view = new ViewInfo()
+			answering = new Answering()
+			answering.what = "view submission"
+		}
+
+		// Keeps the modal open, showing an error under each input by block
+		// id. Fails with Invalid once Slack's three seconds are over.
+		def errors(byBlock map<string, string>) !none {
+			let errs = new map<string, any>()
+			for let (k, v) in byBlock {
+				errs.set(k, v)
+			}
+			return try viewAnswer(map<string, any>{"response_action": "errors", "errors": errs})
+		}
+
+		// Replaces the modal with `form`; after the three seconds through
+		// `views.update`. Fails as that does.
+		def update(form View) !none {
+			let body = try viewBody(form)
+			return none when answering.acknowledge(map<string, any>{"response_action": "update", "view": body})
+			let c = answering.client
+			fail invalid("the view submission came with no client to update the view through") when c is none
+			try c.updateView(view.id, form)
+			return none
+		}
+
+		// Opens `form` over the modal. Fails with Invalid once the three
+		// seconds are over.
+		def push(form View) !none {
+			return try viewAnswer(map<string, any>{"response_action": "push", "view": try viewBody(form)})
+		}
+
+		// Closes every modal of the stack. Fails with Invalid once the three
+		// seconds are over.
+		def clear() !none {
+			return try viewAnswer(map<string, any>{"response_action": "clear"})
+		}
+
+		internal def viewAnswer(body map<string, any>) !none {
+			return none when answering.acknowledge(body)
+			fail invalid("the view submission was acknowledged already: answer within Slack's three seconds")
+		}
+	}
+
+	// A modal closed by the user, with `notifyOnClose` (`view_closed`).
+	type ViewClosed {
+		user Actor
+		team Place
+		view ViewInfo
+		// Every modal of the stack closed at once.
+		@json("is_cleared")
+		isCleared bool
+		@json("api_app_id")
+		apiAppId string
+
+		def new() {
+			self.view = new ViewInfo()
+		}
+	}
+
+	// A shortcut used: a global one from the composer or search
+	// (`shortcut`), or a message shortcut from a message's menu
+	// (`message_action`, with the message and its channel).
+	type Shortcut {
+		// "shortcut" or "message_action".
+		kind string
+		@json("callback_id")
+		callbackId string
+		@json("trigger_id")
+		triggerId string
+		user Actor
+		team Place
+		channel Place
+		message Post
+		@json("response_url")
+		responseURL string
+		@json("api_app_id")
+		apiAppId string
+		internal answering Answering
+
+		def new() {
+			answering = new Answering()
+			answering.what = "shortcut"
+		}
+
+		// Answers a message shortcut in its channel, to the user alone
+		// unless `inChannel`. Fails with Invalid for a global shortcut,
+		// which has no response URL (open a modal with `triggerId`).
+		def respond(text string, inChannel bool = false) !none {
+			return try respond(new Message(text), inChannel)
+		}
+
+		// Answers a message shortcut with a message of blocks. Fails as
+		// `respond` of text does.
+		def respond(message Message, inChannel bool = false) !none {
+			let body = try answerBody(message, inChannel, false)
+			fail invalid("a global shortcut has no channel to answer in: open a modal with its trigger id") when responseURL.len() == 0
+			return try answering.message(body)
+		}
+	}
+
+	// An external select asking for its options as the user types
+	// (`block_suggestion`). Answer with `options` or `groups` within three
+	// seconds.
+	type OptionsRequest {
+		@json("action_id")
+		actionId string
+		@json("block_id")
+		blockId string
+		// What the user typed.
+		value string
+		user Actor
+		team Place
+		container Container
+		view ViewInfo
+		@json("api_app_id")
+		apiAppId string
+		internal answering Answering
+
+		def new() {
+			self.view = new ViewInfo()
+			answering = new Answering()
+			answering.what = "options request"
+		}
+
+		// Offers up to 100 options. Fails with Invalid for a limit they
+		// break, or once the three seconds are over.
+		def options(list Option[]) !none {
+			let problem = optionsProblem("the options", list, 100)
+			fail invalid(problem) when problem.len() > 0
+			return try offer(map<string, any>{"options": optionsBody(list)})
+		}
+
+		// Offers options under headings. Fails as `options` does.
+		def groups(list OptionGroup[]) !none {
+			let out any[] = []
+			for let (k, g) in list {
+				let problem = optionsProblem("group {k}", g.options, 100)
+				fail invalid(problem) when problem.len() > 0
+				out.push(map<string, any>{"label": plainBody(g.label), "options": optionsBody(g.options)})
+			}
+			return try offer(map<string, any>{"option_groups": out})
+		}
+
+		internal def offer(body map<string, any>) !none {
+			return none when answering.acknowledge(body)
+			fail invalid("the options request was answered already: answer within Slack's three seconds")
+		}
+	}
+}

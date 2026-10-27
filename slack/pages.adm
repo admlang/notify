@@ -1,0 +1,60 @@
+partial module adm.notify.slack {
+	// A list Slack hands out a page at a time (conversations, messages,
+	// members, users, files, reactions): `next` fetches the next page by the
+	// cursor the last one named, `all` the rest in one array. Each page
+	// waits for its method's pace like any call.
+	//
+	// ```
+	// let recent = bot.history(channelId)
+	// let page = try recent.next()            // ?Message[], newest first
+	// let everyone = try bot.users().all()
+	// ```
+	type Pages<T> {
+		internal fetch def (string) !(T[], string)
+		internal at    string
+		internal ended bool                        = false
+
+		// Pages that `fetch` returns for a cursor ("" for the first), each
+		// with the cursor of the next ("" after the last).
+		def new(fetch def (string) !(T[], string)) {
+			self.fetch = fetch
+			at = ""
+		}
+
+		// The next page; none after the last. Fails as the call behind the
+		// list does.
+		def next() !?T[] {
+			return none when ended
+			let (page, cursor) = try fetch(at)
+			at = cursor
+			ended = cursor.len() == 0
+			return none when page.len() == 0 && ended
+			return page
+		}
+
+		// Every item left, in one array. Fails as `next` does.
+		def all() !T[] {
+			let out T[] = []
+			for {
+				let page = try next()
+				break when page is none
+				out.push(...page)
+			}
+			return out
+		}
+	}
+
+	// The pages of `method`, its array at `key`, `limit` a page.
+	internal def pagesOf<T>(client Client, method string, key string, args map<string, any>, limit int) Pages<T> {
+		return new Pages<T>(def (cursor string) !(T[], string) {
+			let page = new map<string, any>()
+			for let (k, v) in args {
+				page.set(k, v)
+			}
+			page.set("limit", limit)
+			page.set("cursor", cursor) when cursor.len() > 0
+			let reply = try api(client, method, page)
+			return (try listAt<T>(reply, key), nextCursor(reply))
+		})
+	}
+}

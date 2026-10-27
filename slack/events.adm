@@ -1,0 +1,308 @@
+// The Events API: what happened in a workspace the app is subscribed to,
+// delivered over HTTP or Socket Mode as an `Event` whose `payload` is one
+// of the typed events below, or `OtherEvent` for a type this library does
+// not name.
+partial module adm.notify.slack {
+	use std.data.encoding::(json)
+
+	// A message posted, changed or deleted in a conversation the app is in
+	// (`message`, with `channelType` saying which kind: `channel`, `group`,
+	// `im`, `mpim`). `subtype` is "" for a plain message; a change brings
+	// the new `message` and the `previous` one, a deletion `deletedTs`.
+	struct MessageEvent {
+		channel string
+		@json("channel_type")
+		channelType string
+		user string
+		text string
+		ts string
+		@json("thread_ts")
+		threadTs string
+		subtype string
+		@json("bot_id")
+		botId string
+		team string
+		blocks any[]
+		files File[]
+		edited Edited
+		message Post
+		@json("previous_message")
+		previous Post
+		@json("deleted_ts")
+		deletedTs string
+		@json("event_ts")
+		eventTs string
+	}
+
+	// The app mentioned by `@name` in a message (`app_mention`).
+	struct AppMention {
+		channel string
+		user string
+		text string
+		ts string
+		@json("thread_ts")
+		threadTs string
+		team string
+		blocks any[]
+		@json("event_ts")
+		eventTs string
+	}
+
+	// What a reaction is on.
+	struct ReactionItem {
+		@json("type")
+		kind string
+		channel string
+		ts string
+		file string
+	}
+
+	// A reaction added or taken off (`reaction_added`, `reaction_removed`).
+	struct ReactionEvent {
+		added bool
+		user string
+		// The emoji's name, without colons.
+		reaction string
+		// Who wrote what was reacted to.
+		@json("item_user")
+		itemUser string
+		item ReactionItem
+		@json("event_ts")
+		eventTs string
+	}
+
+	// Someone joined or left a channel (`member_joined_channel`,
+	// `member_left_channel`).
+	struct MemberEvent {
+		joined bool
+		user string
+		channel string
+		@json("channel_type")
+		channelType string
+		team string
+		// Who added them, for a join by invitation.
+		inviter string
+		@json("event_ts")
+		eventTs string
+	}
+
+	// A channel created, renamed, archived, brought back or deleted
+	// (`channel_created`, `channel_rename`, `channel_archive`,
+	// `channel_unarchive`, `channel_deleted`, and the `group_` ones for
+	// private channels): `kind` is Slack's event type.
+	struct ChannelEvent {
+		kind    string
+		channel string
+		name    string
+		user    string
+		eventTs string
+	}
+
+	// A member joined the workspace (`team_join`) or changed (`user_change`).
+	struct UserEvent {
+		joined  bool
+		user    User
+		eventTs string
+	}
+
+	// A user opened the app's Home tab or messages tab (`app_home_opened`).
+	struct AppHomeOpened {
+		user string
+		channel string
+		// "home" or "messages".
+		tab string
+		@json("event_ts")
+		eventTs string
+	}
+
+	// A file shared, created, deleted, made public or changed (`file_shared`,
+	// `file_created`, ...): `kind` is Slack's event type.
+	struct FileEvent {
+		kind    string
+		fileId  string
+		user    string
+		channel string
+		eventTs string
+	}
+
+	// A message or a file pinned or unpinned (`pin_added`, `pin_removed`).
+	struct PinEvent {
+		added   bool
+		user    string
+		channel string
+		item    Item
+		eventTs string
+	}
+
+	// A link the app may unfurl.
+	struct SharedLink {
+		domain string
+		url    string
+	}
+
+	// Links of the app's domains posted in a message (`link_shared`).
+	struct LinkShared {
+		channel string
+		user string
+		@json("message_ts")
+		messageTs string
+		@json("thread_ts")
+		threadTs string
+		links SharedLink[]
+		@json("unfurl_id")
+		unfurlId string
+		source string
+		@json("event_ts")
+		eventTs string
+	}
+
+	// The app was uninstalled from the workspace (`app_uninstalled`): its
+	// tokens no longer work.
+	struct AppUninstalled {
+		eventTs string
+	}
+
+	// Tokens of the app were revoked (`tokens_revoked`): user ids by kind.
+	struct TokensRevoked {
+		oauth   string[]
+		bot     string[]
+		eventTs string
+	}
+
+	// An event of a type this library does not name: its type and its JSON.
+	struct OtherEvent {
+		kind string
+		data map<string, any>
+	}
+
+	// What an event is about.
+	type EventPayload = MessageEvent | AppMention | ReactionEvent | MemberEvent | ChannelEvent | UserEvent | AppHomeOpened | FileEvent | PinEvent | LinkShared | AppUninstalled | TokensRevoked | OtherEvent
+
+	// One delivery of the Events API: the workspace and app it is for, its
+	// id (the same on a retry, `retryNum` above 0), and what happened.
+	//
+	// ```
+	// app.onEvent(def (e slack.Event) !none {
+	// 	match e.payload {
+	// 		case slack.AppMention:
+	// 			try bot.send(e.payload.channel, "Hello <@{e.payload.user}>", slack.PostOptions{thread: e.payload.ts})
+	// 		default:
+	// 	}
+	// 	return none
+	// })
+	// ```
+	type Event {
+		// Slack's event type (`message`, `app_mention`, ...).
+		kind         string
+		teamId       string
+		enterpriseId string
+		apiAppId     string
+		eventId      string
+		// Unix seconds.
+		eventTime    int64
+		// Above 0 when Slack sends it again because no answer came in time.
+		retryNum     int
+		retryReason  string
+		payload      EventPayload
+		// The delivery's JSON as Slack sent it.
+		raw          map<string, any>
+
+		def new() {
+			payload = OtherEvent{}
+		}
+	}
+
+	// The Event of an `event_callback` body. Fails with Invalid when the
+	// event is not of the shape its type names.
+	internal def eventOf(body map<string, any>) !Event {
+		let e = new Event()
+		e.raw = body
+		e.teamId = textAt(body, "team_id")
+		e.enterpriseId = textAt(body, "enterprise_id")
+		e.apiAppId = textAt(body, "api_app_id")
+		e.eventId = textAt(body, "event_id")
+		e.eventTime = int64(intAt(body, "event_time"))
+		let inner = objectAt(body, "event")
+		let kind = textAt(inner, "type")
+		e.kind = kind
+		e.payload = try payloadOf(kind, inner)
+		return e
+	}
+
+	internal def payloadOf(kind string, inner map<string, any>) !EventPayload {
+		let eventTs = textAt(inner, "event_ts")
+		switch kind {
+			case "message":
+				let m = MessageEvent{}
+				try decodeEvent(inner, m)
+				return m
+			case "app_mention":
+				let m = AppMention{}
+				try decodeEvent(inner, m)
+				return m
+			case "reaction_added", "reaction_removed":
+				let r = ReactionEvent{}
+				try decodeEvent(inner, r)
+				r.added = kind == "reaction_added"
+				return r
+			case "member_joined_channel", "member_left_channel":
+				let m = MemberEvent{}
+				try decodeEvent(inner, m)
+				m.joined = kind == "member_joined_channel"
+				return m
+			case "channel_created", "channel_rename", "channel_archive", "channel_unarchive", "channel_deleted", "group_rename", "group_archive", "group_unarchive", "group_deleted":
+				let c = ChannelEvent{kind: kind, user: textAt(inner, "user"), eventTs: eventTs}
+				let ch = inner.get("channel")
+				if ch is string {
+					c.channel = ch
+				} else if ch is map<string, any> {
+					c.channel = textAt(ch, "id")
+					c.name = textAt(ch, "name")
+					c.user = textAt(ch, "creator") when c.user.len() == 0
+				}
+				return c
+			case "team_join", "user_change":
+				let u = UserEvent{joined: kind == "team_join", eventTs: eventTs}
+				try decodeEventAt(inner, "user", u.user)
+				return u
+			case "app_home_opened":
+				let h = AppHomeOpened{}
+				try decodeEvent(inner, h)
+				return h
+			case "file_shared", "file_created", "file_deleted", "file_public", "file_change", "file_unshared":
+				return FileEvent{kind: kind, fileId: textAt(inner, "file_id"), user: textAt(inner, "user_id"), channel: textAt(inner, "channel_id"), eventTs: eventTs}
+			case "pin_added", "pin_removed":
+				let p = PinEvent{added: kind == "pin_added", user: textAt(inner, "user"), channel: textAt(inner, "channel_id"), eventTs: eventTs}
+				try decodeEventAt(inner, "item", p.item)
+				return p
+			case "link_shared":
+				let l = LinkShared{}
+				try decodeEvent(inner, l)
+				return l
+			case "app_uninstalled":
+				return AppUninstalled{eventTs: eventTs}
+			case "tokens_revoked":
+				let tokens = objectAt(inner, "tokens")
+				let t = TokensRevoked{eventTs: eventTs}
+				collectTexts(tokens.get("oauth"), t.oauth)
+				collectTexts(tokens.get("bot"), t.bot)
+				return t
+			default:
+				return OtherEvent{kind: kind, data: inner}
+		}
+	}
+
+	internal def decodeEvent(inner map<string, any>, target any) !none {
+		decodeObject(inner, target) onerror (err error) {
+			fail invalid("the {textAt(inner, "type")} event is not what Slack sends: {err.message}")
+		}
+		return none
+	}
+
+	internal def decodeEventAt(inner map<string, any>, key string, target any) !none {
+		decodeAt(inner, key, target) onerror (err error) {
+			fail invalid("the {textAt(inner, "type")} event's {key} is not what Slack sends: {err.message}")
+		}
+		return none
+	}
+}

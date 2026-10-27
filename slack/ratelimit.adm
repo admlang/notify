@@ -1,0 +1,80 @@
+partial module adm.notify.slack {
+	use std.time
+
+	// Slack's rate-limit tiers: the calls a minute each allows a method,
+	// per workspace and app. Tier 1 is 1, Tier 2 20, Tier 3 50, Tier 4 100;
+	// Slack allows short bursts past them, which pacing to the figure never
+	// needs.
+	internal def perMinute(method string) int {
+		switch method {
+			case "conversations.list", "conversations.create", "conversations.archive", "conversations.unarchive", "conversations.rename", "conversations.setTopic", "conversations.setPurpose", "conversations.close", "users.list", "users.setPresence", "reactions.remove", "reactions.list", "pins.add", "pins.remove", "pins.list", "bookmarks.add", "bookmarks.edit", "bookmarks.remove", "bookmarks.list", "usergroups.create", "usergroups.update", "usergroups.disable", "usergroups.enable", "usergroups.list", "usergroups.users.list", "usergroups.users.update":
+				return 20
+			case "auth.test", "chat.postEphemeral", "chat.getPermalink", "conversations.members", "users.info", "users.profile.get", "files.getUploadURLExternal", "files.completeUploadExternal", "files.info", "views.open", "views.push", "views.update", "views.publish", "oauth.v2.access":
+				return 100
+			case "chat.postMessage":
+				// Paced per channel instead (`channelGap`).
+				return 0
+			case "apps.connections.open":
+				// Tier 1, but Socket Mode reconnects at Slack's request and
+				// must not wait a minute for it: a 429 paces it instead.
+				return 0
+			default:
+				return 50
+		}
+	}
+
+	// The gap `chat.postMessage` keeps between two messages to one channel:
+	// Slack allows about one a second.
+	internal const channelGap = 1s
+
+	// What has been sent of one method this minute.
+	internal struct Window {
+		start int64 = 0
+		count int   = 0
+	}
+
+	// The pace of one token: a window a minute per method, the time of the
+	// last message per channel, and the pause a 429 asked of a method.
+	// Safe from many tasks.
+	internal type Limiter {
+		internal windows  map<string, Window>
+		internal channels map<string, int64>
+		internal blocked  map<string, int64>
+
+		def new() {}
+
+		// How long a call of `method` (to `channel`, for a message) has to
+		// wait before it may go out; 0s takes its place.
+		atomic def waitFor(method string, channel string) duration {
+			let now = time.monoNs()
+			let until = blocked.get(method)
+			return duration(until - now) when !(until is none) && until > now
+			let quota = perMinute(method)
+			if quota > 0 {
+				let found = windows.get(method)
+				let w = found is none ?? (Window{start: now}, found)
+				if now - w.start >= 60000000000 {
+					w.start = now
+					w.count = 0
+				}
+				return duration(w.start + 60000000000 - now) when w.count >= quota
+				w.count++
+				windows.set(method, w)
+			}
+			if method == "chat.postMessage" && channel.len() > 0 {
+				let last = channels.get(channel)
+				let next = last is none ?? (int64(0), last + int64(channelGap))
+				return duration(next - now) when next > now
+				channels.set(channel, now)
+			}
+			return 0s
+		}
+
+		// Holds back `method` for `after`, as a 429 asked.
+		atomic def block(method string, after duration) {
+			let until = time.monoNs() + int64(after)
+			let held = blocked.get(method)
+			blocked.set(method, until) when held is none || until > held
+		}
+	}
+}

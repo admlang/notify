@@ -1,0 +1,137 @@
+partial module adm.notify.slack {
+	use std.time
+
+	// Data an app attaches to a message for other apps (and itself) to read
+	// back: an event type and its payload.
+	struct Metadata {
+		eventType string
+		payload   map<string, any>
+	}
+
+	// How a message is posted, besides its text and blocks.
+	struct PostOptions {
+		// The `ts` of the thread's parent, to reply in a thread.
+		thread    string    = ""
+		// A thread reply shown in the channel too.
+		broadcast bool      = false
+		// Whether links and media in the text unfold into previews.
+		unfurl    bool      = true
+		// Whether `text` is read as Markdown.
+		markdown  bool      = true
+		// A bot posting under another name or icon (with `chat:write.customize`).
+		username  string    = ""
+		iconEmoji string    = ""
+		iconURL   string    = ""
+		metadata  ?Metadata = none
+	}
+
+	partial type Client {
+		// Posts `text` (Markdown) to a channel by id or `#name`, a user's
+		// direct message by `U…` id, or a thread. Fails as every call does.
+		def send(channel string, text string, options PostOptions = PostOptions{}) !Sent {
+			return try send(channel, new Message(text), options)
+		}
+
+		// Posts a message of blocks. Fails with Invalid for a Block Kit
+		// limit it breaks, and as every call does.
+		def send(channel string, message Message, options PostOptions = PostOptions{}) !Sent {
+			let args = map<string, any>{"channel": channel}
+			try messageArgs(message, args)
+			postArgs(options, args)
+			let reply = try api(self, "chat.postMessage", args, target = channel)
+			return try sentOf(reply)
+		}
+
+		// Changes a message's text. Fails as every call does.
+		def update(channel string, ts string, text string) !Sent {
+			return try update(channel, ts, new Message(text))
+		}
+
+		// Changes a message's text and blocks. Fails as `send` does.
+		def update(channel string, ts string, message Message) !Sent {
+			let args = map<string, any>{"channel": channel, "ts": ts}
+			try messageArgs(message, args)
+			args.set("blocks", any[]) when message.blocks.len() == 0
+			return try sentOf(try api(self, "chat.update", args))
+		}
+
+		// Deletes a message. Fails as every call does.
+		def delete(channel string, ts string) !none {
+			try api(self, "chat.delete", map<string, any>{"channel": channel, "ts": ts})
+			return none
+		}
+
+		// Shows `text` to one user in a channel, until they reload. Returns
+		// its `ts`. Fails as every call does.
+		def ephemeral(channel string, user string, text string, thread string = "") !string {
+			return try ephemeral(channel, user, new Message(text), thread)
+		}
+
+		// Shows a message of blocks to one user in a channel. Returns its
+		// `ts`. Fails as `send` does.
+		def ephemeral(channel string, user string, message Message, thread string = "") !string {
+			let args = map<string, any>{"channel": channel, "user": user}
+			try messageArgs(message, args)
+			args.set("thread_ts", thread) when thread.len() > 0
+			let reply = try api(self, "chat.postEphemeral", args)
+			return textAt(reply, "message_ts")
+		}
+
+		// Posts `text` at `at` (up to 120 days ahead). Returns what waits.
+		// Fails as every call does.
+		def schedule(channel string, at time.Time, text string, options PostOptions = PostOptions{}) !ScheduledMessage {
+			return try schedule(channel, at, new Message(text), options)
+		}
+
+		// Posts a message of blocks at `at`. Fails as `send` does.
+		def schedule(channel string, at time.Time, message Message, options PostOptions = PostOptions{}) !ScheduledMessage {
+			let args = map<string, any>{"channel": channel, "post_at": at.unixNs() / 1000000000}
+			try messageArgs(message, args)
+			postArgs(options, args)
+			let reply = try api(self, "chat.scheduleMessage", args)
+			return ScheduledMessage{id: textAt(reply, "scheduled_message_id"), channelId: textAt(reply, "channel"), postAt: int64(intAt(reply, "post_at")), text: message.text}
+		}
+
+		// Withdraws a scheduled message. Fails as every call does.
+		def unschedule(channel string, id string) !none {
+			try api(self, "chat.deleteScheduledMessage", map<string, any>{"channel": channel, "scheduled_message_id": id})
+			return none
+		}
+
+		// The messages waiting to be posted, in a channel or everywhere.
+		def scheduled(channel string = "") Pages<ScheduledMessage> {
+			let args = new map<string, any>()
+			args.set("channel", channel) when channel.len() > 0
+			return pagesOf<ScheduledMessage>(self, "chat.scheduledMessages.list", "scheduled_messages", args, 100)
+		}
+
+		// The address of a message. Fails as every call does.
+		def permalink(channel string, ts string) !string {
+			let reply = try api(self, "chat.getPermalink", map<string, any>{"channel": channel, "message_ts": ts})
+			return textAt(reply, "permalink")
+		}
+	}
+
+	internal def postArgs(o PostOptions, args map<string, any>) {
+		if o.thread.len() > 0 {
+			args.set("thread_ts", o.thread)
+			args.set("reply_broadcast", true) when o.broadcast
+		}
+		if !o.unfurl {
+			args.set("unfurl_links", false)
+			args.set("unfurl_media", false)
+		}
+		args.set("mrkdwn", false) unless o.markdown
+		args.set("username", o.username) when o.username.len() > 0
+		args.set("icon_emoji", o.iconEmoji) when o.iconEmoji.len() > 0
+		args.set("icon_url", o.iconURL) when o.iconURL.len() > 0
+		let m = o.metadata
+		args.set("metadata", map<string, any>{"event_type": m.eventType, "event_payload": m.payload}) unless m is none
+	}
+
+	internal def sentOf(reply map<string, any>) !Sent {
+		let out = Sent{channel: textAt(reply, "channel"), ts: textAt(reply, "ts")}
+		try decodeAt(reply, "message", out.message)
+		return out
+	}
+}

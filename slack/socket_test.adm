@@ -1,0 +1,120 @@
+partial module adm.notify.slack {
+	use (
+		std.time
+		std.testing
+		std.net.http
+		std.net.http.websocket
+		std.data.encoding::(JSON)
+	)
+
+	check "Slack Socket Mode" {
+		// Envelopes reach the app and are acknowledged by id, an
+		// interaction's answer as the payload; a refresh connects again.
+		@test()
+		def TestSocketMode() !none {
+			let seen = new Seen()
+			let acks = new channel<map<string, any>>(8)
+			let dials = new channel<int>(4)
+			let count = new Counter()
+			let server = try slackServer(seen, def (mux http.ServeMux) !none {
+				return try mux.handle("/socket", websocket.handler(def (conn websocket.Conn) !none {
+					let n = count.next()
+					dials <- n
+					try conn.writeText(json(map<string, any>{"type": "hello", "num_connections": 1}))
+					if n > 1 {
+						for {
+							conn.readMessage() onerror (err error) {
+								return none
+							}
+						}
+					}
+					let event = map<string, any>{"type": "event_callback", "team_id": "T1", "event_id": "Ev9", "event": map<string, any>{"type": "app_mention", "user": "U1", "channel": "C1", "text": "hi"}}
+					try conn.writeText(json(map<string, any>{"envelope_id": "e1", "type": "events_api", "payload": event, "retry_attempt": 1}))
+					let suggestion = map<string, any>{"type": "block_suggestion", "action_id": "pick", "value": "ab", "user": map<string, any>{"id": "U1"}}
+					try conn.writeText(json(map<string, any>{"envelope_id": "e2", "type": "interactive", "payload": suggestion, "accepts_response_payload": true}))
+					let command = map<string, any>{"command": "/ping", "text": "now", "user_id": "U1", "channel_id": "C1"}
+					try conn.writeText(json(map<string, any>{"envelope_id": "e3", "type": "slash_commands", "payload": command, "accepts_response_payload": true}))
+					for let k = 0; k < 3; k++ {
+						let (_, data) = try conn.readMessage()
+						let parsed = try (new JSON()).parse(data)
+						acks <- parsed is map<string, any> ?? (parsed, new map<string, any>())
+					}
+					try conn.writeText(json(map<string, any>{"type": "disconnect", "reason": "refresh_requested"}))
+					return none
+				}))
+			})
+			seen.replies.set("apps.connections.open", json(map<string, any>{"ok": true, "url": "ws{seen.base[4:]}/socket"}))
+			let mentions = new channel<Event>(2)
+			let app = new App(clientOf(seen), testSecret)
+			app.onEvent(def (e Event) !none {
+				mentions <- e
+				return none
+			})
+			app.onOptions(def (o OptionsRequest) !none {
+				return try o.options([option("{o.value}!", "x")])
+			})
+			app.onCommand(def (c Command) !none {
+				return try c.respond("pong {c.text}")
+			})
+			let socket = new SocketMode(app, "xapp-test")
+			let ended = new channel<string>(1)
+			async runSocket(socket, ended)
+			assert <- dials == 1
+			let byId = new map<string, map<string, any>>()
+			for let k = 0; k < 3; k++ {
+				let ack = <-acks
+				byId.set("{ack.get("envelope_id")}", ack)
+			}
+			let mention = <-mentions
+			assert mention.kind == "app_mention" && mention.retryNum == 1 && mention.eventId == "Ev9"
+			let first = byId.get("e1")
+			assert !(first is none) && !first.hasKey("payload")
+			let options = byId.get("e2")
+			assert !(options is none) && json(options.get("payload")).contains("ab!")
+			let pong = byId.get("e3")
+			assert !(pong is none) && json(pong.get("payload")).contains("pong now")
+			assert <- dials == 2
+			assert seen.methods.join(",") == "apps.connections.open,apps.connections.open" && seen.auth[0] == "Bearer xapp-test"
+			try socket.close()
+			assert <- ended == ""
+			try server.close()
+			return none
+		}
+
+		// Slack refusing the app-level token ends `run` with Auth.
+		@test()
+		def TestSocketModeAuth() !none {
+			let seen = new Seen()
+			let server = try slackServer(seen)
+			seen.replies.set("apps.connections.open", json(map<string, any>{"ok": false, "error": "invalid_auth"}))
+			let socket = new SocketMode(new App(clientOf(seen), testSecret), "xapp-bad")
+			socket.run() onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.Auth
+				recover none
+			}
+			try server.close()
+			return none
+		}
+	}
+
+	// Counts the connections the test server took.
+	internal type Counter {
+		internal n int = 0
+
+		def new() {}
+
+		atomic def next() int {
+			n++
+			return n
+		}
+	}
+
+	internal def runSocket(socket SocketMode, ended channel<string>) {
+		let failure = ""
+		socket.run() onerror (err error) {
+			failure = err.message
+			recover none
+		}
+		ended <- failure
+	}
+}

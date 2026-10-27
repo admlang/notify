@@ -1,0 +1,579 @@
+// Block Kit's layout blocks, rich text, and the Message a post, an update,
+// an ephemeral message, a webhook or an interaction answer carries. Every
+// limit Slack enforces is checked before anything is sent (`problem`), so
+// a message Slack would refuse fails with Invalid naming the block and the
+// limit.
+partial module adm.notify.slack {
+	// Text with an optional accessory beside it, and up to ten fields in two
+	// columns.
+	struct Section {
+		text      ?Text    = none
+		fields    Text[]
+		accessory ?Element = none
+		blockId   string   = ""
+		// Show all of a long text, without "see more".
+		expand    bool     = false
+	}
+
+	// A thin line between blocks.
+	struct Divider {
+		blockId string = ""
+	}
+
+	// Large bold plain text.
+	struct Header {
+		text    string
+		blockId string = ""
+	}
+
+	// A picture: by address or by a Slack file's id.
+	struct Image {
+		url       string = ""
+		slackFile string = ""
+		alt       string
+		title     string = ""
+		blockId   string = ""
+	}
+
+	// A row of up to 25 interactive elements.
+	struct Actions {
+		elements Element[]
+		blockId  string    = ""
+	}
+
+	// Small text and pictures, up to ten.
+	type ContextElement = Text | ImageElement
+
+	// A line of small grey text and pictures under a message.
+	struct Context {
+		elements ContextElement[]
+		blockId  string           = ""
+	}
+
+	// A labelled field of a modal (or of a message, with `dispatchAction`).
+	struct Input {
+		label          string
+		element        Element
+		hint           string  = ""
+		optional       bool    = false
+		// The element's actions reach `App.onAction` as they happen.
+		dispatchAction bool    = false
+		blockId        string  = ""
+	}
+
+	// An embedded video player.
+	struct Video {
+		videoURL        string
+		thumbnailURL    string
+		alt             string
+		title           string
+		titleURL        string = ""
+		description     string = ""
+		authorName      string = ""
+		providerName    string = ""
+		providerIconURL string = ""
+		blockId         string = ""
+	}
+
+	// A remote file, added with `files.remote.add`, by its external id.
+	struct FileBlock {
+		externalId string
+		blockId    string = ""
+	}
+
+	// Markdown as Slack renders it in a message, for text an LLM or a
+	// document gave (12,000 characters in all of a message).
+	struct MarkdownBlock {
+		text    string
+		blockId string = ""
+	}
+
+	// What a run of rich text is.
+	enum InlineKind {
+		Text      = "text",
+		Link      = "link",
+		Emoji     = "emoji",
+		User      = "user",
+		Channel   = "channel",
+		Usergroup = "usergroup",
+		// `@here`, `@channel` or `@everyone` (`text` holds which).
+		Broadcast = "broadcast",
+		// A date in the reader's zone: `value` is Unix seconds, `text` the
+		// format (`{date_short}`), `url` a link.
+		Date      = "date",
+		Color     = "color",
+	}
+
+	// A run of rich text: text with its styles, a link, an emoji, a mention
+	// or a date.
+	struct Inline {
+		kind   InlineKind = InlineKind.Text
+		text   string     = ""
+		// A link's address, an emoji's name, the id of a mention.
+		value  string     = ""
+		url    string     = ""
+		bold   bool       = false
+		italic bool       = false
+		strike bool       = false
+		code   bool       = false
+	}
+
+	// A run of styled text.
+	def styled(text string, bold bool = false, italic bool = false, strike bool = false, code bool = false) Inline {
+		return Inline{text: text, bold: bold, italic: italic, strike: strike, code: code}
+	}
+
+	// A link showing `text` (the address when "").
+	def link(url string, text string = "") Inline {
+		return Inline{kind: InlineKind.Link, value: url, text: text}
+	}
+
+	// A mention of a user (`U…`), a channel (`C…`) or a user group (`S…`)
+	// by id.
+	def mention(id string) Inline {
+		let kind = id.startsWith("C") || id.startsWith("G") ?? (InlineKind.Channel, id.startsWith("S") ?? (InlineKind.Usergroup, InlineKind.User))
+		return Inline{kind: kind, value: id}
+	}
+
+	// What a part of a rich text block is.
+	enum RichKind {
+		Section      = "rich_text_section",
+		List         = "rich_text_list",
+		Preformatted = "rich_text_preformatted",
+		Quote        = "rich_text_quote",
+	}
+
+	// A part of a rich text block: a paragraph, a bulleted or ordered list
+	// (each item a paragraph), a code block or a quote.
+	struct RichPart {
+		kind     RichKind   = RichKind.Section
+		elements Inline[]
+		// List: its items, whether numbered, its indent and first number.
+		items    RichPart[]
+		ordered  bool       = false
+		indent   int        = 0
+		offset   int        = 0
+		border   int        = 0
+	}
+
+	// Formatted text: paragraphs, lists, code and quotes of styled runs.
+	struct RichText {
+		parts   RichPart[]
+		blockId string     = ""
+	}
+
+	// A paragraph of runs.
+	def paragraph(runs ...Inline) RichPart {
+		return RichPart{elements: runs}
+	}
+
+	// A layout block of a message, a modal or a home tab.
+	type Block = Section | Divider | Header | Image | Actions | Context | Input | Video | FileBlock | MarkdownBlock | RichText
+
+	internal def inlineBody(r Inline) map<string, any> {
+		let out = map<string, any>{"type": r.kind.value}
+		switch r.kind {
+			case InlineKind.Text:
+				out.set("text", r.text)
+			case InlineKind.Link:
+				out.set("url", r.value)
+				out.set("text", r.text) when r.text.len() > 0
+			case InlineKind.Emoji:
+				out.set("name", r.value)
+			case InlineKind.User:
+				out.set("user_id", r.value)
+			case InlineKind.Channel:
+				out.set("channel_id", r.value)
+			case InlineKind.Usergroup:
+				out.set("usergroup_id", r.value)
+			case InlineKind.Broadcast:
+				out.set("range", r.text)
+			case InlineKind.Date:
+				out.set("timestamp", r.value.isNumeric() ?? (r.value.toInt<int64>(), int64(0)))
+				out.set("format", r.text)
+				out.set("url", r.url) when r.url.len() > 0
+			case InlineKind.Color:
+				out.set("value", r.value)
+		}
+		let styles = new map<string, any>()
+		styles.set("bold", true) when r.bold
+		styles.set("italic", true) when r.italic
+		styles.set("strike", true) when r.strike
+		styles.set("code", true) when r.code
+		out.set("style", styles) when styles.len() > 0
+		return out
+	}
+
+	internal def richPartBody(p RichPart) map<string, any> {
+		let out = map<string, any>{"type": p.kind.value}
+		if p.kind == RichKind.List {
+			let items any[] = []
+			for let (_, item) in p.items {
+				items.push(richPartBody(item))
+			}
+			out.set("elements", items)
+			out.set("style", p.ordered ?? ("ordered", "bullet"))
+			out.set("indent", p.indent) when p.indent > 0
+			out.set("offset", p.offset) when p.offset > 0
+		} else {
+			let runs any[] = []
+			for let (_, r) in p.elements {
+				runs.push(inlineBody(r))
+			}
+			out.set("elements", runs)
+		}
+		out.set("border", p.border) when p.border > 0
+		return out
+	}
+
+	internal def richTextBody(r RichText) map<string, any> {
+		let parts any[] = []
+		for let (_, p) in r.parts {
+			parts.push(richPartBody(p))
+		}
+		let out = map<string, any>{"type": "rich_text", "elements": parts}
+		out.set("block_id", r.blockId) when r.blockId.len() > 0
+		return out
+	}
+
+	// The JSON of a block.
+	internal def blockBody(b Block) map<string, any> {
+		let out = new map<string, any>()
+		let id = ""
+		match b {
+			case Section:
+				out = map<string, any>{"type": "section"}
+				let t = b.text
+				out.set("text", textBody(t)) unless t is none
+				if b.fields.len() > 0 {
+					let fields any[] = []
+					for let (_, f) in b.fields {
+						fields.push(textBody(f))
+					}
+					out.set("fields", fields)
+				}
+				let a = b.accessory
+				out.set("accessory", elementBody(a)) unless a is none
+				out.set("expand", true) when b.expand
+				id = b.blockId
+			case Divider:
+				out = map<string, any>{"type": "divider"}
+				id = b.blockId
+			case Header:
+				out = map<string, any>{"type": "header", "text": plainBody(b.text)}
+				id = b.blockId
+			case Image:
+				out = map<string, any>{"type": "image", "alt_text": b.alt}
+				if b.slackFile.len() > 0 {
+					out.set("slack_file", map<string, any>{"id": b.slackFile})
+				} else {
+					out.set("image_url", b.url)
+				}
+				out.set("title", plainBody(b.title)) when b.title.len() > 0
+				id = b.blockId
+			case Actions:
+				let elements any[] = []
+				for let (_, e) in b.elements {
+					elements.push(elementBody(e))
+				}
+				out = map<string, any>{"type": "actions", "elements": elements}
+				id = b.blockId
+			case Context:
+				let elements any[] = []
+				for let (_, e) in b.elements {
+					match e {
+						case Text:
+							elements.push(textBody(e))
+						case ImageElement:
+							elements.push(elementBody(e))
+					}
+				}
+				out = map<string, any>{"type": "context", "elements": elements}
+				id = b.blockId
+			case Input:
+				out = map<string, any>{"type": "input", "label": plainBody(b.label), "element": elementBody(b.element)}
+				out.set("hint", plainBody(b.hint)) when b.hint.len() > 0
+				out.set("optional", true) when b.optional
+				out.set("dispatch_action", true) when b.dispatchAction
+				id = b.blockId
+			case Video:
+				out = map<string, any>{"type": "video", "video_url": b.videoURL, "thumbnail_url": b.thumbnailURL, "alt_text": b.alt, "title": plainBody(b.title)}
+				out.set("title_url", b.titleURL) when b.titleURL.len() > 0
+				out.set("description", plainBody(b.description)) when b.description.len() > 0
+				out.set("author_name", b.authorName) when b.authorName.len() > 0
+				out.set("provider_name", b.providerName) when b.providerName.len() > 0
+				out.set("provider_icon_url", b.providerIconURL) when b.providerIconURL.len() > 0
+				id = b.blockId
+			case FileBlock:
+				out = map<string, any>{"type": "file", "external_id": b.externalId, "source": "remote"}
+				id = b.blockId
+			case MarkdownBlock:
+				out = map<string, any>{"type": "markdown", "text": b.text}
+				id = b.blockId
+			case RichText:
+				return richTextBody(b)
+		}
+		out.set("block_id", id) when id.len() > 0
+		return out
+	}
+
+	internal def blocksBody(blocks Block[]) any[] {
+		let out any[] = []
+		for let (_, b) in blocks {
+			out.push(blockBody(b))
+		}
+		return out
+	}
+
+	// The block id of a block; "" for one without.
+	internal def blockIdOf(b Block) string {
+		match b {
+			case Section:
+				return b.blockId
+			case Divider:
+				return b.blockId
+			case Header:
+				return b.blockId
+			case Image:
+				return b.blockId
+			case Actions:
+				return b.blockId
+			case Context:
+				return b.blockId
+			case Input:
+				return b.blockId
+			case Video:
+				return b.blockId
+			case FileBlock:
+				return b.blockId
+			case MarkdownBlock:
+				return b.blockId
+			case RichText:
+				return b.blockId
+		}
+	}
+
+	// Whether an element may sit in an actions block, as a section's
+	// accessory, or in an input block.
+	internal def fitsActions(e Element) bool {
+		return !(e is TextInput || e is ImageElement || e is FileInput || e is RichTextInput)
+	}
+
+	internal def fitsAccessory(e Element) bool {
+		return !(e is TextInput || e is FileInput || e is RichTextInput || e is DatetimePicker)
+	}
+
+	internal def fitsInput(e Element) bool {
+		return !(e is Button || e is WorkflowButton || e is Overflow || e is ImageElement)
+	}
+
+	// The first limit `blocks` break where a surface holds at most `most`
+	// (50 for a message, 100 for a modal or a home tab); "" when they break
+	// none. Names the block by its place and type.
+	internal def blocksProblem(blocks Block[], most int) string {
+		return "{blocks.len()} blocks, at most {most}" when blocks.len() > most
+		let ids map<string, bool>
+		let markdown = 0
+		for let (k, b) in blocks {
+			let id = blockIdOf(b)
+			if id.len() > 0 {
+				return "block {k} has a block_id of {id.len()} characters, at most 255" when id.len() > 255
+				return "block {k} repeats the block_id {id}" when ids.hasKey(id)
+				ids[id] = true
+			}
+			if b is MarkdownBlock {
+				markdown += b.text.len()
+				return "the markdown blocks hold {markdown} characters, at most 12000" when markdown > 12000
+			}
+			let problem = blockProblem("block {k}", b)
+			return problem when problem.len() > 0
+		}
+		return ""
+	}
+
+	internal def blockProblem(place string, b Block) string {
+		let problem = ""
+		match b {
+			case Section:
+				let t = b.text
+				problem = "{place} (section) has no text and no fields" when t is none && b.fields.len() == 0
+				problem = textProblem("{place} (section)'s text", t.text, 3000) when problem.len() == 0 && !(t is none)
+				problem = "{place} (section) has {b.fields.len()} fields, at most 10" when problem.len() == 0 && b.fields.len() > 10
+				for let (k, f) in b.fields {
+					break when problem.len() > 0
+					problem = textProblem("{place} (section)'s field {k}", f.text, 2000)
+				}
+				let a = b.accessory
+				if problem.len() == 0 && !(a is none) {
+					problem = "{place} (section) cannot hold that element as its accessory" unless fitsAccessory(a)
+					problem = elementProblem("{place} (section)'s accessory", a) when problem.len() == 0
+				}
+			case Header:
+				problem = textProblem("{place} (header)'s text", b.text, 150)
+			case Image:
+				problem = "{place} (image) needs an image url or a Slack file" when b.url.len() == 0 && b.slackFile.len() == 0
+				problem = textProblem("{place} (image)'s url", b.url, 3000, false) when problem.len() == 0
+				problem = textProblem("{place} (image)'s alt text", b.alt, 2000) when problem.len() == 0
+				problem = textProblem("{place} (image)'s title", b.title, 2000, false) when problem.len() == 0
+			case Actions:
+				problem = "{place} (actions) has {b.elements.len()} elements, 1 to 25" when b.elements.len() == 0 || b.elements.len() > 25
+				let ids map<string, bool>
+				for let (k, e) in b.elements {
+					break when problem.len() > 0
+					problem = "{place} (actions) cannot hold element {k}" unless fitsActions(e)
+					problem = elementProblem("{place} (actions)'s element {k}", e) when problem.len() == 0
+					let id = actionIdOf(e)
+					if problem.len() == 0 && id.len() > 0 {
+						problem = "{place} (actions) repeats the action_id {id}" when ids.hasKey(id)
+						ids[id] = true
+					}
+				}
+			case Context:
+				problem = "{place} (context) has {b.elements.len()} elements, 1 to 10" when b.elements.len() == 0 || b.elements.len() > 10
+				for let (k, e) in b.elements {
+					break when problem.len() > 0
+					match e {
+						case Text:
+							problem = textProblem("{place} (context)'s text {k}", e.text, 3000)
+						case ImageElement:
+							problem = elementProblem("{place} (context)'s image {k}", e)
+					}
+				}
+			case Input:
+				problem = textProblem("{place} (input)'s label", b.label, 2000)
+				problem = textProblem("{place} (input)'s hint", b.hint, 2000, false) when problem.len() == 0
+				problem = "{place} (input) cannot hold that element" when problem.len() == 0 && !fitsInput(b.element)
+				problem = elementProblem("{place} (input)'s element", b.element) when problem.len() == 0
+			case Video:
+				problem = textProblem("{place} (video)'s title", b.title, 200)
+				problem = textProblem("{place} (video)'s alt text", b.alt, 2000) when problem.len() == 0
+				problem = textProblem("{place} (video)'s description", b.description, 200, false) when problem.len() == 0
+				problem = textProblem("{place} (video)'s url", b.videoURL, 3000) when problem.len() == 0
+				problem = textProblem("{place} (video)'s thumbnail url", b.thumbnailURL, 3000) when problem.len() == 0
+			case FileBlock:
+				problem = textProblem("{place} (file)'s external id", b.externalId, 255)
+			case MarkdownBlock:
+				problem = "{place} (markdown) is empty" when b.text.len() == 0
+			case RichText:
+				problem = "{place} (rich text) is empty" when b.parts.len() == 0
+			default:
+		}
+		return problem
+	}
+
+	// A message's text and blocks. `text` is what notifications, screen
+	// readers and clients without Block Kit show; Slack asks for it beside
+	// blocks. The methods add blocks and return the message, so they chain.
+	//
+	// ```
+	// let m = new slack.Message("Deploy 42 finished")
+	// m.header("Deploy 42").section("*main* is live", fields = ["*By*\nana", "*Took*\n4 min"])
+	// m.button("Open", url = "https://ci.example/42").button("Roll back", actionId = "rollback", variant = slack.ButtonStyle.Danger)
+	// ```
+	type Message {
+		text   string  = ""
+		blocks Block[]
+
+		def new(text string = "") {
+			self.text = text
+		}
+
+		// Adds `block`.
+		def add(block Block) Message {
+			blocks.push(block)
+			return self
+		}
+
+		// Adds a section of Markdown `text`, with `fields` (Markdown too)
+		// and an accessory.
+		def section(text string, fields string[] = [], accessory ?Element = none) Message {
+			blocks.push(sectionOf(text, fields, accessory))
+			return self
+		}
+
+		// Adds a header of plain `text`.
+		def header(text string) Message {
+			blocks.push(Header{text: text})
+			return self
+		}
+
+		// Adds a divider.
+		def divider() Message {
+			blocks.push(Divider{})
+			return self
+		}
+
+		// Adds a context line of Markdown texts.
+		def context(texts ...string) Message {
+			blocks.push(contextOf(texts))
+			return self
+		}
+
+		// Adds an image block.
+		def image(url string, alt string, title string = "") Message {
+			blocks.push(Image{url: url, alt: alt, title: title})
+			return self
+		}
+
+		// Adds a markdown block.
+		def markdown(text string) Message {
+			blocks.push(MarkdownBlock{text: text})
+			return self
+		}
+
+		// Adds a button to the actions block the message ends with, or to a
+		// new one.
+		def button(text string, actionId string = "", url string = "", value string = "", variant ButtonStyle = ButtonStyle.Default, confirm ?Confirm = none) Message {
+			return action(Button{text: text, actionId: actionId, url: url, value: value, variant: variant, confirm: confirm})
+		}
+
+		// Adds an element to the actions block the message ends with, or to
+		// a new one.
+		def action(element Element) Message {
+			if blocks.len() > 0 {
+				let last = blocks[blocks.len() - 1]
+				match last {
+					case Actions:
+						last.elements.push(element)
+						return self
+					default:
+				}
+			}
+			blocks.push(Actions{elements: [element]})
+			return self
+		}
+
+		// The first limit the message breaks; "" when it breaks none.
+		def problem() string {
+			return "the message has neither text nor blocks" when text.len() == 0 && blocks.len() == 0
+			return "the text is {text.len()} characters, at most 40000" when text.len() > 40000
+			return blocksProblem(blocks, 50)
+		}
+	}
+
+	internal def sectionOf(text string, fields string[], accessory ?Element) Section {
+		let s = Section{text: mrkdwn(text), accessory: accessory}
+		for let (_, f) in fields {
+			s.fields.push(mrkdwn(f))
+		}
+		return s
+	}
+
+	internal def contextOf(list string[]) Context {
+		let c = Context{}
+		for let (_, t) in list {
+			c.elements.push(mrkdwn(t))
+		}
+		return c
+	}
+
+	// The arguments a message adds to a call: `text` and `blocks`. Fails
+	// with Invalid for a limit it breaks.
+	internal def messageArgs(m Message, args map<string, any>) !none {
+		let problem = m.problem()
+		fail invalid(problem) when problem.len() > 0
+		args.set("text", m.text) when m.text.len() > 0
+		args.set("blocks", blocksBody(m.blocks)) when m.blocks.len() > 0
+		return none
+	}
+}

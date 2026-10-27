@@ -1,0 +1,208 @@
+partial module adm.notify.slack {
+	use (
+		std.time
+		std.net.http.websocket
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON)
+	)
+
+	// Socket Mode: an App's events, interactions and slash commands over a
+	// WebSocket to Slack, for an app without a public Request URL. `run`
+	// asks Slack for a connection with the app-level token (`xapp-`, scope
+	// `connections:write`), acknowledges each envelope as the HTTP handler
+	// would (an interaction's first answer in the acknowledgement), and
+	// connects again when Slack asks to refresh or the connection drops.
+	//
+	// ```
+	// let app = new slack.App(bot)
+	// app.onEvent(def (e slack.Event) !none { ... })
+	// try new slack.SocketMode(app).run()           // SLACK_APP_TOKEN
+	// ```
+	//
+	// `run` fails with SlackError: Auth for an app-level token Slack
+	// refuses, Invalid when Slack disabled Socket Mode for the app
+	// (`link_disabled`), Transport once `reconnectLimit` connections in a
+	// row failed.
+	type SocketMode {
+		app             App
+		appToken        ?Secret<string>
+		// Connections in a row that may fail before `run` gives up.
+		reconnectLimit  int             = 10
+		internal writer ?Writer         = none
+		internal closed bool            = false
+
+		// Socket Mode for `app` with `appToken` (else `SLACK_APP_TOKEN`).
+		def new(app App, appToken ?Secret<string> = none) {
+			self.app = app
+			let env = Runtime.getEnv("SLACK_APP_TOKEN")
+			self.appToken = appToken is none ?? (env is none ?? (none, env), appToken)
+		}
+
+		// Connects and hands every envelope to the app until `close`. Fails
+		// as described above.
+		def run() !none {
+			let failures = 0
+			for !closed {
+				let (again, failed) = try session(failures)
+				failures = failed ?? (failures + 1, 0)
+				break unless again
+				time.sleep(duration(int64(1000000000) * int64(failures.min(30)))) when failed
+			}
+			return none
+		}
+
+		// One connection: whether to connect again, and whether this one
+		// failed to open. Fails when connecting failed `reconnectLimit` times in
+		// a row, Slack refuses the token, or it disabled Socket Mode.
+		internal def session(failures int) !(bool, bool) {
+			let opened = connectSocket(self) onerror (err error) {
+				fail err when failures + 1 >= reconnectLimit || isAuth(err)
+				recover none
+			}
+			return (true, true) when opened is none
+			let conn websocket.Conn = opened
+			let link = new Writer(conn)
+			if !adopt(link) {
+				conn.close() onerror recover none
+				return (false, false)
+			}
+			let again = readEnvelopes(self, conn, link) onerror (err error) {
+				conn.close() onerror recover none
+				fail err when closed || isAuth(err) || (err is SlackError && err.kind == ErrorKind.Invalid)
+				recover true
+			}
+			conn.close() onerror recover none
+			return (again, false)
+		}
+
+		// Ends `run` after the envelope it is handling. Does not fail: a
+		// connection that does not close cleanly is dropped.
+		def close() !none {
+			let w = shut()
+			return none when w is none
+			w.conn.close() onerror recover none
+			return none
+		}
+
+		// Takes `w` as the connection's writer; false when `close` came
+		// first, and the connection is to be dropped.
+		internal atomic def adopt(w Writer) bool {
+			writer = w
+			return !closed
+		}
+
+		// Marks the session closed; the writer of its connection, if any.
+		internal atomic def shut() ?Writer {
+			closed = true
+			return writer
+		}
+	}
+
+	// The writes of one connection, one at a time.
+	internal type Writer {
+		conn websocket.Conn
+
+		def new(conn websocket.Conn) {
+			self.conn = conn
+		}
+
+		atomic def write(text string) !none {
+			return try conn.writeText(text)
+		}
+	}
+
+	internal def isAuth(err error) bool {
+		return err is SlackError && err.kind == ErrorKind.Auth
+	}
+
+	// A connection Slack opened for the app.
+	internal def connectSocket(s SocketMode) !?websocket.Conn {
+		let key = s.appToken
+		fail SlackError{message: "slack: socket mode needs an app-level token: give one, or set SLACK_APP_TOKEN", code: ErrorKind.Auth.value, kind: ErrorKind.Auth} when key is none
+		let reply = try deliver(s.app.client, Call{method: "apps.connections.open", args: new map<string, any>(), bearer: key})
+		let address = textAt(reply, "url")
+		fail SlackError{message: "slack: apps.connections.open gave no address", code: ErrorKind.Server.value, kind: ErrorKind.Server} when address.len() == 0
+		let (conn, _) = websocket.dial(address) onerror (err error) {
+			fail SlackError{message: "slack: socket mode: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+		}
+		return conn
+	}
+
+	// Reads envelopes until the connection ends: true to connect again
+	// (Slack asked for a refresh, or the connection dropped), false after
+	// `close`. Fails with Invalid when Slack disabled Socket Mode.
+	internal def readEnvelopes(s SocketMode, conn websocket.Conn, writer Writer) !bool {
+		for {
+			let (kind, data) = conn.readMessage() onerror (err error) {
+				return !s.closed
+			}
+			continue unless kind == websocket.MessageType.Text
+			let parsed = (new JSON()).parse(data) onerror recover none
+			continue unless parsed is map<string, any>
+			let envelope map<string, any> = parsed
+			switch textAt(envelope, "type") {
+				case "hello":
+					continue
+				case "disconnect":
+					fail SlackError{message: "slack: socket mode is disabled for the app", code: ErrorKind.Invalid.value, kind: ErrorKind.Invalid, slackCode: "link_disabled"} when textAt(envelope, "reason") == "link_disabled"
+					return !s.closed
+				default:
+					async handleEnvelope(s.app, envelope, writer)
+			}
+		}
+		return !s.closed
+	}
+
+	// Hands one envelope to the app, acknowledging it by its id (with the
+	// answer as `payload` when there is one).
+	internal def handleEnvelope(app App, envelope map<string, any>, writer Writer) {
+		let receipt = new Receipt(textAt(envelope, "envelope_id"), writer)
+		let ack = def (answer ?map<string, any>) !none {
+			return try receipt.send(answer)
+		}
+		let payload = objectAt(envelope, "payload")
+		let work = def () !none {
+			switch textAt(envelope, "type") {
+				case "events_api":
+					let e = try eventOf(payload)
+					e.retryNum = intAt(envelope, "retry_attempt")
+					e.retryReason = textAt(envelope, "retry_reason")
+					return try deliverEvent(app, e, ack)
+				case "interactive":
+					return try deliverInteraction(app, payload, ack)
+				case "slash_commands":
+					return try deliverCommand(app, payload, ack)
+				default:
+					return try ack(none)
+			}
+		}
+		work() onerror (err error) {
+			// Acknowledged all the same: Slack would send it again.
+			receipt.send(none) onerror recover none
+			app.failures(err)
+			recover none
+		}
+	}
+
+	// The acknowledgement of one envelope, sent once.
+	internal type Receipt {
+		internal id     string
+		internal writer Writer
+		internal sent   bool   = false
+
+		def new(id string, writer Writer) {
+			self.id = id
+			self.writer = writer
+		}
+
+		// Acknowledges the envelope, with `answer` as its payload; a second
+		// call does nothing. Fails when the connection does.
+		atomic def send(answer ?map<string, any>) !none {
+			return none when sent || id.len() == 0
+			sent = true
+			let body = map<string, any>{"envelope_id": id}
+			body.set("payload", answer) unless answer is none
+			return try writer.write(string((new JSON()).encode(body)))
+		}
+	}
+}

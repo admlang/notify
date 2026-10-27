@@ -1,0 +1,330 @@
+// The objects the Web API hands back, as Slack's JSON names them. Ids are
+// text (`C…` channels, `U…` users, `F…` files); a message is named by its
+// channel and `ts`, which `tsTime` reads as a time; a field Slack leaves
+// out holds its zero value.
+partial module adm.notify.slack {
+	use std.data.encoding::(json)
+
+	// Who a token is (`Client.whoami`).
+	struct AuthInfo {
+		url string
+		team string
+		user string
+		@json("team_id")
+		teamId string
+		@json("user_id")
+		userId string
+		// For a bot token.
+		@json("bot_id")
+		botId string
+		@json("enterprise_id")
+		enterpriseId string
+		@json("is_enterprise_install")
+		isEnterpriseInstall bool
+	}
+
+	// A channel's topic or purpose.
+	struct Topic {
+		value string
+		creator string
+		@json("last_set")
+		lastSet int64
+	}
+
+	// A conversation: a public or private channel, a direct message (`im`)
+	// or a group direct message (`mpim`).
+	struct Conversation {
+		id string
+		name string
+		@json("is_channel")
+		isChannel bool
+		@json("is_group")
+		isGroup bool
+		@json("is_im")
+		isIm bool
+		@json("is_mpim")
+		isMpim bool
+		@json("is_private")
+		isPrivate bool
+		@json("is_archived")
+		isArchived bool
+		@json("is_general")
+		isGeneral bool
+		@json("is_shared")
+		isShared bool
+		@json("is_ext_shared")
+		isExtShared bool
+		@json("is_org_shared")
+		isOrgShared bool
+		// Whether the token's user or bot is in it.
+		@json("is_member")
+		isMember bool
+		created int64
+		creator string
+		// The other person of a direct message.
+		user string
+		topic Topic
+		purpose Topic
+		@json("num_members")
+		members int
+		@json("context_team_id")
+		teamId string
+		updated int64
+	}
+
+	// An emoji reaction on a message or a file: its name and who added it.
+	struct Reaction {
+		name  string
+		count int
+		users string[]
+	}
+
+	// When and by whom a message was last edited.
+	struct Edited {
+		user string
+		ts   string
+	}
+
+	// A message as Slack holds it: in a channel's history, a thread, an
+	// event. `blocks` is its Block Kit as JSON.
+	struct Post {
+		@json("type")
+		kind string
+		// "" for a plain message; `bot_message`, `thread_broadcast`,
+		// `channel_join`, `message_changed`, ... otherwise.
+		subtype string
+		ts string
+		// The thread's parent; equal to `ts` on the parent itself.
+		@json("thread_ts")
+		threadTs string
+		user string
+		@json("bot_id")
+		botId string
+		@json("app_id")
+		appId string
+		// The bot's name on a `bot_message`.
+		username string
+		team string
+		// The channel, where Slack names it on the message.
+		channel string
+		text string
+		blocks any[]
+		attachments any[]
+		files File[]
+		reactions Reaction[]
+		@json("reply_count")
+		replyCount int
+		@json("reply_users")
+		replyUsers string[]
+		@json("latest_reply")
+		latestReply string
+		@json("parent_user_id")
+		parentUserId string
+		edited Edited
+		@json("client_msg_id")
+		clientMessageId string
+		@json("pinned_to")
+		pinnedTo string[]
+		permalink string
+	}
+
+	// A person's profile as they filled it in.
+	struct Profile {
+		title string
+		phone string
+		@json("real_name")
+		realName string
+		@json("display_name")
+		displayName string
+		@json("first_name")
+		firstName string
+		@json("last_name")
+		lastName string
+		email string
+		@json("status_text")
+		statusText string
+		@json("status_emoji")
+		statusEmoji string
+		@json("status_expiration")
+		statusExpiration int64
+		@json("image_72")
+		image72 string
+		@json("image_192")
+		image192 string
+		@json("image_512")
+		image512 string
+		@json("image_original")
+		imageOriginal string
+		team string
+	}
+
+	// A member of a workspace: a person, a bot or an app's user.
+	struct User {
+		id string
+		@json("team_id")
+		teamId string
+		name string
+		@json("real_name")
+		realName string
+		deleted bool
+		color string
+		tz string
+		@json("tz_label")
+		tzLabel string
+		// Seconds east of UTC.
+		@json("tz_offset")
+		tzOffset int
+		@json("is_admin")
+		isAdmin bool
+		@json("is_owner")
+		isOwner bool
+		@json("is_primary_owner")
+		isPrimaryOwner bool
+		// A guest: multi-channel (`isRestricted`) or single-channel
+		// (`isUltraRestricted`).
+		@json("is_restricted")
+		isRestricted bool
+		@json("is_ultra_restricted")
+		isUltraRestricted bool
+		@json("is_bot")
+		isBot bool
+		@json("is_app_user")
+		isAppUser bool
+		updated int64
+		locale string
+		profile Profile
+	}
+
+	// Whether a person is at their keyboard (`users.getPresence`).
+	struct Presence {
+		// "active" or "away".
+		presence string
+		online bool
+		@json("auto_away")
+		autoAway bool
+		@json("manual_away")
+		manualAway bool
+		@json("connection_count")
+		connectionCount int
+		@json("last_activity")
+		lastActivity int64
+	}
+
+	// A file uploaded to Slack. `urlPrivate` needs the token to download.
+	struct File {
+		id string
+		created int64
+		name string
+		title string
+		mimetype string
+		filetype string
+		@json("pretty_type")
+		prettyType string
+		user string
+		size int64
+		mode string
+		@json("is_external")
+		isExternal bool
+		@json("is_public")
+		isPublic bool
+		@json("public_url_shared")
+		publicURLShared bool
+		@json("url_private")
+		urlPrivate string
+		@json("url_private_download")
+		urlPrivateDownload string
+		permalink string
+		@json("permalink_public")
+		permalinkPublic string
+		channels string[]
+		groups string[]
+		ims string[]
+		@json("alt_txt")
+		altText string
+	}
+
+	// A message that waits to be posted (`chat.scheduleMessage`).
+	struct ScheduledMessage {
+		id string
+		@json("channel_id")
+		channelId string
+		// Unix seconds.
+		@json("post_at")
+		postAt int64
+		@json("date_created")
+		dateCreated int64
+		text string
+	}
+
+	// A message or a file a reaction or a pin is on: `type` is "message" or
+	// "file".
+	struct Item {
+		@json("type")
+		kind string
+		channel string
+		message Post
+		file File
+		created int64
+		@json("created_by")
+		createdBy string
+	}
+
+	// A link or a bookmark kept at the top of a channel.
+	struct Bookmark {
+		id string
+		@json("channel_id")
+		channelId string
+		title string
+		link string
+		emoji string
+		@json("icon_url")
+		iconURL string
+		@json("type")
+		kind string
+		@json("date_created")
+		dateCreated int64
+		@json("date_updated")
+		dateUpdated int64
+		rank string
+	}
+
+	// What a user group prefers: the channels its members are added to.
+	struct GroupPrefs {
+		channels string[]
+		groups   string[]
+	}
+
+	// A user group, `@handle` mentions notify all of its members.
+	struct Usergroup {
+		id string
+		@json("team_id")
+		teamId string
+		name string
+		description string
+		handle string
+		@json("is_external")
+		isExternal bool
+		@json("date_create")
+		dateCreate int64
+		@json("date_update")
+		dateUpdate int64
+		// Non-zero once disabled.
+		@json("date_delete")
+		dateDelete int64
+		@json("created_by")
+		createdBy string
+		@json("updated_by")
+		updatedBy string
+		prefs GroupPrefs
+		// Its members, when asked for (`includeUsers`).
+		users string[]
+	}
+
+	// A message as `chat.postMessage` and the like answer: where it went
+	// and its `ts`, which names it for an update, a delete or a reply.
+	struct Sent {
+		channel string
+		ts      string
+		message Post
+	}
+}

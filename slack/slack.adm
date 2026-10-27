@@ -1,3 +1,346 @@
+// A Slack client over std.net.http: the Web API (messages, scheduled
+// messages, conversations, users, files, reactions, pins, bookmarks, views,
+// user groups), Block Kit builders that check Slack's limits before a
+// message is sent, incoming webhooks, an `App` that receives the Events
+// API, interactivity and slash commands over HTTP or Socket Mode, and the
+// OAuth v2 installation of a distributed app.
+//
+// ```
+// let bot = new slack.Client(botToken)              // SLACK_BOT_TOKEN when left out
+// try bot.send("#deploys", "Release 1.4 is out")
+// let message = new slack.Message()
+// message.section("*Release 1.4* is out")
+// message.button("Release notes", url = "https://example.com/notes/1.4")
+// try bot.send("#deploys", message)
+//
+// try slack.webhook(hookURL).send("Build passed")
+// ```
 partial module adm.notify.slack {
-	// Slack over std.net.http: Web API methods (messages, files, users, conversations), Block Kit builders, incoming webhooks, the Events API and interactivity with request signing, slash commands, Socket Mode over std.net.http.websocket
+	use (
+		std.errors
+		std.time
+		std.net.http
+		std.net.url
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON)
+	)
+
+	// Slack's Web API address; `baseURL` replaces it for a proxy or a test
+	// server.
+	const apiURL = "https://slack.com/api"
+
+	// The library's version, in the User-Agent of every request.
+	const libraryVersion = "0.1.0"
+
+	// What went wrong, for the caller that acts on it.
+	enum ErrorKind {
+		// The token is missing, wrong, revoked or of the wrong kind, or lacks
+		// a scope the method needs (`needed` names it).
+		Auth        = "auth",
+		// Slack refused the pace: `retryAfter` says how long to wait.
+		RateLimited = "ratelimited",
+		// The request breaks a rule: an argument Slack rejects, a Block Kit
+		// limit, a channel the bot is not in.
+		Invalid     = "invalid",
+		// No channel, user, message, file or view of that id.
+		NotFound    = "notfound",
+		// Slack could not be reached, or the connection dropped.
+		Transport   = "transport",
+		// Slack failed, or answered with something that is not its API.
+		Server      = "server",
+	}
+
+	// The failure of every call here. `slackCode` is Slack's error string
+	// (`channel_not_found`, `invalid_blocks`, ...), `needed` and `provided`
+	// the scopes of a `missing_scope`, `details` the warnings and messages
+	// Slack attached, `status` the HTTP status (0 when none came back) and
+	// `retryAfter` the pause a rate limit asked for.
+	struct SlackError {
+		message    string
+		code       string
+		cause      ?error
+		stack      errors.StackTrace
+		kind       ErrorKind
+		status     int
+		slackCode  string
+		needed     string
+		provided   string
+		details    string[]
+		retryAfter ?duration
+	}
+
+	// A connection to the Slack Web API as one token, a bot's (`xoxb-`), a
+	// user's (`xoxp-`) or an app-level one (`xapp-`, for Socket Mode). It
+	// paces its calls to Slack's rate-limit tier of each method (and one
+	// message a second per channel), waits out every 429 Slack answers, and
+	// holds no connection of its own (std.net.http keeps them), so any
+	// number of tasks may share one.
+	//
+	// Calls fail with SlackError: Auth for a token Slack refuses or a scope
+	// it lacks, NotFound for an unknown channel, user, message or file,
+	// Invalid for an argument Slack or the local Block Kit checks refuse,
+	// RateLimited once `rateLimitRetries` waits were spent, Server and
+	// Transport.
+	partial type Client {
+		token            ?Secret<string>
+		// The API's base: `https://slack.com/api`, or a proxy's.
+		baseURL          string
+		// How often a call refused with 429 is sent again after the wait
+		// Slack asked for, before it fails with RateLimited.
+		rateLimitRetries int             = 5
+		// The HTTP client requests go through: timeouts, a transport.
+		httpClient       http.Client
+		internal limits  Limiter
+
+		// A client with `token` (else `SLACK_BOT_TOKEN`), of the API at
+		// `baseURL` (else `SLACK_API_URL`, else Slack's).
+		def new(token ?Secret<string> = none, baseURL string = "") {
+			let env = Runtime.getEnv("SLACK_BOT_TOKEN")
+			self.token = token is none ?? (env is none ?? (none, env), token)
+			let envURL = Runtime.getEnv("SLACK_API_URL")
+			let base = baseURL.len() > 0 ?? (baseURL, envURL is none ?? (apiURL, envURL))
+			self.baseURL = base.trimEnd("/")
+			httpClient = new http.Client()
+			httpClient.userAgent = "adm.notify.slack/{libraryVersion}"
+			httpClient.retry = http.RetryPolicy{attempts: 2, statuses: [502, 503, 504]}
+			limits = new Limiter()
+		}
+
+		// Who the token is: its team, user and bot (`auth.test`). Fails as
+		// every call does.
+		def whoami() !AuthInfo {
+			let out = AuthInfo{}
+			try decodeObject(try api(self, "auth.test"), out)
+			return out
+		}
+	}
+
+	// One Web API call: the method's name, its arguments (a string goes as
+	// it is, a number or a bool as text, an object or an array as JSON),
+	// and the token it goes with when not the client's.
+	internal struct Call {
+		method string
+		args   map<string, any>
+		// The channel a message goes to, which `chat.postMessage` paces
+		// one a second.
+		target string           = ""
+		// A token in place of the client's: a user's, or none.
+		bearer ?Secret<string>  = none
+		// Sent without a token (`oauth.v2.access` authenticates otherwise).
+		bare   bool             = false
+		// Basic authentication instead of a token: client id and secret.
+		basic  string           = ""
+	}
+
+	// Calls `method` with `args` and returns the reply's object. Fails as
+	// `deliver` does.
+	internal def api(client Client, method string, args map<string, any> = new map<string, any>(), target string = "") !map<string, any> {
+		return try deliver(client, Call{method: method, args: args, target: target})
+	}
+
+	// Sends `c`, waiting first for the pace of its method (and channel),
+	// and again for every 429 Slack answers (up to `rateLimitRetries`).
+	// Returns the reply's object once Slack said `ok`. Fails with the
+	// SlackError the reply describes otherwise.
+	internal def deliver(client Client, c Call) !map<string, any> {
+		let attempt = 0
+		for {
+			let wait = client.limits.waitFor(c.method, c.target)
+			for wait > 0s {
+				time.sleep(wait)
+				wait = client.limits.waitFor(c.method, c.target)
+			}
+			let req = try requestOf(client, c)
+			let res = client.httpClient.do(req) onerror (err error) {
+				fail SlackError{message: "slack: {c.method}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+			}
+			if res.status == 429 {
+				let pause = res.retryAfter()
+				let after = pause is none ?? (1s, pause)
+				res.close() onerror recover none
+				client.limits.block(c.method, after)
+				if attempt < client.rateLimitRetries {
+					attempt++
+					continue
+				}
+				fail SlackError{message: "slack: {c.method}: rate limited", code: ErrorKind.RateLimited.value, kind: ErrorKind.RateLimited, status: 429, slackCode: "ratelimited", retryAfter: after}
+			}
+			return try replyOf(c.method, res)
+		}
+		fail "slack: unreachable"
+	}
+
+	internal def requestOf(client Client, c Call) !http.Request {
+		let req = try client.httpClient.request(http.Method.POST, "{client.baseURL}/{c.method}")
+		let given = c.bearer
+		let key = given is none ?? (client.token, given)
+		if c.basic.len() > 0 {
+			req.headers.set("Authorization", "Basic " + c.basic)
+		} else if !c.bare && !(key is none) {
+			req.headers.set("Authorization", "Bearer " + key.reveal())
+		}
+		req.replaceBody(formOf(c.args).bytes())
+		req.headers.set("Content-Type", "application/x-www-form-urlencoded")
+		return req
+	}
+
+	// The arguments as a form: text as it is, numbers and bools as text,
+	// objects and arrays as JSON, none left out.
+	internal def formOf(args map<string, any>) string {
+		let form = new url.Values()
+		let codec = new JSON()
+		for let (key, value) in args {
+			if value is string {
+				form.set(key, value)
+			} else if value is bool || value is int || value is int64 || value is float {
+				form.set(key, "{value}")
+			} else {
+				form.set(key, string(codec.encode(value)))
+			}
+		}
+		return form.encode()
+	}
+
+	// The object of a Web API reply: `{"ok": true, ...}`. Fails with the
+	// SlackError of `{"ok": false, "error": ...}`, of an HTTP failure, or
+	// of a body that is not the API's JSON.
+	internal def replyOf(method string, res http.Response) !map<string, any> {
+		let text = res.text() onerror (err error) {
+			fail SlackError{message: "slack: {method}: the reply was cut short: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport, status: res.status}
+		}
+		let parsed = (new JSON()).parse(text) onerror recover none
+		if !(parsed is map<string, any>) {
+			let kind = res.status >= 500 || res.ok() ?? (ErrorKind.Server, kindOfStatus(res.status))
+			fail SlackError{message: "slack: {method}: {res.status} {text.trim().len() > 0 ?? (text.trim(), res.reason)}", code: kind.value, kind: kind, status: res.status}
+		}
+		let body map<string, any> = parsed
+		return body when boolAt(body, "ok")
+		let code = textAt(body, "error")
+		let kind = kindOf(code, res.status)
+		let failure = SlackError{message: "slack: {method}: {code.len() > 0 ?? (code, "{res.status}")}", code: kind.value, kind: kind, status: res.status, slackCode: code, needed: textAt(body, "needed"), provided: textAt(body, "provided")}
+		let metadata = objectAt(body, "response_metadata")
+		collectTexts(metadata.get("messages"), failure.details)
+		collectTexts(metadata.get("warnings"), failure.details)
+		failure.message += " ({failure.details.join("; ")})" when failure.details.len() > 0
+		failure.message += " (needs {failure.needed})" when failure.needed.len() > 0
+		fail failure
+	}
+
+	// The kind of a Slack error string; the HTTP status decides one Slack
+	// gave no name.
+	internal def kindOf(code string, status int) ErrorKind {
+		switch code {
+			case "not_authed", "invalid_auth", "account_inactive", "token_revoked", "token_expired", "no_permission", "missing_scope", "not_allowed_token_type", "ekm_access_denied", "access_denied", "org_login_required", "team_access_not_granted", "two_factor_setup_required", "invalid_client_id", "bad_client_secret", "invalid_refresh_token":
+				return ErrorKind.Auth
+			case "ratelimited", "rate_limited":
+				return ErrorKind.RateLimited
+			case "internal_error", "fatal_error", "service_unavailable", "request_timeout", "unknown_error":
+				return ErrorKind.Server
+			default:
+				return ErrorKind.NotFound when code.endsWith("_not_found") || code == "not_found" || code == "no_such_subteam"
+				return code.len() == 0 ?? (kindOfStatus(status), ErrorKind.Invalid)
+		}
+	}
+
+	internal def kindOfStatus(status int) ErrorKind {
+		return ErrorKind.Auth when status := 401 || 403
+		return ErrorKind.NotFound when status := 404 || 410
+		return ErrorKind.RateLimited when status == 429
+		return ErrorKind.Server when status >= 500
+		return ErrorKind.Invalid
+	}
+
+	// Binds an object onto `target`. Fails with SlackError Server when it
+	// is not of that shape.
+	internal def decodeObject(object any, target any) !none {
+		let codec = new JSON()
+		codec.decode(codec.encode(object), target) onerror (err error) {
+			fail SlackError{message: "slack: the reply is not what the API sends: {err.message}", code: ErrorKind.Server.value, cause: err, kind: ErrorKind.Server}
+		}
+		return none
+	}
+
+	// Binds the object at `key` of a reply onto `target`; a missing key
+	// leaves it as it is. Fails as `decodeObject` does.
+	internal def decodeAt(reply map<string, any>, key string, target any) !none {
+		let value = reply.get(key)
+		return none when value is none
+		return try decodeObject(value, target)
+	}
+
+	// The body an array is bound through: the JSON codec binds objects onto
+	// typed values, not a top-level array.
+	internal struct Items<T> {
+		items T[]
+	}
+
+	// The array at `key` of a reply as T[]; empty when the key is missing.
+	// Fails as `decodeObject` does.
+	internal def listAt<T>(reply map<string, any>, key string) !T[] {
+		let value = reply.get(key)
+		let box = Items<T>{}
+		return box.items when value is none
+		try decodeObject(map<string, any>{"items": value}, box)
+		return box.items
+	}
+
+	// The cursor of the next page a reply names; "" after the last.
+	internal def nextCursor(reply map<string, any>) string {
+		return textAt(objectAt(reply, "response_metadata"), "next_cursor")
+	}
+
+	// A failure raised before anything is sent: a limit the request breaks.
+	internal def invalid(message string) SlackError {
+		return SlackError{message: "slack: {message}", code: ErrorKind.Invalid.value, kind: ErrorKind.Invalid}
+	}
+
+	// The text of `key` in an object; "" when absent or not text.
+	internal def textAt(object map<string, any>, key string) string {
+		let v = object.get(key)
+		return v when v is string
+		return "{v}" when v is int
+		return ""
+	}
+
+	internal def intAt(object map<string, any>, key string) int {
+		let v = object.get(key)
+		return v when v is int
+		return int(v) when v is float
+		return v.toInt<int>() when v is string && v.isNumeric()
+		return 0
+	}
+
+	internal def boolAt(object map<string, any>, key string) bool {
+		let v = object.get(key)
+		return v is bool && v
+	}
+
+	internal def objectAt(object map<string, any>, key string) map<string, any> {
+		let v = object.get(key)
+		return v is map<string, any> ?? (v, new map<string, any>())
+	}
+
+	// The texts of a JSON array, appended to `out`.
+	internal def collectTexts(value ?any, out string[]) {
+		return unless value is any[]
+		for let (_, v) in value {
+			out.push(v) when v is string
+		}
+	}
+
+	internal def texts(list string[]) any[] {
+		let out any[] = []
+		for let (_, s) in list {
+			out.push(s)
+		}
+		return out
+	}
+
+	// A message timestamp (`1700000000.000100`) as a time.
+	def tsTime(ts string) time.Time {
+		let parts = ts.split(".")
+		let seconds = parts[0].isNumeric() ?? (parts[0].toInt<int64>(), int64(0))
+		let micros = parts.len() > 1 && parts[1].isNumeric() ?? (parts[1].toInt<int64>(), int64(0))
+		return time.fromUnixNs(seconds * 1000000000 + micros * 1000)
+	}
 }

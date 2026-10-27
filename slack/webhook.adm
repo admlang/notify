@@ -1,0 +1,88 @@
+partial module adm.notify.slack {
+	use (
+		std.time
+		std.net.http
+		std.data.encoding::(JSON)
+	)
+
+	// An incoming webhook: an address that posts to the one channel it was
+	// made for, with no token. Also what an interaction's `response_url`
+	// is, which `Responder` posts to.
+	//
+	// ```
+	// try slack.webhook(hookURL).send("Build passed")
+	// ```
+	type Webhook {
+		url              string
+		// How often a post refused with 429 is sent again after the wait.
+		rateLimitRetries int         = 5
+		httpClient       http.Client
+
+		def new(url string) {
+			self.url = url
+			httpClient = new http.Client()
+			httpClient.userAgent = "adm.notify.slack/{libraryVersion}"
+		}
+
+		// Posts `text` (Markdown). Fails with Invalid for a payload Slack
+		// refuses or an archived channel, Auth for a hook taken back,
+		// NotFound for an unknown one, RateLimited, Server and Transport.
+		def send(text string) !none {
+			return try send(new Message(text))
+		}
+
+		// Posts a message of blocks. Fails with Invalid for a Block Kit
+		// limit it breaks, and as `send` of text does.
+		def send(message Message) !none {
+			let body = new map<string, any>()
+			try messageArgs(message, body)
+			return try postJSON(httpClient, url, body, rateLimitRetries)
+		}
+	}
+
+	// An incoming webhook at `url`.
+	def webhook(url string) Webhook {
+		return new Webhook(url)
+	}
+
+	// Posts `body` as JSON to a webhook or a response URL, waiting out a
+	// 429 up to `retries` times. Fails with the SlackError of the text
+	// Slack answers otherwise (`invalid_payload`, `no_service`, ...).
+	internal def postJSON(client http.Client, address string, body map<string, any>, retries int) !none {
+		let attempt = 0
+		for {
+			let req = try client.request(http.Method.POST, address)
+			req.replaceBody((new JSON()).encode(body))
+			req.headers.set("Content-Type", "application/json")
+			let res = client.do(req) onerror (err error) {
+				fail SlackError{message: "slack: webhook: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+			}
+			let text = (res.text() onerror recover "").trim()
+			if res.status == 429 && attempt < retries {
+				let pause = res.retryAfter()
+				time.sleep(pause is none ?? (1s, pause))
+				attempt++
+				continue
+			}
+			return none when res.ok()
+			let parsed = (new JSON()).parse(text) onerror recover none
+			let code = parsed is map<string, any> ?? (textAt(parsed, "error"), text)
+			let kind = webhookKind(code, res.status)
+			fail SlackError{message: "slack: webhook: {res.status} {code}", code: kind.value, kind: kind, status: res.status, slackCode: code, retryAfter: res.retryAfter()}
+		}
+		fail "slack: unreachable"
+	}
+
+	internal def webhookKind(code string, status int) ErrorKind {
+		switch code {
+			case "invalid_token", "action_prohibited", "team_disabled", "user_not_found":
+				return ErrorKind.Auth
+			case "no_service", "no_service_id", "no_team", "channel_not_found":
+				return ErrorKind.NotFound
+			case "channel_is_archived", "invalid_payload", "invalid_blocks", "no_text", "posting_to_general_channel_denied", "too_many_attachments":
+				return ErrorKind.Invalid
+			default:
+				return kindOfStatus(status)
+		}
+	}
+}

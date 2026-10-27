@@ -1,0 +1,476 @@
+partial module adm.notify.slack {
+	use (
+		std.time
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.net.url
+		std.data.encoding::(JSON)
+	)
+
+	// A bot token and a channel for the live test, which posts, edits,
+	// reacts to, uploads to and deletes in a real channel.
+	@env("ADM_TEST_SLACK_TOKEN")
+	internal const liveToken string
+
+	@env("ADM_TEST_SLACK_CHANNEL")
+	internal const liveChannel string
+
+	// What the loopback server was asked, and what it answers.
+	internal type Seen {
+		methods string[]
+		args    map<string, string>[]
+		auth    string[]
+		agents  string[]
+		// The reply of a method: its JSON text; `{"ok": true}` when none.
+		replies map<string, string>
+		// How many times a method answers 429 before it answers.
+		limited map<string, int>
+		uploads byte[][]
+		hooks   map<string, any>[]
+		// The base address of the server.
+		base    string                = ""
+
+		def new() {}
+	}
+
+	// `value` as JSON text.
+	internal def json(value ?any) string {
+		return value is none ?? ("null", string((new JSON()).encode(value)))
+	}
+
+	// A server that answers as the Web API at /api, takes upload bytes at
+	// /upload and webhook posts at /hook (`/hook/<error>` answers that error
+	// with 400).
+	internal def slackServer(seen Seen, extra ?def (http.ServeMux) !none = none) !httptest.Server {
+		let mux = new http.ServeMux()
+		let more = extra
+		try more(mux) unless more is none
+		try mux.handle("/api/", def (ctx http.Context) !none {
+			let method = ctx.path()[5:]
+			let form = try url.parseQuery(try ctx.text())
+			let fields = new map<string, string>()
+			for let p in form.pairs() {
+				fields.set(p.key, p.value)
+			}
+			seen.methods.push(method)
+			seen.args.push(fields)
+			seen.auth.push(ctx.header("Authorization"))
+			seen.agents.push(ctx.header("User-Agent"))
+			let left = seen.limited.get(method)
+			if !(left is none) && left > 0 {
+				seen.limited.set(method, left - 1)
+				ctx.setHeader("Retry-After", "0")
+				return try ctx.text(429, "")
+			}
+			let reply = seen.replies.get(method)
+			return try ctx.text(reply is none ?? ("\{\"ok\": true}", reply))
+		})
+		try mux.handle("/upload/", def (ctx http.Context) !none {
+			let data = try ctx.bytes()
+			seen.uploads.push(data)
+			return try ctx.text("OK - {data.len()}")
+		})
+		try mux.handle("/hook/", def (ctx http.Context) !none {
+			let parsed = try (new JSON()).parse(try ctx.text())
+			seen.hooks.push(parsed is map<string, any> ?? (parsed, new map<string, any>()))
+			let rest = ctx.path()[6:]
+			return try ctx.text(rest.len() > 0 ?? (400, 200), rest.len() > 0 ?? (rest, "ok"))
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		seen.base = "http://{server.address().str()}"
+		return server
+	}
+
+	internal def clientOf(seen Seen) Client {
+		return new Client("xoxb-test", "{seen.base}/api")
+	}
+
+	// The methods called from `from` on, one a line, against `want`.
+	internal def calledSince(seen Seen, from int, want string[]) !none {
+		let got = seen.methods[from:].join("\n")
+		let expected = want.join("\n")
+		fail "methods differ:\n--- got\n{got}\n--- want\n{expected}" unless got == expected
+		return none
+	}
+
+	// The argument `key` of call `at`.
+	internal def arg(seen Seen, at int, key string) string {
+		let found = seen.args[at].get(key)
+		return found is none ?? ("", found)
+	}
+
+	check "Slack Web API" {
+		// A message goes to chat.postMessage as a form with the token, the
+		// blocks as JSON, and the thread and unfurl options.
+		@test()
+		def TestSendMessage() !none {
+			let seen = new Seen()
+			seen.replies.set("chat.postMessage", json(map<string, any>{"ok": true, "channel": "C1", "ts": "1700000000.000100", "message": map<string, any>{"text": "hi", "ts": "1700000000.000100", "user": "U1"}}))
+			let server = try slackServer(seen)
+			let bot = clientOf(seen)
+			let sent = try bot.send("#deploys", "Release 1.4 is out")
+			assert sent.channel == "C1" && sent.ts == "1700000000.000100" && sent.message.user == "U1"
+			let message = new Message("Release")
+			message.section("*Release 1.4* is out")
+			message.button("Release notes", url = "https://example.com/notes/1.4")
+			try bot.send("C2", message, PostOptions{thread: "1.2", broadcast: true, unfurl: false})
+			assert seen.methods.join(",") == "chat.postMessage,chat.postMessage"
+			assert seen.auth[0] == "Bearer xoxb-test" && seen.agents[0].startsWith("adm.notify.slack/")
+			assert arg(seen, 0, "channel") == "#deploys" && arg(seen, 0, "text") == "Release 1.4 is out" && arg(seen, 0, "blocks") == ""
+			let blocks = try (new JSON()).parse(arg(seen, 1, "blocks"))
+			assert blocks is any[] && blocks.len() == 2
+			assert arg(seen, 1, "thread_ts") == "1.2" && arg(seen, 1, "reply_broadcast") == "true" && arg(seen, 1, "unfurl_links") == "false"
+			assert tsTime("1700000000.000100").unixNs() == 1700000000000100000
+			try server.close()
+			return none
+		}
+
+		// Every Web API method goes to its name with its arguments.
+		@test()
+		def TestMethods() !none {
+			let seen = new Seen()
+			seen.replies.set("chat.postEphemeral", json(map<string, any>{"ok": true, "message_ts": "5.5"}))
+			seen.replies.set("chat.getPermalink", json(map<string, any>{"ok": true, "permalink": "https://x.slack.com/p1"}))
+			seen.replies.set("chat.scheduleMessage", json(map<string, any>{"ok": true, "scheduled_message_id": "Q1", "channel": "C1", "post_at": 1800000000}))
+			seen.replies.set("conversations.info", json(map<string, any>{"ok": true, "channel": map<string, any>{"id": "C1", "name": "general", "is_channel": true, "num_members": 3, "topic": map<string, any>{"value": "t"}}}))
+			seen.replies.set("users.info", json(map<string, any>{"ok": true, "user": map<string, any>{"id": "U1", "name": "ana", "tz_offset": 3600, "profile": map<string, any>{"email": "ana@example.com", "display_name": "Ana"}}}))
+			seen.replies.set("users.getPresence", json(map<string, any>{"ok": true, "presence": "away", "online": false}))
+			seen.replies.set("reactions.get", json(map<string, any>{"ok": true, "message": map<string, any>{"reactions": [map<string, any>{"name": "tada", "count": 2, "users": ["U1", "U2"]}]}}))
+			seen.replies.set("auth.test", json(map<string, any>{"ok": true, "team_id": "T1", "user_id": "U9", "bot_id": "B1", "url": "https://x.slack.com/"}))
+			seen.replies.set("usergroups.users.list", json(map<string, any>{"ok": true, "users": ["U1", "U2"]}))
+			let server = try slackServer(seen)
+			let bot = clientOf(seen)
+			let me = try bot.whoami()
+			assert me.teamId == "T1" && me.botId == "B1"
+			assert try bot.ephemeral("C1", "U1", "psst") == "5.5"
+			let at = time.parse("2027-01-15T08:00:00Z") onerror recover time.now()
+			let waiting = try bot.schedule("C1", at, "later")
+			assert waiting.id == "Q1" && waiting.postAt == 1800000000
+			try bot.unschedule("C1", "Q1")
+			try bot.update("C1", "1.1", "edited")
+			try bot.delete("C1", "1.1")
+			assert try bot.permalink("C1", "1.1") == "https://x.slack.com/p1"
+			let channel = try bot.conversation("C1")
+			assert channel.name == "general" && channel.members == 3 && channel.topic.value == "t"
+			try bot.open("U1", "U2")
+			try bot.invite("C1", "U3", "U4")
+			try bot.kick("C1", "U3")
+			try bot.createChannel("launch", private = true)
+			try bot.join("C1")
+			try bot.leave("C1")
+			try bot.archive("C1")
+			try bot.unarchive("C1")
+			try bot.rename("C1", "launch-2")
+			try bot.setTopic("C1", "Launch")
+			try bot.setPurpose("C1", "Ship it")
+			try bot.close("D1")
+			let ana = try bot.user("U1")
+			assert ana.profile.email == "ana@example.com" && ana.tzOffset == 3600
+			try bot.userByEmail("ana@example.com")
+			let presence = try bot.presence("U1")
+			assert presence.presence == "away"
+			try bot.away()
+			try bot.profile()
+			try bot.react("C1", "1.1", ":tada:")
+			try bot.unreact("C1", "1.1", "tada")
+			let reactions = try bot.reactions("C1", "1.1")
+			assert reactions.len() == 1 && reactions[0].count == 2
+			try bot.pin("C1", "1.1")
+			try bot.unpin("C1", "1.1")
+			try bot.pins("C1")
+			try bot.bookmark("C1", "Docs", "https://example.com", emoji = ":book:")
+			try bot.editBookmark("C1", "Bk1", title = "Manual")
+			try bot.removeBookmark("C1", "Bk1")
+			try bot.bookmarks("C1")
+			try bot.createGroup("On Call")
+			try bot.groups(members = true)
+			try bot.updateGroup("S1", description = "Pager", channels = ["C1"])
+			try bot.disableGroup("S1")
+			try bot.enableGroup("S1")
+			assert (try bot.groupMembers("S1")).join(",") == "U1,U2"
+			try bot.setGroupMembers("S1", ["U1"])
+			try bot.deleteFile("F1")
+			try bot.sharePublic("F1")
+			try bot.revokePublic("F1")
+			try bot.file("F1")
+			try calledSince(seen, 0, [
+				"auth.test",
+				"chat.postEphemeral",
+				"chat.scheduleMessage",
+				"chat.deleteScheduledMessage",
+				"chat.update",
+				"chat.delete",
+				"chat.getPermalink",
+				"conversations.info",
+				"conversations.open",
+				"conversations.invite",
+				"conversations.kick",
+				"conversations.create",
+				"conversations.join",
+				"conversations.leave",
+				"conversations.archive",
+				"conversations.unarchive",
+				"conversations.rename",
+				"conversations.setTopic",
+				"conversations.setPurpose",
+				"conversations.close",
+				"users.info",
+				"users.lookupByEmail",
+				"users.getPresence",
+				"users.setPresence",
+				"users.profile.get",
+				"reactions.add",
+				"reactions.remove",
+				"reactions.get",
+				"pins.add",
+				"pins.remove",
+				"pins.list",
+				"bookmarks.add",
+				"bookmarks.edit",
+				"bookmarks.remove",
+				"bookmarks.list",
+				"usergroups.create",
+				"usergroups.list",
+				"usergroups.update",
+				"usergroups.disable",
+				"usergroups.enable",
+				"usergroups.users.list",
+				"usergroups.users.update",
+				"files.delete",
+				"files.sharedPublicURL",
+				"files.revokePublicURL",
+				"files.info",
+			])
+			assert arg(seen, 1, "user") == "U1" && arg(seen, 2, "post_at") == "{at.unixNs() / 1000000000}"
+			assert arg(seen, 4, "ts") == "1.1" && arg(seen, 4, "blocks") == "[]"
+			assert arg(seen, 8, "users") == "U1,U2" && arg(seen, 9, "users") == "U3,U4" && arg(seen, 11, "is_private") == "true"
+			assert arg(seen, 23, "presence") == "away" && arg(seen, 25, "name") == "tada" && arg(seen, 25, "timestamp") == "1.1"
+			assert arg(seen, 31, "type") == "link" && arg(seen, 31, "emoji") == ":book:" && arg(seen, 32, "bookmark_id") == "Bk1"
+			assert arg(seen, 35, "handle") == "on-call" && arg(seen, 36, "include_users") == "true" && arg(seen, 37, "channels") == "C1"
+			assert arg(seen, 41, "users") == "U1"
+			try server.close()
+			return none
+		}
+
+		// A list follows `next_cursor` until Slack gives none; files.list
+		// pages by number.
+		@test()
+		def TestPages() !none {
+			let seen = new Seen()
+			let server = try slackServer(seen)
+			let bot = clientOf(seen)
+			seen.replies.set("conversations.list", json(map<string, any>{"ok": true, "channels": [map<string, any>{"id": "C1"}, map<string, any>{"id": "C2"}], "response_metadata": map<string, any>{"next_cursor": "abc"}}))
+			let first = try bot.conversations([ConversationKind.Public, ConversationKind.Private]).next()
+			assert !(first is none) && first.len() == 2
+			assert arg(seen, 0, "types") == "public_channel,private_channel" && arg(seen, 0, "limit") == "200" && arg(seen, 0, "cursor") == ""
+			let pages = bot.history("C1", oldest = "1.0")
+			seen.replies.set("conversations.history", json(map<string, any>{"ok": true, "messages": [map<string, any>{"ts": "3.0", "text": "c"}], "response_metadata": map<string, any>{"next_cursor": "n2"}}))
+			let page = try pages.next()
+			seen.replies.set("conversations.history", json(map<string, any>{"ok": true, "messages": [map<string, any>{"ts": "2.0", "text": "b"}], "response_metadata": map<string, any>{"next_cursor": ""}}))
+			let rest = try pages.all()
+			assert !(page is none) && page[0].ts == "3.0" && rest.len() == 1 && rest[0].text == "b"
+			assert arg(seen, 2, "cursor") == "n2" && arg(seen, 1, "oldest") == "1.0"
+			assert try pages.next() is none
+			seen.replies.set("conversations.members", json(map<string, any>{"ok": true, "members": ["U1", "U2"]}))
+			assert (try bot.members("C1").all()).join(",") == "U1,U2"
+			seen.replies.set("files.list", json(map<string, any>{"ok": true, "files": [map<string, any>{"id": "F1"}], "paging": map<string, any>{"page": 1, "pages": 2}}))
+			let files = bot.files(channel = "C1")
+			try files.next()
+			seen.replies.set("files.list", json(map<string, any>{"ok": true, "files": [map<string, any>{"id": "F2"}], "paging": map<string, any>{"page": 2, "pages": 2}}))
+			let second = try files.next()
+			assert !(second is none) && second[0].id == "F2" && try files.next() is none
+			let at = seen.methods.len() - 1
+			assert arg(seen, at, "page") == "2" && arg(seen, at, "channel") == "C1"
+			try bot.replies("C1", "1.0").next()
+			try bot.users().next()
+			try bot.reacted().next()
+			try bot.scheduled("C1").next()
+			try calledSince(seen, at + 1, ["conversations.replies", "users.list", "reactions.list", "chat.scheduledMessages.list"])
+			try server.close()
+			return none
+		}
+
+		// An upload asks for an address, sends the bytes there, then
+		// completes and shares the file.
+		@test()
+		def TestUpload() !none {
+			let seen = new Seen()
+			let server = try slackServer(seen)
+			let bot = clientOf(seen)
+			seen.replies.set("files.getUploadURLExternal", json(map<string, any>{"ok": true, "upload_url": "{seen.base}/upload/x", "file_id": "F7"}))
+			seen.replies.set("files.completeUploadExternal", json(map<string, any>{"ok": true, "files": [map<string, any>{"id": "F7", "title": "Report"}]}))
+			let file = try bot.upload("C1", "pdf bytes".bytes(), "report.pdf", title = "Report", comment = "Here", thread = "1.1")
+			assert file.id == "F7" && file.title == "Report"
+			try calledSince(seen, 0, ["files.getUploadURLExternal", "files.completeUploadExternal"])
+			assert arg(seen, 0, "filename") == "report.pdf" && arg(seen, 0, "length") == "9"
+			assert seen.uploads.len() == 1 && string(seen.uploads[0]) == "pdf bytes"
+			let done = try (new JSON()).parse(arg(seen, 1, "files"))
+			assert json(done) == "[\{\"id\":\"F7\",\"title\":\"Report\"}]"
+			assert arg(seen, 1, "channel_id") == "C1" && arg(seen, 1, "initial_comment") == "Here" && arg(seen, 1, "thread_ts") == "1.1"
+			let many Upload[] = []
+			for let k = 0; k < 11; k++ {
+				many.push(Upload{name: "f{k}.txt", data: [1]})
+			}
+			bot.upload("C1", many) onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.Invalid
+				recover File[]
+			}
+			try server.close()
+			return none
+		}
+
+		// Modals and the Home tab go to views.* with the view as JSON; the
+		// reply's view comes back with its state.
+		@test()
+		def TestViews() !none {
+			let seen = new Seen()
+			let server = try slackServer(seen)
+			let bot = clientOf(seen)
+			let state = map<string, any>{"values": map<string, any>{"b1": map<string, any>{"title": map<string, any>{"type": "plain_text_input", "value": "Fix it"}}}}
+			seen.replies.set("views.open", json(map<string, any>{"ok": true, "view": map<string, any>{"id": "V1", "type": "modal", "callback_id": "ticket", "hash": "h1", "state": state}}))
+			let form = new View("New ticket", callbackId = "ticket", submit = "Create")
+			form.input("Title", TextInput{actionId: "title"}, blockId = "b1")
+			let opened = try bot.openView("tr1", form)
+			let title = opened.value("b1", "title")
+			assert opened.id == "V1" && opened.hash == "h1" && !(title is none) && title.value == "Fix it"
+			assert opened.value("missing") is none
+			try bot.pushView("tr2", new View("Step two"))
+			try bot.updateView("V1", form, hash = "h1")
+			form.externalId = "ticket-9"
+			try bot.updateView("", form)
+			let home = new View()
+			home.section("Welcome")
+			try bot.publishHome("U1", home)
+			try calledSince(seen, 0, ["views.open", "views.push", "views.update", "views.update", "views.publish"])
+			assert arg(seen, 0, "trigger_id") == "tr1" && arg(seen, 1, "trigger_id") == "tr2"
+			let body = try (new JSON()).parse(arg(seen, 0, "view"))
+			assert body is map<string, any> && "{body.get("type")}" == "modal" && "{body.get("callback_id")}" == "ticket"
+			assert arg(seen, 2, "view_id") == "V1" && arg(seen, 2, "hash") == "h1" && arg(seen, 3, "external_id") == "ticket-9" && arg(seen, 3, "view_id") == ""
+			let shown = try (new JSON()).parse(arg(seen, 4, "view"))
+			assert arg(seen, 4, "user_id") == "U1" && shown is map<string, any> && "{shown.get("type")}" == "home"
+			try server.close()
+			return none
+		}
+
+		// A file's bytes are read from its private address with the token.
+		@test()
+		def TestDownload() !none {
+			let seen = new Seen()
+			let server = try slackServer(seen, def (mux http.ServeMux) !none {
+				return try mux.handle("/files/", def (ctx http.Context) !none {
+					return try ctx.text(401, "") unless ctx.header("Authorization") == "Bearer xoxb-test"
+					return try ctx.text(404, "") unless ctx.path() == "/files/F7/report.pdf"
+					return try ctx.text("pdf bytes")
+				})
+			})
+			let bot = clientOf(seen)
+			let data = try bot.download(File{id: "F7", urlPrivateDownload: "{seen.base}/files/F7/report.pdf"})
+			assert string(data) == "pdf bytes"
+			bot.download(File{id: "F8", urlPrivate: "{seen.base}/files/F8"}) onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.NotFound && err.status == 404
+				recover byte[]
+			}
+			(new Client("xoxb-other", "{seen.base}/api")).download(File{id: "F7", urlPrivate: "{seen.base}/files/F7/report.pdf"}) onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.Auth
+				recover byte[]
+			}
+			bot.download(File{id: "F9"}) onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.Invalid
+				recover byte[]
+			}
+			try server.close()
+			return none
+		}
+
+		// A reply of `ok: false` fails with its kind; a 429 is waited out
+		// and sent again, and fails with RateLimited past the retries.
+		@test()
+		def TestErrors() !none {
+			let seen = new Seen()
+			let server = try slackServer(seen)
+			let bot = clientOf(seen)
+			let cases = map<string, ErrorKind>{"channel_not_found": ErrorKind.NotFound, "invalid_auth": ErrorKind.Auth, "invalid_blocks": ErrorKind.Invalid, "internal_error": ErrorKind.Server, "ratelimited": ErrorKind.RateLimited}
+			for let (code, kind) in cases {
+				seen.replies.set("conversations.info", json(map<string, any>{"ok": false, "error": code}))
+				let failed = false
+				bot.conversation("C1") onerror (err error) {
+					assert err is SlackError && err.kind == kind && err.slackCode == code
+					failed = true
+					recover Conversation{}
+				}
+				assert failed
+			}
+			seen.replies.set("users.info", json(map<string, any>{"ok": false, "error": "missing_scope", "needed": "users:read", "provided": "chat:write", "response_metadata": map<string, any>{"messages": ["[ERROR] scope"]}}))
+			bot.user("U1") onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.Auth && err.needed == "users:read" && err.details.len() == 1 && err.message.contains("users:read")
+				recover User{}
+			}
+			seen.limited.set("auth.test", 2)
+			seen.replies.set("auth.test", json(map<string, any>{"ok": true, "team_id": "T1"}))
+			let from = seen.methods.len()
+			let info = try bot.whoami()
+			assert info.teamId == "T1" && seen.methods.len() - from == 3
+			bot.rateLimitRetries = 1
+			seen.limited.set("auth.test", 5)
+			bot.whoami() onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.RateLimited && err.status == 429
+				recover AuthInfo{}
+			}
+			let broken = new Client("xoxb-test", "http://127.0.0.1:1/api")
+			broken.whoami() onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.Transport
+				recover AuthInfo{}
+			}
+			try server.close()
+			return none
+		}
+
+		// A webhook posts JSON with no token; its errors come back as text.
+		@test()
+		def TestWebhook() !none {
+			let seen = new Seen()
+			let server = try slackServer(seen)
+			try webhook("{seen.base}/hook/").send("Build passed")
+			let m = new Message("Deploy")
+			m.section("*main* is live")
+			try webhook("{seen.base}/hook/").send(m)
+			assert seen.hooks.len() == 2 && "{seen.hooks[0].get("text")}" == "Build passed" && !seen.hooks[0].hasKey("blocks")
+			let blocks = seen.hooks[1].get("blocks")
+			assert blocks is any[] && blocks.len() == 1
+			let failures = map<string, ErrorKind>{"invalid_payload": ErrorKind.Invalid, "no_service": ErrorKind.NotFound, "action_prohibited": ErrorKind.Auth}
+			for let (code, kind) in failures {
+				let failed = false
+				webhook("{seen.base}/hook/{code}").send("x") onerror (err error) {
+					assert err is SlackError && err.kind == kind && err.slackCode == code
+					failed = true
+					recover none
+				}
+				assert failed
+			}
+			try server.close()
+			return none
+		}
+
+		// Posts to a real channel with a real token: a message of blocks,
+		// an edit, a reaction, a file, then deletes what it made.
+		@test()
+		def TestLive() !none {
+			return none when liveToken.len() == 0 || liveChannel.len() == 0
+			let bot = new Client(liveToken)
+			let m = new Message("adm.notify.slack live test")
+			m.header("adm.notify.slack").section("live test", fields = ["*Library*\n0.1.0"])
+			let sent = try bot.send(liveChannel, m)
+			try bot.react(sent.channel, sent.ts, "white_check_mark")
+			let edited = try bot.update(sent.channel, sent.ts, "adm.notify.slack live test (edited)")
+			assert edited.ts == sent.ts
+			let reactions = try bot.reactions(sent.channel, sent.ts)
+			assert reactions.len() == 1
+			let file = try bot.upload(sent.channel, "adm".bytes(), "adm.txt", thread = sent.ts)
+			try bot.deleteFile(file.id)
+			try bot.delete(sent.channel, sent.ts)
+			return none
+		}
+	}
+}

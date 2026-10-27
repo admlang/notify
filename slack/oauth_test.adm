@@ -1,0 +1,147 @@
+partial module adm.notify.slack {
+	use (
+		std.time
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.net.url
+		std.data.encoding::(base64encode)
+	)
+
+	internal def installerOf(seen Seen) Installer {
+		return new Installer(["chat:write", "commands"], "https://app.example/slack/oauth", userScopes = ["search:read"], clientId = "C123", clientSecret = new Secret<string>("sec"), client = clientOf(seen))
+	}
+
+	internal def installedReply() string {
+		return json(map<string, any>{"ok": true, "access_token": "xoxb-1", "token_type": "bot", "scope": "chat:write,commands", "bot_user_id": "B1", "app_id": "A1", "team": map<string, any>{"id": "T1", "name": "Acme"}, "enterprise": none, "authed_user": map<string, any>{"id": "U1", "scope": "search:read", "access_token": "xoxp-1", "token_type": "user"}, "refresh_token": "xoxe-1", "expires_in": 43200, "incoming_webhook": map<string, any>{"url": "https://hooks.slack.com/x", "channel": "#general", "channel_id": "C1"}})
+	}
+
+	// The query parameter `name` of an address, "" when absent.
+	internal def param(address string, name string) !string {
+		let query = try url.parseQuery(address.contains("?") ?? (address[address.indexOf("?") + 1:], ""))
+		let found = query.get(name)
+		return found is none ?? ("", found)
+	}
+
+	// A redirect policy that hands every redirect back to the caller.
+	internal type KeepRedirects {
+		def new() {}
+
+		def follow(next http.Request, via http.Request[]) !bool {
+			return false
+		}
+	}
+
+	check "Slack OAuth" {
+		// The approval address asks for the scopes with a fresh state and a
+		// PKCE challenge; the callback's code becomes an installation, kept
+		// in the store.
+		@test()
+		def TestInstall() !none {
+			let seen = new Seen()
+			let server = try slackServer(seen)
+			seen.replies.set("oauth.v2.access", installedReply())
+			let installer = installerOf(seen)
+			let address = try installer.start(team = "T1")
+			assert address.startsWith("https://slack.com/oauth/v2/authorize?")
+			let state = try param(address, "state")
+			assert state.len() > 0 && (try param(address, "code_challenge")).len() > 0 && try param(address, "code_challenge_method") == "S256"
+			assert try param(address, "client_id") == "C123" && try param(address, "scope") == "chat:write,commands" && try param(address, "user_scope") == "search:read" && try param(address, "team") == "T1"
+			assert try param(address, "redirect_uri") == "https://app.example/slack/oauth"
+			let installed = try installer.complete("https://app.example/slack/oauth?code=abc&state={state}")
+			assert installed.teamId == "T1" && installed.teamName == "Acme" && installed.botUserId == "B1" && installed.appId == "A1"
+			assert !(installed.botToken is none) && installed.botScopes.join(",") == "chat:write,commands" && installed.userId == "U1" && !(installed.userToken is none)
+			assert !(installed.botRefreshToken is none) && !(installed.botExpiresAt is none) && installed.webhook.channelId == "C1"
+			assert seen.methods.join(",") == "oauth.v2.access" && arg(seen, 0, "code") == "abc" && arg(seen, 0, "redirect_uri") == "https://app.example/slack/oauth" && arg(seen, 0, "code_verifier").len() > 0
+			assert seen.auth[0] == "Basic " + base64encode("C123:sec".bytes())
+			let kept = try installer.store.find("T1", "")
+			assert !(kept is none) && kept.botUserId == "B1"
+			// A state is taken once.
+			installer.complete("https://app.example/slack/oauth?code=abc&state={state}") onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.Invalid
+				recover Installation{}
+			}
+			// A refused approval fails with Auth.
+			let next = try param(try installer.start(), "state")
+			installer.complete("?error=access_denied&state={next}") onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.Auth && err.slackCode == "access_denied"
+				recover Installation{}
+			}
+			try server.close()
+			return none
+		}
+
+		// A bot token about to expire is renewed with its refresh token
+		// before a client of it is made.
+		@test()
+		def TestRenew() !none {
+			let seen = new Seen()
+			let server = try slackServer(seen)
+			let installer = installerOf(seen)
+			let old = Installation{teamId: "T1", botToken: new Secret<string>("xoxb-old"), botRefreshToken: new Secret<string>("xoxe-old"), botExpiresAt: time.now() - 60s}
+			try installer.store.save(old)
+			seen.replies.set("oauth.v2.access", json(map<string, any>{"ok": true, "access_token": "xoxb-new", "token_type": "bot", "refresh_token": "xoxe-new", "expires_in": 43200}))
+			let bot = try installer.clientFor("T1")
+			let token = bot.token
+			assert !(token is none) && token.reveal() == "xoxb-new"
+			assert arg(seen, 0, "grant_type") == "refresh_token" && arg(seen, 0, "refresh_token") == "xoxe-old"
+			let saved = try installer.store.find("T1", "")
+			fail "the renewed installation was not saved" when saved is none
+			let expires = saved.botExpiresAt
+			assert !(expires is none) && time.now().before(expires)
+			// A fresh token is not renewed.
+			let calls = seen.methods.len()
+			try installer.clientFor("T1")
+			assert seen.methods.len() == calls
+			installer.clientFor("T9") onerror (err error) {
+				assert err is SlackError && err.kind == ErrorKind.NotFound
+				recover new Client("x")
+			}
+			// A user token is renewed on its own; one renewed long before it
+			// expires only when the leeway reaches it.
+			let user = Installation{teamId: "T2", userToken: new Secret<string>("xoxp-old"), userRefreshToken: new Secret<string>("xoxe-u"), userExpiresAt: time.now() + 600s}
+			let early = try installer.renew(user)
+			let same = early.userToken
+			assert seen.methods.len() == calls && !(same is none) && same.reveal() == "xoxp-old"
+			seen.replies.set("oauth.v2.access", json(map<string, any>{"ok": true, "access_token": "xoxp-new", "token_type": "user", "refresh_token": "xoxe-u2", "expires_in": 43200}))
+			let renewed = try installer.renew(user, leeway = 900s)
+			let fresh = renewed.userToken
+			assert seen.methods.len() == calls + 1 && !(fresh is none) && fresh.reveal() == "xoxp-new"
+			let found = try installer.installation("T2")
+			assert !(found is none) && found.teamId == "T2" && (try installer.installation("T3")) is none
+			try installer.store.remove("T2", "")
+			assert (try installer.store.find("T2", "")) is none
+			try server.close()
+			return none
+		}
+
+		// The install handler redirects to the approval page; the callback
+		// handler completes the installation.
+		@test()
+		def TestHandlers() !none {
+			let seen = new Seen()
+			let api = try slackServer(seen)
+			seen.replies.set("oauth.v2.access", installedReply())
+			let installer = installerOf(seen)
+			let mux = new http.ServeMux()
+			try mux.handle("/install", installer.installHandler())
+			try mux.handle("/oauth", installer.callbackHandler("https://app.example/installed"))
+			let server = new httptest.Server(mux)
+			try server.start()
+			let base = "http://{server.address().str()}"
+			let client = new http.Client()
+			client.redirects = new KeepRedirects()
+			let res = try client.do(try client.request(http.Method.GET, "{base}/install"))
+			assert res.status == 302
+			let state = try param(res.header("Location"), "state")
+			assert state.len() > 0
+			let done = try client.do(try client.request(http.Method.GET, "{base}/oauth?code=abc&state={state}"))
+			assert done.status == 302 && done.header("Location") == "https://app.example/installed"
+			let bad = try client.do(try client.request(http.Method.GET, "{base}/oauth?code=abc&state=nope"))
+			assert bad.status == 400
+			try server.close()
+			try api.close()
+			return none
+		}
+	}
+}

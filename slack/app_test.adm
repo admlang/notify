@@ -1,0 +1,291 @@
+partial module adm.notify.slack {
+	use (
+		std.time
+		std.testing
+		std.crypto.hash::(Hash, hmac)
+		std.net.http
+		std.net.http.httptest
+		std.net.url
+		std.data.encoding::(JSON, hexencode)
+	)
+
+	internal const testSecret = "s3cret"
+
+	// A POST to the app at `/slack`, signed with `secret` at `stamp` (now
+	// when 0).
+	internal def signedPost(seen Seen, body string, contentType string, secret string = testSecret, stamp int64 = 0, headers map<string, string> = new map<string, string>()) !http.Response {
+		let at = stamp != 0 ?? (stamp, time.now().unixNs() / 1000000000)
+		let signature = "v0=" + hexencode(hmac(Hash.SHA256, secret.bytes(), "v0:{at}:".bytes() + body.bytes()))
+		let client = new http.Client()
+		let req = try client.request(http.Method.POST, "{seen.base}/slack")
+		req.headers.set("X-Slack-Signature", signature)
+		req.headers.set("X-Slack-Request-Timestamp", "{at}")
+		req.headers.set("Content-Type", contentType)
+		for let (k, v) in headers {
+			req.headers.set(k, v)
+		}
+		req.replaceBody(body.bytes())
+		return try client.do(req)
+	}
+
+	internal def postEvent(seen Seen, event map<string, any>, headers map<string, string> = new map<string, string>()) !http.Response {
+		let body = json(map<string, any>{"type": "event_callback", "team_id": "T1", "api_app_id": "A1", "event_id": "Ev1", "event_time": 1760000000, "event": event})
+		return try signedPost(seen, body, "application/json", headers = headers)
+	}
+
+	internal def postPayload(seen Seen, payload map<string, any>) !http.Response {
+		let form = new url.Values()
+		form.set("payload", json(payload))
+		return try signedPost(seen, form.encode(), "application/x-www-form-urlencoded")
+	}
+
+	check "Slack App" {
+		// Only requests signed with the secret and recent are served; URL
+		// verification answers the challenge.
+		@test()
+		def TestSignatures() !none {
+			let seen = new Seen()
+			let app = new App(new Client("xoxb-test", "http://127.0.0.1:1/api"), testSecret)
+			let mux = new http.ServeMux()
+			try mux.handle("/slack", app)
+			let server = new httptest.Server(mux)
+			try server.start()
+			seen.base = "http://{server.address().str()}"
+			let challenge = json(map<string, any>{"type": "url_verification", "challenge": "c-123"})
+			let ok = try signedPost(seen, challenge, "application/json")
+			let answer = try (new JSON()).parse(try ok.text())
+			assert ok.status == 200 && answer is map<string, any> && "{answer.get("challenge")}" == "c-123"
+			let forged = try signedPost(seen, challenge, "application/json", secret = "wrong")
+			assert forged.status == 401
+			let stale = try signedPost(seen, challenge, "application/json", stamp = time.now().unixNs() / 1000000000 - 600)
+			assert stale.status == 401
+			assert signedBy(testSecret, "1760000000", "v0=00", "x".bytes(), 300s) == false
+			let ssl = try signedPost(seen, "ssl_check=1&token=x", "application/x-www-form-urlencoded")
+			assert ssl.status == 200
+			try server.close()
+			return none
+		}
+
+		// Events reach `onEvent` typed, after the acknowledgement, with the
+		// retry count of a repeated delivery.
+		@test()
+		def TestEvents() !none {
+			let seen = new Seen()
+			let got = new channel<Event>(16)
+			let app = new App(new Client("xoxb-test", "http://127.0.0.1:1/api"), testSecret)
+			app.onEvent(def (e Event) !none {
+				got <- e
+				return none
+			})
+			let mux = new http.ServeMux()
+			try mux.handle("/slack", app)
+			let server = new httptest.Server(mux)
+			try server.start()
+			seen.base = "http://{server.address().str()}"
+			let res = try postEvent(seen, map<string, any>{"type": "app_mention", "user": "U1", "text": "<@B1> hi", "ts": "1.1", "channel": "C1"}, headers = map<string, string>{"X-Slack-Retry-Num": "2", "X-Slack-Retry-Reason": "http_timeout"})
+			assert res.status == 200
+			let mention = <-got
+			assert mention.kind == "app_mention" && mention.teamId == "T1" && mention.eventId == "Ev1" && mention.retryNum == 2 && mention.retryReason == "http_timeout"
+			match mention.payload {
+				case AppMention:
+					assert mention.payload.user == "U1" && mention.payload.channel == "C1" && mention.payload.text == "<@B1> hi"
+				default:
+					fail "not an app mention"
+			}
+			try postEvent(seen, map<string, any>{"type": "reaction_added", "user": "U2", "reaction": "tada", "item_user": "U1", "item": map<string, any>{"type": "message", "channel": "C1", "ts": "1.1"}})
+			let reaction = <-got
+			assert reaction.payload is ReactionEvent
+			let r = reaction.payload
+			if r is ReactionEvent {
+				assert r.added && r.reaction == "tada" && r.item.channel == "C1" && r.item.ts == "1.1"
+			}
+			try postEvent(seen, map<string, any>{"type": "member_joined_channel", "user": "U3", "channel": "C1", "inviter": "U1"})
+			let joined = (<-got).payload
+			assert joined is MemberEvent && joined.joined && joined.inviter == "U1"
+			try postEvent(seen, map<string, any>{"type": "message", "subtype": "message_changed", "channel": "C1", "channel_type": "channel", "message": map<string, any>{"text": "new", "ts": "1.1"}, "previous_message": map<string, any>{"text": "old", "ts": "1.1"}})
+			let changed = (<-got).payload
+			assert changed is MessageEvent && changed.subtype == "message_changed" && changed.message.text == "new" && changed.previous.text == "old"
+			try postEvent(seen, map<string, any>{"type": "channel_rename", "channel": map<string, any>{"id": "C1", "name": "launch"}})
+			let renamed = (<-got).payload
+			assert renamed is ChannelEvent && renamed.channel == "C1" && renamed.name == "launch"
+			try postEvent(seen, map<string, any>{"type": "team_join", "user": map<string, any>{"id": "U9", "name": "new"}})
+			let newcomer = (<-got).payload
+			assert newcomer is UserEvent && newcomer.joined && newcomer.user.id == "U9"
+			try postEvent(seen, map<string, any>{"type": "tokens_revoked", "tokens": map<string, any>{"bot": ["U5"]}})
+			let revoked = (<-got).payload
+			assert revoked is TokensRevoked && revoked.bot.join(",") == "U5"
+			try postEvent(seen, map<string, any>{"type": "dnd_updated", "user": "U1"})
+			let other = (<-got).payload
+			assert other is OtherEvent && other.kind == "dnd_updated" && "{other.data.get("user")}" == "U1"
+			try server.close()
+			return none
+		}
+
+		// A command's first answer in time is the acknowledgement; past
+		// `ackAfter` the acknowledgement goes out empty and the answer goes
+		// to the response URL.
+		@test()
+		def TestCommands() !none {
+			let seen = new Seen()
+			let api = try slackServer(seen)
+			let app = new App(clientOf(seen), testSecret)
+			let slow = new channel<none>(1)
+			app.onCommand(def (c Command) !none {
+				if c.text == "slow" {
+					time.sleep(300ms)
+					try c.respond("late answer")
+					slow <- none
+					return none
+				}
+				return try c.respond("Deploying {c.text}", inChannel = true)
+			})
+			app.ackAfter = 100ms
+			let mux = new http.ServeMux()
+			try mux.handle("/slack", app)
+			let server = new httptest.Server(mux)
+			try server.start()
+			let hooks = seen.base
+			seen.base = "http://{server.address().str()}"
+			let form = new url.Values()
+			form.set("command", "/deploy")
+			form.set("text", "main")
+			form.set("user_id", "U1")
+			form.set("channel_id", "C1")
+			form.set("response_url", "{hooks}/hook/")
+			form.set("trigger_id", "tr1")
+			let res = try signedPost(seen, form.encode(), "application/x-www-form-urlencoded")
+			let answer = try (new JSON()).parse(try res.text())
+			assert answer is map<string, any> && "{answer.get("response_type")}" == "in_channel" && "{answer.get("text")}" == "Deploying main"
+			form.set("text", "slow")
+			let late = try signedPost(seen, form.encode(), "application/x-www-form-urlencoded")
+			assert late.status == 200 && (try late.text()).len() == 0
+			<-slow
+			assert seen.hooks.len() == 1 && "{seen.hooks[0].get("text")}" == "late answer" && "{seen.hooks[0].get("response_type")}" == "ephemeral"
+			try server.close()
+			try api.close()
+			return none
+		}
+
+		// A block action is acknowledged at once; its update goes to the
+		// response URL. A submission's answer is the acknowledgement;
+		// options too.
+		@test()
+		def TestInteractions() !none {
+			let seen = new Seen()
+			let api = try slackServer(seen)
+			let hooks = seen.base
+			let app = new App(clientOf(seen), testSecret)
+			let acted = new channel<string>(1)
+			app.onAction(def (a BlockAction) !none {
+				if a.actionId() == "remove" {
+					try a.deleteOriginal()
+				} else {
+					try a.update(new Message("Approved by <@{a.user.id}>"))
+				}
+				acted <- "{a.actionId()}:{a.value()}:{a.container.messageTs}"
+				return none
+			})
+			app.onView(def (s ViewSubmission) !none {
+				return try s.clear() when s.view.callbackId == "wipe"
+				let title = s.view.value("title")
+				return try s.errors(map<string, string>{"title-block": "At least three characters"}) when title is none || title.value.len() < 3
+				return none
+			})
+			let closed = new channel<string>(1)
+			app.onViewClosed(def (c ViewClosed) !none {
+				closed <- "{c.view.id}:{c.isCleared}:{c.user.id}"
+				return none
+			})
+			let shortcut = new channel<string>(1)
+			app.onShortcut(def (s Shortcut) !none {
+				try s.respond("Noted")
+				shortcut <- "{s.kind}:{s.callbackId}:{s.triggerId}"
+				return none
+			})
+			app.onOptions(def (o OptionsRequest) !none {
+				return try o.options([option("{o.value} one", "1"), option("{o.value} two", "2")])
+			})
+			let mux = new http.ServeMux()
+			try mux.handle("/slack", app)
+			let server = new httptest.Server(mux)
+			try server.start()
+			seen.base = "http://{server.address().str()}"
+			let action = map<string, any>{"type": "block_actions", "user": map<string, any>{"id": "U1", "username": "ana"}, "trigger_id": "tr", "response_url": "{hooks}/hook/", "container": map<string, any>{"type": "message", "message_ts": "1.1", "channel_id": "C1"}, "actions": [map<string, any>{"action_id": "approve", "block_id": "b", "type": "button", "value": "42"}]}
+			let res = try postPayload(seen, action)
+			assert res.status == 200 && (try res.text()).len() == 0
+			assert <- acted == "approve:42:1.1"
+			assert seen.hooks.len() == 1 && "{seen.hooks[0].get("replace_original")}" == "true" && "{seen.hooks[0].get("text")}" == "Approved by <@U1>"
+			let state = map<string, any>{"values": map<string, any>{"title-block": map<string, any>{"title": map<string, any>{"type": "plain_text_input", "value": "ab"}}}}
+			let submission = map<string, any>{"type": "view_submission", "user": map<string, any>{"id": "U1"}, "view": map<string, any>{"id": "V1", "callback_id": "ticket", "state": state}}
+			let refused = try postPayload(seen, submission)
+			let errors = try (new JSON()).parse(try refused.text())
+			assert errors is map<string, any> && "{errors.get("response_action")}" == "errors" && json(errors.get("errors")).contains("title-block")
+			state.set("values", map<string, any>{"title-block": map<string, any>{"title": map<string, any>{"type": "plain_text_input", "value": "abc"}}})
+			let accepted = try postPayload(seen, submission)
+			assert accepted.status == 200 && (try accepted.text()).len() == 0
+			let removal = map<string, any>{"type": "block_actions", "user": map<string, any>{"id": "U1"}, "response_url": "{hooks}/hook/", "container": map<string, any>{"type": "message", "message_ts": "1.2", "channel_id": "C1"}, "actions": [map<string, any>{"action_id": "remove", "block_id": "b", "type": "button", "value": "7"}]}
+			try postPayload(seen, removal)
+			assert <- acted == "remove:7:1.2"
+			assert seen.hooks.len() == 2 && "{seen.hooks[1].get("delete_original")}" == "true"
+			let wipe = map<string, any>{"type": "view_submission", "user": map<string, any>{"id": "U1"}, "view": map<string, any>{"id": "V2", "callback_id": "wipe", "state": map<string, any>{"values": new map<string, any>()}}}
+			let cleared = try (new JSON()).parse(try (try postPayload(seen, wipe)).text())
+			assert cleared is map<string, any> && "{cleared.get("response_action")}" == "clear"
+			let closing = map<string, any>{"type": "view_closed", "user": map<string, any>{"id": "U2"}, "is_cleared": true, "view": map<string, any>{"id": "V3", "callback_id": "ticket"}}
+			let shut = try postPayload(seen, closing)
+			assert shut.status == 200 && <- closed == "V3:true:U2"
+			let note = map<string, any>{"type": "message_action", "callback_id": "remember", "trigger_id": "tr9", "user": map<string, any>{"id": "U1"}, "response_url": "{hooks}/hook/", "message": map<string, any>{"text": "hi", "ts": "1.3"}}
+			let taken = try postPayload(seen, note)
+			assert taken.status == 200 && <- shortcut == "message_action:remember:tr9"
+			assert seen.hooks.len() == 3 && "{seen.hooks[2].get("text")}" == "Noted"
+			let suggestion = map<string, any>{"type": "block_suggestion", "action_id": "pick", "block_id": "b", "value": "re", "user": map<string, any>{"id": "U1"}}
+			let offered = try (new JSON()).parse(try (try postPayload(seen, suggestion)).text())
+			assert offered is map<string, any> && json(offered.get("options")).contains("re one")
+			try server.close()
+			try api.close()
+			return none
+		}
+
+		// A callback failing before its acknowledgement fails the request;
+		// one failing after it reaches `onError`.
+		@test()
+		def TestFailures() !none {
+			let seen = new Seen()
+			let app = new App(new Client("xoxb-test", "http://127.0.0.1:1/api"), testSecret)
+			let reported = new channel<string>(1)
+			app.onError(def (err error) {
+				reported <- err.message
+			})
+			app.onEvent(def (e Event) !none {
+				fail "event handler broke"
+			})
+			app.onCommand(def (c Command) !none {
+				fail "command handler broke"
+			})
+			let mux = new http.ServeMux()
+			try mux.handle("/slack", app)
+			let server = new httptest.Server(mux)
+			try server.start()
+			seen.base = "http://{server.address().str()}"
+			let res = try postEvent(seen, map<string, any>{"type": "app_mention", "user": "U1"})
+			assert res.status == 200
+			assert <- reported == "event handler broke"
+			let form = new url.Values()
+			form.set("command", "/x")
+			let failed = try signedPost(seen, form.encode(), "application/x-www-form-urlencoded")
+			assert failed.status == 500
+			// An app with no signing secret refuses to serve.
+			let unsigned = new App(new Client("xoxb-test", "http://127.0.0.1:1/api"))
+			unsigned.signingSecret = none
+			let bare = new http.ServeMux()
+			try bare.handle("/slack", unsigned)
+			let other = new httptest.Server(bare)
+			try other.start()
+			let unsignedSeen = new Seen()
+			unsignedSeen.base = "http://{other.address().str()}"
+			assert (try postEvent(unsignedSeen, map<string, any>{"type": "app_mention"})).status == 500
+			try other.close()
+			try server.close()
+			return none
+		}
+	}
+}

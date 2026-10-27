@@ -1,0 +1,272 @@
+partial module adm.notify.slack {
+	use std.data.encoding::(json)
+
+	// What a view is.
+	enum ViewKind {
+		// A dialog over Slack, opened from a `triggerId`.
+		Modal = "modal",
+		// The app's Home tab, one per user.
+		Home  = "home",
+	}
+
+	// A modal or a Home tab: its blocks (100 at most) and, for a modal, its
+	// title and buttons. Its methods add blocks and return the view, so they
+	// chain. `callbackId` and `privateMetadata` come back with the
+	// submission.
+	//
+	// ```
+	// let form = new slack.View("New ticket", callbackId = "ticket", submit = "Create")
+	// form.input("Title", slack.TextInput{actionId: "title"})
+	// form.input("Details", slack.TextInput{actionId: "details", multiline: true}, optional = true)
+	// try bot.openView(command.triggerId, form)
+	// ```
+	type View {
+		kind            ViewKind = ViewKind.Modal
+		title           string   = ""
+		submit          string   = ""
+		closeLabel      string   = ""
+		blocks          Block[]
+		callbackId      string   = ""
+		// Up to 3000 characters the app keeps with the view.
+		privateMetadata string   = ""
+		// A key the app chooses, unique per workspace, for `updateView`.
+		externalId      string   = ""
+		// Closing it closes every modal pushed under it.
+		clearOnClose    bool     = false
+		// Closing it reaches `App.onViewClosed`.
+		notifyOnClose   bool     = false
+		submitDisabled  bool     = false
+
+		// A modal titled `title`.
+		def new(title string = "", callbackId string = "", submit string = "", closeLabel string = "", kind ViewKind = ViewKind.Modal) {
+			self.title = title
+			self.callbackId = callbackId
+			self.submit = submit
+			self.closeLabel = closeLabel
+			self.kind = kind
+		}
+
+		// Adds `block`.
+		def add(block Block) View {
+			blocks.push(block)
+			return self
+		}
+
+		// Adds a section of Markdown `text`.
+		def section(text string, fields string[] = [], accessory ?Element = none) View {
+			blocks.push(sectionOf(text, fields, accessory))
+			return self
+		}
+
+		// Adds a header of plain `text`.
+		def header(text string) View {
+			blocks.push(Header{text: text})
+			return self
+		}
+
+		// Adds a divider.
+		def divider() View {
+			blocks.push(Divider{})
+			return self
+		}
+
+		// Adds a context line of Markdown texts.
+		def context(texts ...string) View {
+			blocks.push(contextOf(texts))
+			return self
+		}
+
+		// Adds a labelled field; its value comes back in the submission's
+		// state under `blockId` (its place when "") and the element's
+		// action id.
+		def input(label string, element Element, hint string = "", optional bool = false, blockId string = "", dispatchAction bool = false) View {
+			blocks.push(Input{label: label, element: element, hint: hint, optional: optional, blockId: blockId, dispatchAction: dispatchAction})
+			return self
+		}
+
+		// Adds an image block.
+		def image(url string, alt string, title string = "") View {
+			blocks.push(Image{url: url, alt: alt, title: title})
+			return self
+		}
+
+		// The first limit the view breaks; "" when it breaks none.
+		def problem() string {
+			if kind == ViewKind.Modal {
+				let problem = textProblem("the modal's title", title, 24)
+				problem = textProblem("the modal's submit button", submit, 24, false) when problem.len() == 0
+				problem = textProblem("the modal's close button", closeLabel, 24, false) when problem.len() == 0
+				return problem when problem.len() > 0
+			}
+			let problem = textProblem("the view's private metadata", privateMetadata, 3000, false)
+			problem = textProblem("the view's callback id", callbackId, 255, false) when problem.len() == 0
+			problem = textProblem("the view's external id", externalId, 255, false) when problem.len() == 0
+			problem = blocksProblem(blocks, 100) when problem.len() == 0
+			return problem
+		}
+	}
+
+	// The JSON of a view. Fails with Invalid for a limit it breaks.
+	internal def viewBody(v View) !map<string, any> {
+		let problem = v.problem()
+		fail invalid(problem) when problem.len() > 0
+		let out = map<string, any>{"type": v.kind.value, "blocks": blocksBody(v.blocks)}
+		if v.kind == ViewKind.Modal {
+			out.set("title", plainBody(v.title))
+			out.set("submit", plainBody(v.submit)) when v.submit.len() > 0
+			out.set("close", plainBody(v.closeLabel)) when v.closeLabel.len() > 0
+			out.set("clear_on_close", true) when v.clearOnClose
+			out.set("notify_on_close", true) when v.notifyOnClose
+			out.set("submit_disabled", true) when v.submitDisabled
+		}
+		out.set("callback_id", v.callbackId) when v.callbackId.len() > 0
+		out.set("private_metadata", v.privateMetadata) when v.privateMetadata.len() > 0
+		out.set("external_id", v.externalId) when v.externalId.len() > 0
+		return out
+	}
+
+	// What a user chose in one element of a view: by its type, the text,
+	// the option, the date, the users or conversations.
+	struct StateValue {
+		@json("type")
+		kind string
+		value string
+		@json("selected_option")
+		selectedOption Option
+		@json("selected_options")
+		selectedOptions Option[]
+		@json("selected_date")
+		selectedDate string
+		@json("selected_time")
+		selectedTime string
+		@json("selected_date_time")
+		selectedDateTime int64
+		@json("selected_user")
+		selectedUser string
+		@json("selected_users")
+		selectedUsers string[]
+		@json("selected_conversation")
+		selectedConversation string
+		@json("selected_conversations")
+		selectedConversations string[]
+		@json("selected_channel")
+		selectedChannel string
+		@json("selected_channels")
+		selectedChannels string[]
+		@json("rich_text_value")
+		richText any
+		files any[]
+	}
+
+	// The values of a view's inputs: by block id, then action id, as
+	// Slack's JSON (`ViewInfo.value` reads one as a StateValue).
+	struct ViewState {
+		values map<string, any>
+	}
+
+	// A view as Slack holds it: the ids to update it by, and the state of
+	// its inputs.
+	type ViewInfo {
+		id string
+		@json("team_id")
+		teamId string
+		@json("type")
+		kind string
+		@json("callback_id")
+		callbackId string
+		@json("private_metadata")
+		privateMetadata string
+		@json("external_id")
+		externalId string
+		// Changes with every update; `updateView` with it fails when the
+		// view changed meanwhile.
+		hash string
+		@json("root_view_id")
+		rootViewId string
+		@json("previous_view_id")
+		previousViewId string
+		@json("app_id")
+		appId string
+		@json("bot_id")
+		botId string
+		blocks any[]
+		state ViewState
+
+		def new() {}
+
+		// The value chosen in the element `actionId` of block `blockId`;
+		// none when the view has no such input.
+		def value(blockId string, actionId string) ?StateValue {
+			return stateValue(state, blockId, actionId)
+		}
+
+		// The value of the element `actionId`, in whichever block holds it.
+		def value(actionId string) ?StateValue {
+			for let (blockId, _) in state.values {
+				let found = stateValue(state, blockId, actionId)
+				return found unless found is none
+			}
+			return none
+		}
+	}
+
+	// The value of `actionId` in block `blockId` of a state; none when it
+	// has none, or not of a value's shape.
+	internal def stateValue(state ViewState, blockId string, actionId string) ?StateValue {
+		let block = state.values.get(blockId)
+		return none unless block is map<string, any>
+		let raw = block.get(actionId)
+		return none when raw is none
+		let out = StateValue{}
+		let failed = false
+		decodeObject(raw, out) onerror (err error) {
+			failed = true
+			recover none
+		}
+		return none when failed
+		return out
+	}
+
+	partial type Client {
+		// Opens a modal for the user whose action gave `triggerId` (within
+		// three seconds of it). Fails as every call does.
+		def openView(triggerId string, form View) !ViewInfo {
+			return try viewCall(self, "views.open", map<string, any>{"trigger_id": triggerId, "view": try viewBody(form)})
+		}
+
+		// Opens a modal over the one open (three deep at most). Fails as
+		// every call does.
+		def pushView(triggerId string, form View) !ViewInfo {
+			return try viewCall(self, "views.push", map<string, any>{"trigger_id": triggerId, "view": try viewBody(form)})
+		}
+
+		// Replaces an open view, named by its id (or `form.externalId` when
+		// `viewId` is ""); with `hash` it fails when the view changed since.
+		// Fails as every call does.
+		def updateView(viewId string, form View, hash string = "") !ViewInfo {
+			let args = map<string, any>{"view": try viewBody(form)}
+			if viewId.len() > 0 {
+				args.set("view_id", viewId)
+			} else {
+				args.set("external_id", form.externalId)
+			}
+			args.set("hash", hash) when hash.len() > 0
+			return try viewCall(self, "views.update", args)
+		}
+
+		// Shows `home` as `user`'s Home tab of the app. Fails as every call
+		// does.
+		def publishHome(user string, home View, hash string = "") !ViewInfo {
+			home.kind = ViewKind.Home
+			let args = map<string, any>{"user_id": user, "view": try viewBody(home)}
+			args.set("hash", hash) when hash.len() > 0
+			return try viewCall(self, "views.publish", args)
+		}
+	}
+
+	internal def viewCall(client Client, method string, args map<string, any>) !ViewInfo {
+		let out = new ViewInfo()
+		try decodeAt(try api(client, method, args), "view", out)
+		return out
+	}
+}

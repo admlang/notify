@@ -1,0 +1,131 @@
+partial module adm.notify.slack {
+	// The kinds of conversation a list holds.
+	enum ConversationKind {
+		Public  = "public_channel",
+		Private = "private_channel",
+		// Group direct messages.
+		Mpim    = "mpim",
+		// Direct messages.
+		Im      = "im",
+	}
+
+	partial type Client {
+		// The conversations of `kinds` (public channels when none), archived
+		// ones left out unless asked for.
+		def conversations(kinds ConversationKind[] = [], archived bool = false) Pages<Conversation> {
+			let names string[]
+			for let (_, k) in kinds {
+				names.push(k.value)
+			}
+			let args = map<string, any>{"types": names.len() > 0 ?? (names.join(","), ConversationKind.Public.value), "exclude_archived": !archived}
+			return pagesOf<Conversation>(self, "conversations.list", "channels", args, 200)
+		}
+
+		// A conversation by id, with its member count. Fails with NotFound
+		// for an unknown one, and as every call does.
+		def conversation(id string) !Conversation {
+			let out = Conversation{}
+			try decodeAt(try api(self, "conversations.info", map<string, any>{"channel": id, "include_num_members": true}), "channel", out)
+			return out
+		}
+
+		// A conversation's messages, newest first, between `oldest` and
+		// `latest` (message `ts` values; "" for no bound).
+		def history(channel string, oldest string = "", latest string = "", inclusive bool = false) Pages<Post> {
+			let args = map<string, any>{"channel": channel}
+			args.set("oldest", oldest) when oldest.len() > 0
+			args.set("latest", latest) when latest.len() > 0
+			args.set("inclusive", true) when inclusive
+			return pagesOf<Post>(self, "conversations.history", "messages", args, 200)
+		}
+
+		// A thread: its parent (`ts`) first, then the replies.
+		def replies(channel string, ts string) Pages<Post> {
+			return pagesOf<Post>(self, "conversations.replies", "messages", map<string, any>{"channel": channel, "ts": ts}, 200)
+		}
+
+		// The ids of a conversation's members.
+		def members(channel string) Pages<string> {
+			return pagesOf<string>(self, "conversations.members", "members", map<string, any>{"channel": channel}, 200)
+		}
+
+		// Opens (or finds) the direct message with one user, or the group
+		// direct message with several. Fails as every call does.
+		def open(users ...string) !Conversation {
+			let out = Conversation{}
+			try decodeAt(try api(self, "conversations.open", map<string, any>{"users": users.join(","), "return_im": true}), "channel", out)
+			return out
+		}
+
+		// Adds users to a channel. Fails as every call does.
+		def invite(channel string, users ...string) !Conversation {
+			let out = Conversation{}
+			try decodeAt(try api(self, "conversations.invite", map<string, any>{"channel": channel, "users": users.join(",")}), "channel", out)
+			return out
+		}
+
+		// Removes a user from a channel. Fails as every call does.
+		def kick(channel string, user string) !none {
+			try api(self, "conversations.kick", map<string, any>{"channel": channel, "user": user})
+			return none
+		}
+
+		// Creates a channel (lowercase, at most 80 characters). Fails as
+		// every call does.
+		def createChannel(name string, private bool = false) !Conversation {
+			let out = Conversation{}
+			try decodeAt(try api(self, "conversations.create", map<string, any>{"name": name, "is_private": private}), "channel", out)
+			return out
+		}
+
+		// Joins a public channel. Fails as every call does.
+		def join(channel string) !Conversation {
+			let out = Conversation{}
+			try decodeAt(try api(self, "conversations.join", map<string, any>{"channel": channel}), "channel", out)
+			return out
+		}
+
+		// Leaves a channel. Fails as every call does.
+		def leave(channel string) !none {
+			try api(self, "conversations.leave", map<string, any>{"channel": channel})
+			return none
+		}
+
+		// Archives a channel. Fails as every call does.
+		def archive(channel string) !none {
+			try api(self, "conversations.archive", map<string, any>{"channel": channel})
+			return none
+		}
+
+		// Brings an archived channel back. Fails as every call does.
+		def unarchive(channel string) !none {
+			try api(self, "conversations.unarchive", map<string, any>{"channel": channel})
+			return none
+		}
+
+		// Renames a channel. Fails as every call does.
+		def rename(channel string, name string) !Conversation {
+			let out = Conversation{}
+			try decodeAt(try api(self, "conversations.rename", map<string, any>{"channel": channel, "name": name}), "channel", out)
+			return out
+		}
+
+		// Sets a channel's topic. Fails as every call does.
+		def setTopic(channel string, topic string) !none {
+			try api(self, "conversations.setTopic", map<string, any>{"channel": channel, "topic": topic})
+			return none
+		}
+
+		// Sets a channel's purpose. Fails as every call does.
+		def setPurpose(channel string, purpose string) !none {
+			try api(self, "conversations.setPurpose", map<string, any>{"channel": channel, "purpose": purpose})
+			return none
+		}
+
+		// Closes a direct message. Fails as every call does.
+		def close(channel string) !none {
+			try api(self, "conversations.close", map<string, any>{"channel": channel})
+			return none
+		}
+	}
+}

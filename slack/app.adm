@@ -1,0 +1,337 @@
+partial module adm.notify.slack {
+	use (
+		std.os
+		std.time
+		std.crypto::(constantTimeEqual)
+		std.crypto.hash::(Hash, hmac)
+		std.net.http
+		std.net.url
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON, hexencode)
+	)
+
+	// What a Slack app receives, over HTTP (an `App` is an http.Handler for
+	// the Request URLs of the Events API, interactivity and slash commands)
+	// or over Socket Mode (`SocketMode` runs one). Each kind reaches the
+	// callback registered for it, on a task of its own:
+	//
+	// - an `Event`, a `BlockAction`, a `Shortcut` or a `ViewClosed` is
+	//   acknowledged at once, then handled; their answers go to the
+	//   response URL;
+	// - a `Command`, a `ViewSubmission` or an `OptionsRequest` waits up to
+	//   `ackAfter` for the callback's first answer, which becomes the
+	//   acknowledgement; past it the acknowledgement goes out empty and a
+	//   command's later answers use the response URL.
+	//
+	// Over HTTP each request's signature (`X-Slack-Signature`, the HMAC of
+	// the signing secret) and age (`X-Slack-Request-Timestamp`, at most
+	// `tolerance` off) are checked first; a request that fails either gets
+	// 401. URL verification and SSL checks are answered.
+	//
+	// ```
+	// let app = new slack.App(bot)                     // SLACK_SIGNING_SECRET
+	// app.onCommand(def (c slack.Command) !none {
+	// 	return try c.respond("pong")
+	// })
+	// try mux.handle("/slack", app)
+	// ```
+	type App {
+		// The Web API client the callbacks' answers go through.
+		client               Client
+		signingSecret        ?Secret<string>
+		// How far a request's timestamp may be from now: an older one is a
+		// replay.
+		tolerance            duration                   = 300s
+		// How long an interaction's acknowledgement waits for the
+		// callback's answer; Slack gives up after three seconds.
+		ackAfter             duration                   = 2500ms
+		internal events      def (Event) !none
+		internal commands    def (Command) !none
+		internal actions     def (BlockAction) !none
+		internal submissions def (ViewSubmission) !none
+		internal closings    def (ViewClosed) !none
+		internal shortcuts   def (Shortcut) !none
+		internal suggestions def (OptionsRequest) !none
+		internal failures    def (error)
+
+		// An app answering through `client` (a client of `SLACK_BOT_TOKEN`
+		// when none), checking requests with `signingSecret` (else
+		// `SLACK_SIGNING_SECRET`).
+		def new(client ?Client = none, signingSecret ?Secret<string> = none) {
+			self.client = client is none ?? (new Client(), client)
+			let env = Runtime.getEnv("SLACK_SIGNING_SECRET")
+			self.signingSecret = signingSecret is none ?? (env is none ?? (none, env), signingSecret)
+			events = def (e Event) !none {
+				return none
+			}
+			commands = def (c Command) !none {
+				return none
+			}
+			actions = def (a BlockAction) !none {
+				return none
+			}
+			submissions = def (s ViewSubmission) !none {
+				return none
+			}
+			closings = def (c ViewClosed) !none {
+				return none
+			}
+			shortcuts = def (s Shortcut) !none {
+				return none
+			}
+			suggestions = def (o OptionsRequest) !none {
+				return none
+			}
+			failures = def (err error) {
+				os.stderr.write("slack: a handler failed: {err.message}\n".bytes()) onerror recover 0
+			}
+		}
+
+		// Runs `handle` for every Events API delivery. Returns the app.
+		def onEvent(handle def (Event) !none) App {
+			events = handle
+			return self
+		}
+
+		// Runs `handle` for every slash command. Returns the app.
+		def onCommand(handle def (Command) !none) App {
+			commands = handle
+			return self
+		}
+
+		// Runs `handle` for every block action. Returns the app.
+		def onAction(handle def (BlockAction) !none) App {
+			actions = handle
+			return self
+		}
+
+		// Runs `handle` for every modal submission. Returns the app.
+		def onView(handle def (ViewSubmission) !none) App {
+			submissions = handle
+			return self
+		}
+
+		// Runs `handle` for every modal closed with `notifyOnClose`. Returns
+		// the app.
+		def onViewClosed(handle def (ViewClosed) !none) App {
+			closings = handle
+			return self
+		}
+
+		// Runs `handle` for every global or message shortcut. Returns the app.
+		def onShortcut(handle def (Shortcut) !none) App {
+			shortcuts = handle
+			return self
+		}
+
+		// Runs `handle` for every external select's request for options.
+		// Returns the app.
+		def onOptions(handle def (OptionsRequest) !none) App {
+			suggestions = handle
+			return self
+		}
+
+		// Where the failures of callbacks go once their delivery was
+		// acknowledged; standard error when none is given.
+		def onError(handle def (error)) App {
+			failures = handle
+			return self
+		}
+
+		// Implements http.Handler. Fails when no signing secret is known.
+		def serve(ctx http.Context) !none {
+			let body = try ctx.bytes()
+			let key = signingSecret
+			fail invalid("the app has no signing secret: give one, or set SLACK_SIGNING_SECRET") when key is none
+			let ok = signedBy(key.reveal(), ctx.header("X-Slack-Request-Timestamp"), ctx.header("X-Slack-Signature"), body, tolerance)
+			return ctx.text(401, "invalid request signature") unless ok
+			let ack = def (answer ?map<string, any>) !none {
+				if answer is none {
+					try ctx.text(200, "")
+				} else {
+					try ctx.json(answer)
+				}
+				return none
+			}
+			if ctx.header("Content-Type").startsWith("application/json") {
+				let parsed = (new JSON()).parse(body) onerror recover none
+				return ctx.text(400, "not an Events API body") unless parsed is map<string, any>
+				let kind = textAt(parsed, "type")
+				return ctx.json(map<string, any>{"challenge": textAt(parsed, "challenge")}) when kind == "url_verification"
+				return ctx.text(200, "") unless kind == "event_callback"
+				let e = try eventOf(parsed)
+				let retry = ctx.header("X-Slack-Retry-Num")
+				e.retryNum = retry.toInt<int>() when retry.isNumeric()
+				e.retryReason = ctx.header("X-Slack-Retry-Reason")
+				return try deliverEvent(self, e, ack)
+			}
+			let form = url.parseQuery(string(body)) onerror recover new url.Values()
+			let payload = form.get("payload")
+			if !(payload is none) {
+				let parsed = (new JSON()).parse(payload) onerror recover none
+				return ctx.text(400, "not an interactivity payload") unless parsed is map<string, any>
+				return try deliverInteraction(self, parsed, ack)
+			}
+			let command = form.get("command")
+			if !(command is none) {
+				let fields = new map<string, any>()
+				for let p in form.pairs() {
+					fields.set(p.key, p.value) unless fields.hasKey(p.key)
+				}
+				return try deliverCommand(self, fields, ack)
+			}
+			return ctx.text(200, "")
+		}
+	}
+
+	// Whether `signature` is `v0=` and the hex HMAC-SHA256, keyed with the
+	// signing secret, of `v0:<timestamp>:<body>`, and the timestamp within
+	// `tolerance` of now.
+	internal def signedBy(secret string, stamp string, signature string, body byte[], tolerance duration) bool {
+		return false unless stamp.isNumeric() && signature.startsWith("v0=")
+		let now = time.now().unixNs() / 1000000000
+		let age = now - stamp.toInt<int64>()
+		let limit = int64(tolerance) / 1000000000
+		return false when age > limit || age < -limit
+		let expected = "v0=" + hexencode(hmac(Hash.SHA256, secret.bytes(), "v0:{stamp}:".bytes() + body))
+		return constantTimeEqual(expected.bytes(), signature.bytes())
+	}
+
+	// Acknowledges an event, then runs its callback on a task of its own.
+	internal def deliverEvent(app App, e Event, ack def (?map<string, any>) !none) !none {
+		try ack(none)
+		async runQuietly(app, def () !none {
+			return try app.events(e)
+		})
+		return none
+	}
+
+	// Runs `work`, sending a failure to the app's failure callback.
+	internal def runQuietly(app App, work def () !none) {
+		work() onerror (err error) {
+			app.failures(err)
+			recover none
+		}
+	}
+
+	// A slash command from its fields (a form over HTTP, an object over
+	// Socket Mode).
+	internal def deliverCommand(app App, fields map<string, any>, ack def (?map<string, any>) !none) !none {
+		let c = new Command()
+		c.command = textAt(fields, "command")
+		c.text = textAt(fields, "text")
+		c.userId = textAt(fields, "user_id")
+		c.userName = textAt(fields, "user_name")
+		c.channelId = textAt(fields, "channel_id")
+		c.channelName = textAt(fields, "channel_name")
+		c.teamId = textAt(fields, "team_id")
+		c.teamDomain = textAt(fields, "team_domain")
+		c.enterpriseId = textAt(fields, "enterprise_id")
+		c.apiAppId = textAt(fields, "api_app_id")
+		c.isEnterpriseInstall = textAt(fields, "is_enterprise_install") == "true"
+		c.triggerId = textAt(fields, "trigger_id")
+		c.responseURL = textAt(fields, "response_url")
+		c.answering.responseURL = c.responseURL
+		let handle = app.commands
+		return try waitForAnswer(app, c.answering, def () !none {
+			return try handle(c)
+		}, ack)
+	}
+
+	// An interactivity payload, by its `type`.
+	internal def deliverInteraction(app App, payload map<string, any>, ack def (?map<string, any>) !none) !none {
+		let kind = textAt(payload, "type")
+		switch kind {
+			case "block_actions":
+				let a = new BlockAction()
+				try decodeObject(payload, a)
+				a.answering.responseURL = a.responseURL
+				a.answering.client = app.client
+				try ack(none)
+				let handle = app.actions
+				async runQuietly(app, def () !none {
+					return try handle(a)
+				})
+				return none
+			case "view_submission":
+				let s = new ViewSubmission()
+				try decodeObject(payload, s)
+				let urls = payload.get("response_urls")
+				if urls is any[] {
+					for let (_, u) in urls {
+						s.responseURLs.set(textAt(u, "channel_id"), textAt(u, "response_url")) when u is map<string, any>
+					}
+				}
+				let handle = app.submissions
+				return try waitForAnswer(app, s.answering, def () !none {
+					return try handle(s)
+				}, ack)
+			case "view_closed":
+				let c = new ViewClosed()
+				try decodeObject(payload, c)
+				try ack(none)
+				let handle = app.closings
+				async runQuietly(app, def () !none {
+					return try handle(c)
+				})
+				return none
+			case "shortcut", "message_action":
+				let s = new Shortcut()
+				try decodeObject(payload, s)
+				s.kind = kind
+				s.answering.responseURL = s.responseURL
+				s.answering.client = app.client
+				try ack(none)
+				let handle = app.shortcuts
+				async runQuietly(app, def () !none {
+					return try handle(s)
+				})
+				return none
+			case "block_suggestion":
+				let o = new OptionsRequest()
+				try decodeObject(payload, o)
+				let handle = app.suggestions
+				return try waitForAnswer(app, o.answering, def () !none {
+					return try handle(o)
+				}, ack)
+			default:
+				return try ack(none)
+		}
+	}
+
+	// Runs `work` on a task of its own and acknowledges with its first
+	// answer, or empty once it ended without one or `ackAfter` passed. A
+	// failure before the acknowledgement fails the delivery unacknowledged
+	// (over HTTP Slack sees a 500); one after it goes to the app's failure
+	// callback.
+	internal def waitForAnswer(app App, answering Answering, work def () !none, ack def (?map<string, any>) !none) !none {
+		let exchange = new Exchange()
+		answering.exchange = exchange
+		answering.client = app.client
+		async runReporting(app, work, exchange)
+		select {
+			case exchange.ready:
+			case time.sleepChan(app.ackAfter):
+		}
+		let (given, failure) = exchange.close()
+		if given is none {
+			fail failure unless failure is none
+			return try ack(none)
+		}
+		return try ack(given.body)
+	}
+
+	// Runs `work` and tells the exchange it ended; a failure the
+	// acknowledgement no longer waits for goes to the app's failure
+	// callback.
+	internal def runReporting(app App, work def () !none, exchange Exchange) {
+		let failure ?error = none
+		work() onerror (err error) {
+			failure = err
+			recover none
+		}
+		let heard = exchange.ended(failure)
+		let late = failure
+		app.failures(late) when !heard && !(late is none)
+	}
+}

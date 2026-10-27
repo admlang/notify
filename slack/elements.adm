@@ -1,0 +1,585 @@
+// Block Kit's composition objects (text, options, confirmations, filters)
+// and interactive elements, as typed values. Each becomes the JSON Slack
+// reads through `elementBody`; `elementProblem` names the first limit one
+// breaks.
+partial module adm.notify.slack {
+	// A text object: plain text, or `mrkdwn`, Slack's Markdown (`*bold*`,
+	// `_italic_`, `<url|link>`, `<@U123>`).
+	struct Text {
+		text     string
+		markdown bool   = false
+		// Plain text: `:smile:` shows the emoji.
+		emoji    bool   = true
+		// mrkdwn: links and mentions are left as written, not detected.
+		verbatim bool   = false
+	}
+
+	// Plain text.
+	def plain(text string, emoji bool = true) Text {
+		return Text{text: text, emoji: emoji}
+	}
+
+	// Text in Slack's Markdown.
+	def mrkdwn(text string, verbatim bool = false) Text {
+		return Text{text: text, markdown: true, verbatim: verbatim}
+	}
+
+	// A choice of a select, an overflow menu, checkboxes or radio buttons:
+	// what it shows and the `value` an action reports.
+	struct Option {
+		text        Text
+		value       string
+		description ?Text  = none
+		// An overflow menu's option opens this address.
+		url         string = ""
+	}
+
+	// A choice showing `text` (plain), reporting `value`.
+	def option(text string, value string, description string = "") Option {
+		let o = Option{text: plain(text), value: value}
+		o.description = plain(description) when description.len() > 0
+		return o
+	}
+
+	// Options under a heading, in a select.
+	struct OptionGroup {
+		label   string
+		options Option[]
+	}
+
+	// A dialog an element shows before its action goes out.
+	struct Confirm {
+		title   string
+		text    string
+		confirm string = "Yes"
+		deny    string = "Cancel"
+		// The confirm button in red.
+		danger  bool   = false
+	}
+
+	// Which conversations a conversations select offers; empty `include`
+	// offers every kind (`im`, `mpim`, `private`, `public`).
+	struct Filter {
+		include               string[]
+		excludeExternalShared bool     = false
+		excludeBotUsers       bool     = false
+	}
+
+	// A button's colour.
+	enum ButtonStyle {
+		Default = "",
+		// Green: the action the message is about.
+		Primary = "primary",
+		// Red: a destructive action, best with a Confirm.
+		Danger  = "danger",
+	}
+
+	// A button: it reports `actionId` and `value`, or opens `url`.
+	struct Button {
+		text               string
+		actionId           string      = ""
+		url                string      = ""
+		value              string      = ""
+		variant            ButtonStyle = ButtonStyle.Default
+		confirm            ?Confirm    = none
+		// What a screen reader says instead of the text.
+		accessibilityLabel string      = ""
+	}
+
+	// A button that starts a Workflow Builder workflow by its link trigger.
+	struct WorkflowButton {
+		text               string
+		trigger            string
+		// Values handed to the workflow's inputs.
+		inputs             map<string, string>
+		actionId           string              = ""
+		variant            ButtonStyle         = ButtonStyle.Default
+		accessibilityLabel string              = ""
+	}
+
+	// Where a select's choices come from.
+	enum SelectSource {
+		// `options` or `groups`, given here.
+		Static        = "static",
+		// The app's options load URL, asked as the user types
+		// (`App.onOptions`).
+		External      = "external",
+		Users         = "users",
+		Conversations = "conversations",
+		Channels      = "channels",
+	}
+
+	// A menu of one choice, or of several when `multi`.
+	struct Select {
+		source             SelectSource  = SelectSource.Static
+		multi              bool          = false
+		actionId           string        = ""
+		placeholder        string        = ""
+		options            Option[]
+		groups             OptionGroup[]
+		// Chosen at first: options (static, external), users, conversations
+		// or channels by id.
+		initialOptions     Option[]
+		initialIds         string[]
+		// External: the characters typed before options are asked for.
+		minQueryLength     int           = 0
+		// Multi: the most that may be chosen (0 for no limit).
+		maxSelected        int           = 0
+		// Conversations: which kinds are offered, and whether the one the
+		// user is in is chosen at first.
+		filter             ?Filter       = none
+		defaultToCurrent   bool          = false
+		// In a modal input, the action's `response_url` posts to the chosen
+		// conversation or channel.
+		responseURLEnabled bool          = false
+		confirm            ?Confirm      = none
+		focusOnLoad        bool          = false
+	}
+
+	// A static select of `options` (`select` is a keyword).
+	def menu(actionId string, options Option[], placeholder string = "", multi bool = false) Select {
+		return Select{actionId: actionId, options: options, placeholder: placeholder, multi: multi}
+	}
+
+	// A "…" menu of up to five options.
+	struct Overflow {
+		actionId string   = ""
+		options  Option[]
+		confirm  ?Confirm = none
+	}
+
+	// A date chooser; `initialDate` is `YYYY-MM-DD`.
+	struct DatePicker {
+		actionId    string   = ""
+		initialDate string   = ""
+		placeholder string   = ""
+		confirm     ?Confirm = none
+		focusOnLoad bool     = false
+	}
+
+	// A time chooser; `initialTime` is `HH:mm`, in `timezone` (an IANA
+	// name) or the user's.
+	struct TimePicker {
+		actionId    string   = ""
+		initialTime string   = ""
+		timezone    string   = ""
+		placeholder string   = ""
+		confirm     ?Confirm = none
+		focusOnLoad bool     = false
+	}
+
+	// A date and time chooser; `initial` is Unix seconds (0 for none).
+	struct DatetimePicker {
+		actionId    string   = ""
+		initial     int64    = 0
+		confirm     ?Confirm = none
+		focusOnLoad bool     = false
+	}
+
+	// Up to ten checkboxes, or radio buttons when `radio`.
+	struct Choices {
+		actionId       string   = ""
+		options        Option[]
+		initialOptions Option[]
+		radio          bool     = false
+		confirm        ?Confirm = none
+		focusOnLoad    bool     = false
+	}
+
+	// What a text input takes.
+	enum InputKind {
+		Plain  = "plain_text_input",
+		Email  = "email_text_input",
+		URL    = "url_text_input",
+		Number = "number_input",
+	}
+
+	// A text field of a modal or a message input: plain text (one line or
+	// `multiline`), an email address, a URL, or a number.
+	struct TextInput {
+		kind         InputKind = InputKind.Plain
+		actionId     string    = ""
+		placeholder  string    = ""
+		initialValue string    = ""
+		multiline    bool      = false
+		// Plain text: 0 for no bound.
+		minLength    int       = 0
+		maxLength    int       = 0
+		// Number: whether it takes a fraction, and the bounds ("" for none).
+		decimal      bool      = false
+		minValue     string    = ""
+		maxValue     string    = ""
+		// When an `App.onAction` fires for it, with `dispatchAction` on its
+		// input block: `on_enter_pressed`, `on_character_entered`.
+		dispatchOn   string[]
+		focusOnLoad  bool      = false
+	}
+
+	// A picture beside a section's text, or in a context block: by address
+	// or by a Slack file's id.
+	struct ImageElement {
+		url       string = ""
+		slackFile string = ""
+		alt       string
+	}
+
+	// A formatted text field (bold, lists, links) of a modal.
+	struct RichTextInput {
+		actionId     string    = ""
+		placeholder  string    = ""
+		initialValue ?RichText = none
+		dispatchOn   string[]
+		focusOnLoad  bool      = false
+	}
+
+	// A field of a modal that takes files.
+	struct FileInput {
+		actionId  string   = ""
+		// Extensions it takes (`pdf`, `png`); empty for any.
+		filetypes string[]
+		maxFiles  int      = 10
+	}
+
+	// An interactive element: what an actions block, a section's accessory
+	// or an input block holds.
+	type Element = Button | WorkflowButton | Select | Overflow | DatePicker | TimePicker | DatetimePicker | Choices | TextInput | ImageElement | RichTextInput | FileInput
+
+	internal def textBody(t Text) map<string, any> {
+		let out = map<string, any>{"type": t.markdown ?? ("mrkdwn", "plain_text"), "text": t.text}
+		if t.markdown {
+			out.set("verbatim", true) when t.verbatim
+		} else {
+			out.set("emoji", t.emoji)
+		}
+		return out
+	}
+
+	internal def plainBody(text string) map<string, any> {
+		return textBody(plain(text))
+	}
+
+	internal def optionBody(o Option) map<string, any> {
+		let out = map<string, any>{"text": textBody(o.text), "value": o.value}
+		let d = o.description
+		out.set("description", textBody(d)) unless d is none
+		out.set("url", o.url) when o.url.len() > 0
+		return out
+	}
+
+	internal def optionsBody(list Option[]) any[] {
+		let out any[] = []
+		for let (_, o) in list {
+			out.push(optionBody(o))
+		}
+		return out
+	}
+
+	internal def confirmBody(c Confirm) map<string, any> {
+		let out = map<string, any>{"title": plainBody(c.title), "text": plainBody(c.text), "confirm": plainBody(c.confirm), "deny": plainBody(c.deny)}
+		out.set("style", "danger") when c.danger
+		return out
+	}
+
+	// The JSON of an element.
+	internal def elementBody(e Element) map<string, any> {
+		let out = new map<string, any>()
+		match e {
+			case Button:
+				out = map<string, any>{"type": "button", "text": plainBody(e.text)}
+				out.set("action_id", e.actionId) when e.actionId.len() > 0
+				out.set("url", e.url) when e.url.len() > 0
+				out.set("value", e.value) when e.value.len() > 0
+				out.set("style", e.variant.value) when e.variant != ButtonStyle.Default
+				let c = e.confirm
+				out.set("confirm", confirmBody(c)) unless c is none
+				out.set("accessibility_label", e.accessibilityLabel) when e.accessibilityLabel.len() > 0
+			case WorkflowButton:
+				let parameters any[] = []
+				for let (name, value) in e.inputs {
+					parameters.push(map<string, any>{"name": name, "value": value})
+				}
+				let trigger = map<string, any>{"url": e.trigger}
+				trigger.set("customizable_input_parameters", parameters) when parameters.len() > 0
+				out = map<string, any>{"type": "workflow_button", "text": plainBody(e.text), "workflow": map<string, any>{"trigger": trigger}}
+				out.set("action_id", e.actionId) when e.actionId.len() > 0
+				out.set("style", e.variant.value) when e.variant != ButtonStyle.Default
+				out.set("accessibility_label", e.accessibilityLabel) when e.accessibilityLabel.len() > 0
+			case Select:
+				out = selectBody(e)
+			case Overflow:
+				out = map<string, any>{"type": "overflow", "options": optionsBody(e.options)}
+				out.set("action_id", e.actionId) when e.actionId.len() > 0
+				let c = e.confirm
+				out.set("confirm", confirmBody(c)) unless c is none
+			case DatePicker:
+				out = map<string, any>{"type": "datepicker"}
+				out.set("action_id", e.actionId) when e.actionId.len() > 0
+				out.set("initial_date", e.initialDate) when e.initialDate.len() > 0
+				out.set("placeholder", plainBody(e.placeholder)) when e.placeholder.len() > 0
+				let c = e.confirm
+				out.set("confirm", confirmBody(c)) unless c is none
+				out.set("focus_on_load", true) when e.focusOnLoad
+			case TimePicker:
+				out = map<string, any>{"type": "timepicker"}
+				out.set("action_id", e.actionId) when e.actionId.len() > 0
+				out.set("initial_time", e.initialTime) when e.initialTime.len() > 0
+				out.set("timezone", e.timezone) when e.timezone.len() > 0
+				out.set("placeholder", plainBody(e.placeholder)) when e.placeholder.len() > 0
+				let c = e.confirm
+				out.set("confirm", confirmBody(c)) unless c is none
+				out.set("focus_on_load", true) when e.focusOnLoad
+			case DatetimePicker:
+				out = map<string, any>{"type": "datetimepicker"}
+				out.set("action_id", e.actionId) when e.actionId.len() > 0
+				out.set("initial_date_time", e.initial) when e.initial > 0
+				let c = e.confirm
+				out.set("confirm", confirmBody(c)) unless c is none
+				out.set("focus_on_load", true) when e.focusOnLoad
+			case Choices:
+				out = map<string, any>{"type": e.radio ?? ("radio_buttons", "checkboxes"), "options": optionsBody(e.options)}
+				out.set("action_id", e.actionId) when e.actionId.len() > 0
+				if e.initialOptions.len() > 0 {
+					if e.radio {
+						out.set("initial_option", optionBody(e.initialOptions[0]))
+					} else {
+						out.set("initial_options", optionsBody(e.initialOptions))
+					}
+				}
+				let c = e.confirm
+				out.set("confirm", confirmBody(c)) unless c is none
+				out.set("focus_on_load", true) when e.focusOnLoad
+			case TextInput:
+				out = map<string, any>{"type": e.kind.value}
+				out.set("action_id", e.actionId) when e.actionId.len() > 0
+				out.set("placeholder", plainBody(e.placeholder)) when e.placeholder.len() > 0
+				out.set("initial_value", e.initialValue) when e.initialValue.len() > 0
+				out.set("multiline", true) when e.multiline && e.kind == InputKind.Plain
+				out.set("min_length", e.minLength) when e.minLength > 0
+				out.set("max_length", e.maxLength) when e.maxLength > 0
+				if e.kind == InputKind.Number {
+					out.set("is_decimal_allowed", e.decimal)
+					out.set("min_value", e.minValue) when e.minValue.len() > 0
+					out.set("max_value", e.maxValue) when e.maxValue.len() > 0
+				}
+				out.set("dispatch_action_config", map<string, any>{"trigger_actions_on": texts(e.dispatchOn)}) when e.dispatchOn.len() > 0
+				out.set("focus_on_load", true) when e.focusOnLoad
+			case ImageElement:
+				out = map<string, any>{"type": "image", "alt_text": e.alt}
+				if e.slackFile.len() > 0 {
+					out.set("slack_file", map<string, any>{"id": e.slackFile})
+				} else {
+					out.set("image_url", e.url)
+				}
+			case RichTextInput:
+				out = map<string, any>{"type": "rich_text_input"}
+				out.set("action_id", e.actionId) when e.actionId.len() > 0
+				out.set("placeholder", plainBody(e.placeholder)) when e.placeholder.len() > 0
+				let initial = e.initialValue
+				out.set("initial_value", richTextBody(initial)) unless initial is none
+				out.set("dispatch_action_config", map<string, any>{"trigger_actions_on": texts(e.dispatchOn)}) when e.dispatchOn.len() > 0
+				out.set("focus_on_load", true) when e.focusOnLoad
+			case FileInput:
+				out = map<string, any>{"type": "file_input", "max_files": e.maxFiles}
+				out.set("action_id", e.actionId) when e.actionId.len() > 0
+				out.set("filetypes", texts(e.filetypes)) when e.filetypes.len() > 0
+		}
+		return out
+	}
+
+	internal def selectBody(s Select) map<string, any> {
+		let kind = "{s.multi ?? ("multi_", "")}{s.source.value}_select"
+		let out = map<string, any>{"type": kind}
+		out.set("action_id", s.actionId) when s.actionId.len() > 0
+		out.set("placeholder", plainBody(s.placeholder)) when s.placeholder.len() > 0
+		switch s.source {
+			case SelectSource.Static:
+				if s.groups.len() > 0 {
+					let groups any[] = []
+					for let (_, g) in s.groups {
+						groups.push(map<string, any>{"label": plainBody(g.label), "options": optionsBody(g.options)})
+					}
+					out.set("option_groups", groups)
+				} else {
+					out.set("options", optionsBody(s.options))
+				}
+			case SelectSource.External:
+				out.set("min_query_length", s.minQueryLength) when s.minQueryLength > 0
+			default:
+		}
+		if s.source := SelectSource.Static || SelectSource.External {
+			if s.initialOptions.len() > 0 {
+				if s.multi {
+					out.set("initial_options", optionsBody(s.initialOptions))
+				} else {
+					out.set("initial_option", optionBody(s.initialOptions[0]))
+				}
+			}
+		} else if s.initialIds.len() > 0 {
+			let one = s.source == SelectSource.Users ?? ("initial_user", s.source == SelectSource.Conversations ?? ("initial_conversation", "initial_channel"))
+			if s.multi {
+				out.set(one + "s", texts(s.initialIds))
+			} else {
+				out.set(one, s.initialIds[0])
+			}
+		}
+		out.set("max_selected_items", s.maxSelected) when s.multi && s.maxSelected > 0
+		let f = s.filter
+		if s.source == SelectSource.Conversations {
+			if !(f is none) {
+				let filter = new map<string, any>()
+				filter.set("include", texts(f.include)) when f.include.len() > 0
+				filter.set("exclude_external_shared_channels", true) when f.excludeExternalShared
+				filter.set("exclude_bot_users", true) when f.excludeBotUsers
+				out.set("filter", filter)
+			}
+			out.set("default_to_current_conversation", true) when s.defaultToCurrent
+		}
+		out.set("response_url_enabled", true) when s.responseURLEnabled && !s.multi
+		let c = s.confirm
+		out.set("confirm", confirmBody(c)) unless c is none
+		out.set("focus_on_load", true) when s.focusOnLoad
+		return out
+	}
+
+	// The first limit `t` breaks as the text of `what`, at most `most`
+	// characters; "" when it breaks none.
+	internal def textProblem(what string, text string, most int, required bool = true) string {
+		return "{what} is empty" when required && text.len() == 0
+		return "{what} is {text.len()} characters, at most {most}" when text.len() > most
+		return ""
+	}
+
+	internal def optionProblem(place string, o Option) string {
+		let problem = textProblem("{place}'s text", o.text.text, 75)
+		problem = textProblem("{place}'s value", o.value, 150) when problem.len() == 0
+		let d = o.description
+		problem = textProblem("{place}'s description", d.text, 75, false) when problem.len() == 0 && !(d is none)
+		problem = textProblem("{place}'s url", o.url, 3000, false) when problem.len() == 0
+		return problem
+	}
+
+	internal def optionsProblem(place string, list Option[], most int) string {
+		return "{place} has {list.len()} options, at most {most}" when list.len() > most
+		for let (k, o) in list {
+			let problem = optionProblem("{place}'s option {k}", o)
+			return problem when problem.len() > 0
+		}
+		return ""
+	}
+
+	internal def confirmProblem(place string, c ?Confirm) string {
+		return "" when c is none
+		let problem = textProblem("{place}'s confirm title", c.title, 100)
+		problem = textProblem("{place}'s confirm text", c.text, 300) when problem.len() == 0
+		problem = textProblem("{place}'s confirm button", c.confirm, 30) when problem.len() == 0
+		problem = textProblem("{place}'s deny button", c.deny, 30) when problem.len() == 0
+		return problem
+	}
+
+	// The first limit an element breaks, named from `place`; "" when it
+	// breaks none.
+	internal def elementProblem(place string, e Element) string {
+		let problem = ""
+		match e {
+			case Button:
+				problem = textProblem("{place}'s text", e.text, 75)
+				problem = textProblem("{place}'s action_id", e.actionId, 255, false) when problem.len() == 0
+				problem = textProblem("{place}'s url", e.url, 3000, false) when problem.len() == 0
+				problem = textProblem("{place}'s value", e.value, 2000, false) when problem.len() == 0
+				problem = textProblem("{place}'s accessibility label", e.accessibilityLabel, 75, false) when problem.len() == 0
+				problem = confirmProblem(place, e.confirm) when problem.len() == 0
+			case WorkflowButton:
+				problem = textProblem("{place}'s text", e.text, 75)
+				problem = textProblem("{place}'s trigger", e.trigger, 3000) when problem.len() == 0
+			case Select:
+				problem = textProblem("{place}'s placeholder", e.placeholder, 150, false)
+				problem = textProblem("{place}'s action_id", e.actionId, 255, false) when problem.len() == 0
+				if problem.len() == 0 && e.source == SelectSource.Static {
+					if e.groups.len() > 0 {
+						problem = "{place} has {e.groups.len()} option groups, at most 100" when e.groups.len() > 100
+						for let (k, g) in e.groups {
+							break when problem.len() > 0
+							problem = textProblem("{place}'s group {k} label", g.label, 75)
+							problem = optionsProblem("{place}'s group {k}", g.options, 100) when problem.len() == 0
+						}
+					} else {
+						problem = "{place} offers no options" when e.options.len() == 0
+						problem = optionsProblem(place, e.options, 100) when problem.len() == 0
+					}
+				}
+				problem = confirmProblem(place, e.confirm) when problem.len() == 0
+			case Overflow:
+				problem = "{place} has {e.options.len()} options, 1 to 5" when e.options.len() == 0 || e.options.len() > 5
+				problem = optionsProblem(place, e.options, 5) when problem.len() == 0
+				problem = confirmProblem(place, e.confirm) when problem.len() == 0
+			case DatePicker:
+				problem = "{place}'s initial date is not YYYY-MM-DD" when e.initialDate.len() > 0 && !isDate(e.initialDate)
+				problem = textProblem("{place}'s placeholder", e.placeholder, 150, false) when problem.len() == 0
+				problem = confirmProblem(place, e.confirm) when problem.len() == 0
+			case TimePicker:
+				problem = "{place}'s initial time is not HH:mm" when e.initialTime.len() > 0 && !isTime(e.initialTime)
+				problem = textProblem("{place}'s placeholder", e.placeholder, 150, false) when problem.len() == 0
+				problem = confirmProblem(place, e.confirm) when problem.len() == 0
+			case DatetimePicker:
+				problem = confirmProblem(place, e.confirm)
+			case Choices:
+				problem = "{place} offers no options" when e.options.len() == 0
+				problem = optionsProblem(place, e.options, 10) when problem.len() == 0
+				problem = confirmProblem(place, e.confirm) when problem.len() == 0
+			case TextInput:
+				problem = textProblem("{place}'s placeholder", e.placeholder, 150, false)
+				problem = "{place}'s lengths are 0 to 3000, at least min" when problem.len() == 0 && (e.minLength < 0 || e.maxLength > 3000 || e.minLength > 3000 || (e.maxLength > 0 && e.minLength > e.maxLength))
+			case ImageElement:
+				problem = "{place} needs an image url or a Slack file" when e.url.len() == 0 && e.slackFile.len() == 0
+				problem = textProblem("{place}'s url", e.url, 3000, false) when problem.len() == 0
+				problem = textProblem("{place}'s alt text", e.alt, 2000) when problem.len() == 0
+			case RichTextInput:
+				problem = textProblem("{place}'s placeholder", e.placeholder, 150, false)
+			case FileInput:
+				problem = "{place} takes 1 to 10 files, not {e.maxFiles}" when e.maxFiles < 1 || e.maxFiles > 10
+		}
+		return problem
+	}
+
+	// Whether `text` is `YYYY-MM-DD`.
+	internal def isDate(text string) bool {
+		let parts = text.split("-")
+		return parts.len() == 3 && parts[0].len() == 4 && parts[1].len() == 2 && parts[2].len() == 2 && parts[0].isNumeric() && parts[1].isNumeric() && parts[2].isNumeric()
+	}
+
+	// Whether `text` is `HH:mm`.
+	internal def isTime(text string) bool {
+		let parts = text.split(":")
+		return parts.len() == 2 && parts[0].len() == 2 && parts[1].len() == 2 && parts[0].isNumeric() && parts[1].isNumeric()
+	}
+
+	// The action id of an element; "" for one without.
+	internal def actionIdOf(e Element) string {
+		match e {
+			case Button:
+				return e.actionId
+			case WorkflowButton:
+				return e.actionId
+			case Select:
+				return e.actionId
+			case Overflow:
+				return e.actionId
+			case DatePicker:
+				return e.actionId
+			case TimePicker:
+				return e.actionId
+			case DatetimePicker:
+				return e.actionId
+			case Choices:
+				return e.actionId
+			case TextInput:
+				return e.actionId
+			case RichTextInput:
+				return e.actionId
+			case FileInput:
+				return e.actionId
+			default:
+				return ""
+		}
+	}
+}

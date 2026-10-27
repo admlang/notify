@@ -1,0 +1,326 @@
+partial module adm.notify.slack {
+	use (
+		std.time
+		std.net.url
+		std.net.http
+		std.proto.auth.oauth2
+		std.services.runtime::(Runtime)
+		std.data.encoding::(base64encode)
+	)
+
+	// Slack's page where a user approves an installation.
+	const authorizeURL = "https://slack.com/oauth/v2/authorize"
+
+	// The incoming webhook an installation with `incoming-webhook` made.
+	struct InstalledWebhook {
+		url              string = ""
+		channel          string = ""
+		channelId        string = ""
+		configurationURL string = ""
+	}
+
+	// One installation of a distributed app: the workspace (or the Enterprise
+	// Grid organization) it is in, the bot's token and the installing
+	// user's, the scopes each holds, and for a token that expires (token
+	// rotation) when, and the refresh token that renews it.
+	struct Installation {
+		teamId              string           = ""
+		teamName            string           = ""
+		enterpriseId        string           = ""
+		enterpriseName      string           = ""
+		isEnterpriseInstall bool             = false
+		appId               string           = ""
+		botToken            ?Secret<string>  = none
+		botUserId           string           = ""
+		botScopes           string[]
+		botRefreshToken     ?Secret<string>  = none
+		botExpiresAt        ?time.Time       = none
+		userId              string           = ""
+		userToken           ?Secret<string>  = none
+		userScopes          string[]
+		userRefreshToken    ?Secret<string>  = none
+		userExpiresAt       ?time.Time       = none
+		webhook             InstalledWebhook
+		installedAt         time.Time        = time.now()
+	}
+
+	// Where an Installer keeps installations: the program's database, a
+	// vault. `find` answers none for a workspace without one.
+	interface InstallationStore {
+		def save(i Installation) !none
+		def find(teamId string, enterpriseId string) !?Installation
+		def remove(teamId string, enterpriseId string) !none
+	}
+
+	// An InstallationStore in memory, for a program with one process and
+	// installations it may lose.
+	type MemoryStore {
+		internal kept map<string, Installation>
+
+		def new() {}
+
+		// Keeps `i`, replacing the workspace's earlier installation. Does not
+		// fail: the error return is the interface's.
+		atomic def save(i Installation) !none {
+			kept.set(installKey(i.teamId, i.enterpriseId, i.isEnterpriseInstall), i)
+			return none
+		}
+
+		// The installation of a workspace, or of its organization when the
+		// app was installed organization-wide; none for neither. Does not
+		// fail.
+		atomic def find(teamId string, enterpriseId string) !?Installation {
+			let found = kept.get(installKey(teamId, enterpriseId, false))
+			return found unless found is none
+			return kept.get(installKey("", enterpriseId, true))
+		}
+
+		// Forgets a workspace's installation. Does not fail.
+		atomic def remove(teamId string, enterpriseId string) !none {
+			kept.delete(installKey(teamId, enterpriseId, false))
+			return none
+		}
+	}
+
+	internal def installKey(teamId string, enterpriseId string, org bool) string {
+		return org ?? ("org:{enterpriseId}", "{enterpriseId}:{teamId}")
+	}
+
+	// The OAuth v2 installation of a distributed app: the address that
+	// sends a user to Slack's approval page (with a fresh `state` and a
+	// PKCE challenge, through std.proto.auth.oauth2), the exchange of the
+	// code Slack sends back for the bot's and the user's tokens, kept in the
+	// program's `store`, and the renewal of tokens that expire.
+	//
+	// ```
+	// let installer = new slack.Installer(["chat:write", "commands"], "https://app.example/slack/oauth", store)
+	// try mux.handle("/slack/install", installer.installHandler())
+	// try mux.handle("/slack/oauth", installer.callbackHandler("https://app.example/installed"))
+	// let bot = try installer.clientFor(teamId)
+	// ```
+	type Installer {
+		clientId         string
+		clientSecret     ?Secret<string>
+		// The bot's scopes, and the installing user's.
+		scopes           string[]
+		userScopes       string[]
+		// The Redirect URL registered for the app.
+		redirectURI      string
+		store            InstallationStore
+		// The Web API client the code exchange goes through.
+		client           Client
+		// Slack's approval page; a test server's in tests.
+		approvalURL      string                                   = authorizeURL
+		// How long a started installation waits for its callback.
+		patience         duration                                 = 600s
+		internal oauth   oauth2.Client
+		internal pending map<string, oauth2.AuthorizationRequest>
+		internal started map<string, int64>
+
+		// An installer of the app `clientId` (else `SLACK_CLIENT_ID`) with
+		// `clientSecret` (else `SLACK_CLIENT_SECRET`), keeping installations
+		// in `store`.
+		def new(scopes string[], redirectURI string, store InstallationStore = new MemoryStore(), userScopes string[] = [], clientId string = "", clientSecret ?Secret<string> = none, client ?Client = none) {
+			self.scopes = scopes
+			self.userScopes = userScopes
+			self.redirectURI = redirectURI
+			self.store = store
+			let envId = Runtime.getEnv("SLACK_CLIENT_ID")
+			self.clientId = clientId.len() > 0 ?? (clientId, envId is none ?? ("", envId))
+			let envSecret = Runtime.getEnv("SLACK_CLIENT_SECRET")
+			self.clientSecret = clientSecret is none ?? (envSecret is none ?? (none, envSecret), clientSecret)
+			self.client = client is none ?? (new Client(), client)
+			let metadata = new oauth2.ServerMetadata("https://slack.com")
+			oauth = new oauth2.Client(self.clientId, metadata)
+			oauth.secret = self.clientSecret
+		}
+
+		// The address to send an installing user to, for workspace `team`
+		// when given. Remembers the request's state for `complete` until
+		// `patience` passes. Fails as std.proto.auth.oauth2 does.
+		def start(team string = "") !string {
+			oauth.metadata.authorizationEndpoint = approvalURL
+			let extra = map<string, string>{"scope": scopes.join(",")}
+			extra.set("user_scope", userScopes.join(",")) when userScopes.len() > 0
+			extra.set("team", team) when team.len() > 0
+			let request = try oauth.authorize(redirectURI, [], oauth2.AuthorizationOptions{extra: extra})
+			remember(request)
+			return request.url
+		}
+
+		// Finishes the installation the redirect to `callback` (the whole
+		// URL, or its query) brings back: checks the state, exchanges the
+		// code for the tokens, saves the installation and returns it. Fails
+		// with Invalid for an unknown or stale state, Auth for a refused
+		// approval or when Slack refuses the code or the app's secret, and as
+		// the store does.
+		def complete(callback string) !Installation {
+			let query = callback.contains("?") ?? (callback[callback.indexOf("?") + 1:], callback)
+			let params = url.parseQuery(query) onerror fail invalid("the callback query does not parse")
+			let state = params.get("state")
+			let request = recall(state is none ?? ("", state))
+			fail invalid("the installation's state is unknown or stale: start it again") when request is none
+			let refused = params.get("error")
+			fail SlackError{message: "slack: the installation was not approved: {refused}", code: ErrorKind.Auth.value, kind: ErrorKind.Auth, slackCode: refused} unless refused is none
+			let code = params.get("code")
+			fail invalid("the callback has no code") when code is none
+			let args = map<string, any>{"code": code, "redirect_uri": request.redirectUri, "code_verifier": request.verifier.reveal()}
+			let reply = try deliver(client, Call{method: "oauth.v2.access", args: args, basic: basicOf(clientId, clientSecret)})
+			let installed = installationOf(reply)
+			try store.save(installed)
+			return installed
+		}
+
+		// The installation of a workspace with its bot token renewed when it
+		// expires within `leeway` (token rotation); none when the workspace
+		// has none. Fails as the renewal and the store do.
+		def installation(teamId string, enterpriseId string = "", leeway duration = 300s) !?Installation {
+			let found = try store.find(teamId, enterpriseId)
+			return none when found is none
+			return try renew(found, leeway)
+		}
+
+		// A Web API client of a workspace's bot token, renewed as needed.
+		// Fails with NotFound when the workspace has no installation, and as
+		// `installation` does.
+		def clientFor(teamId string, enterpriseId string = "") !Client {
+			let found = try installation(teamId, enterpriseId)
+			fail SlackError{message: "slack: no installation for team {teamId}", code: ErrorKind.NotFound.value, kind: ErrorKind.NotFound} when found is none
+			fail SlackError{message: "slack: the installation of team {teamId} has no bot token", code: ErrorKind.Auth.value, kind: ErrorKind.Auth} when found.botToken is none
+			return new Client(found.botToken, client.baseURL)
+		}
+
+		// `i` with tokens that expire within `leeway` renewed (and saved).
+		// Fails with Auth when Slack refuses a refresh token, and as the
+		// store does.
+		def renew(i Installation, leeway duration = 300s) !Installation {
+			let changed = false
+			let botAt = i.botExpiresAt
+			let botRefresh = i.botRefreshToken
+			if !(botAt is none) && !(botRefresh is none) && !time.now().before(botAt - leeway) {
+				let fresh = try refreshed(self, botRefresh)
+				i.botToken = fresh.accessToken
+				i.botRefreshToken = fresh.refreshToken
+				i.botExpiresAt = fresh.expiresAt
+				changed = true
+			}
+			let userAt = i.userExpiresAt
+			let userRefresh = i.userRefreshToken
+			if !(userAt is none) && !(userRefresh is none) && !time.now().before(userAt - leeway) {
+				let fresh = try refreshed(self, userRefresh)
+				i.userToken = fresh.accessToken
+				i.userRefreshToken = fresh.refreshToken
+				i.userExpiresAt = fresh.expiresAt
+				changed = true
+			}
+			try store.save(i) when changed
+			return i
+		}
+
+		// A handler that sends the user to Slack's approval page.
+		def installHandler() http.Handler {
+			let installer = self
+			return new http.HandlerFunc(def (ctx http.Context) !none {
+				let team = ctx.query("team", "")
+				return try ctx.redirect(try installer.start(team))
+			})
+		}
+
+		// A handler for the Redirect URL: finishes the installation, then
+		// sends the user to `done` (or answers a short page). A failure
+		// answers 400 with its message.
+		def callbackHandler(done string = "") http.Handler {
+			let installer = self
+			return new http.HandlerFunc(def (ctx http.Context) !none {
+				let failed = ""
+				installer.complete(ctx.request.url.rawQuery) onerror (err error) {
+					failed = err.message
+					recover Installation{}
+				}
+				return try ctx.text(400, failed) when failed.len() > 0
+				return try ctx.redirect(done) when done.len() > 0
+				return try ctx.html("<!doctype html><title>Installed</title><p>The app is installed. You can close this page.</p>")
+			})
+		}
+
+		internal atomic def remember(request oauth2.AuthorizationRequest) {
+			let now = time.monoNs()
+			for let (state, at) in started.clone() {
+				if now - at > int64(patience) {
+					started.delete(state)
+					pending.delete(state)
+				}
+			}
+			pending.set(request.state, request)
+			started.set(request.state, now)
+		}
+
+		// The request of `state`, taken out; none for an unknown or stale
+		// one.
+		internal atomic def recall(state string) ?oauth2.AuthorizationRequest {
+			let found = pending.get(state)
+			let at = started.get(state)
+			pending.delete(state)
+			started.delete(state)
+			return none when found is none || at is none
+			return none when time.monoNs() - at > int64(patience)
+			return found
+		}
+	}
+
+	// `Basic` credentials of the app's id and secret.
+	internal def basicOf(clientId string, secret ?Secret<string>) string {
+		let text = secret is none ?? ("", secret.reveal())
+		return base64encode("{clientId}:{text}".bytes())
+	}
+
+	// A fresh token for a refresh token, through std.proto.auth.oauth2.
+	internal def refreshed(installer Installer, refresh Secret<string>) !oauth2.Token {
+		let endpoint = "{installer.client.baseURL}/oauth.v2.access"
+		installer.oauth.metadata.tokenEndpoint = endpoint
+		let old = new oauth2.Token("")
+		old.refreshToken = refresh
+		let fresh = installer.oauth.refresh(old) onerror (err error) {
+			fail SlackError{message: "slack: the token could not be renewed: {err.message}", code: ErrorKind.Auth.value, cause: err, kind: ErrorKind.Auth}
+		}
+		return fresh
+	}
+
+	// The Installation an `oauth.v2.access` reply describes.
+	internal def installationOf(reply map<string, any>) Installation {
+		let team = objectAt(reply, "team")
+		let enterprise = objectAt(reply, "enterprise")
+		let i = Installation{teamId: textAt(team, "id"), teamName: textAt(team, "name"), enterpriseId: textAt(enterprise, "id"), enterpriseName: textAt(enterprise, "name"), isEnterpriseInstall: boolAt(reply, "is_enterprise_install"), appId: textAt(reply, "app_id"), botUserId: textAt(reply, "bot_user_id")}
+		let bot = textAt(reply, "access_token")
+		if bot.len() > 0 {
+			i.botToken = new Secret<string>(bot)
+			i.botScopes = scopesOf(textAt(reply, "scope"))
+			let refresh = textAt(reply, "refresh_token")
+			i.botRefreshToken = new Secret<string>(refresh) when refresh.len() > 0
+			let expires = intAt(reply, "expires_in")
+			i.botExpiresAt = time.now() + duration(int64(expires) * 1000000000) when expires > 0
+		}
+		let user = objectAt(reply, "authed_user")
+		i.userId = textAt(user, "id")
+		let token = textAt(user, "access_token")
+		if token.len() > 0 {
+			i.userToken = new Secret<string>(token)
+			i.userScopes = scopesOf(textAt(user, "scope"))
+			let refresh = textAt(user, "refresh_token")
+			i.userRefreshToken = new Secret<string>(refresh) when refresh.len() > 0
+			let expires = intAt(user, "expires_in")
+			i.userExpiresAt = time.now() + duration(int64(expires) * 1000000000) when expires > 0
+		}
+		let hook = objectAt(reply, "incoming_webhook")
+		i.webhook = InstalledWebhook{url: textAt(hook, "url"), channel: textAt(hook, "channel"), channelId: textAt(hook, "channel_id"), configurationURL: textAt(hook, "configuration_url")}
+		return i
+	}
+
+	internal def scopesOf(text string) string[] {
+		let out string[]
+		for let (_, s) in text.split(",") {
+			out.push(s.trim()) when s.trim().len() > 0
+		}
+		return out
+	}
+}

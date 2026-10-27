@@ -1,0 +1,49 @@
+partial module adm.notify.slack {
+	partial type Client {
+		// Every member of the workspace, people, bots and apps, deleted ones
+		// included.
+		def users() Pages<User> {
+			return pagesOf<User>(self, "users.list", "members", map<string, any>{"include_locale": true}, 200)
+		}
+
+		// A member by id. Fails with NotFound for an unknown one, and as
+		// every call does.
+		def user(id string) !User {
+			let out = User{}
+			try decodeAt(try api(self, "users.info", map<string, any>{"user": id, "include_locale": true}), "user", out)
+			return out
+		}
+
+		// The member with an email address (with `users:read.email`). Fails
+		// with NotFound when nobody has it, and as every call does.
+		def userByEmail(email string) !User {
+			let out = User{}
+			try decodeAt(try api(self, "users.lookupByEmail", map<string, any>{"email": email}), "user", out)
+			return out
+		}
+
+		// Whether a member is active or away. Fails as every call does.
+		def presence(user string) !Presence {
+			let out = Presence{}
+			try decodeObject(try api(self, "users.getPresence", map<string, any>{"user": user}), out)
+			return out
+		}
+
+		// Marks the token's user away, or back to automatic presence with
+		// `on` false. Fails as every call does.
+		def away(on bool = true) !none {
+			try api(self, "users.setPresence", map<string, any>{"presence": on ?? ("away", "auto")})
+			return none
+		}
+
+		// A member's profile; the token's user's when `user` is "". Fails as
+		// every call does.
+		def profile(user string = "") !Profile {
+			let args = new map<string, any>()
+			args.set("user", user) when user.len() > 0
+			let out = Profile{}
+			try decodeAt(try api(self, "users.profile.get", args), "profile", out)
+			return out
+		}
+	}
+}

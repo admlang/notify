@@ -1,0 +1,61 @@
+partial module adm.notify.slack {
+	partial type Client {
+		// Creates a user group `@handle` (the name, lowercased, when "").
+		// Fails as every call does.
+		def createGroup(name string, handle string = "", description string = "", channels string[] = []) !Usergroup {
+			let args = map<string, any>{"name": name, "handle": handle.len() > 0 ?? (handle, name.lower().replace(" ", "-"))}
+			args.set("description", description) when description.len() > 0
+			args.set("channels", channels.join(",")) when channels.len() > 0
+			let out = Usergroup{}
+			try decodeAt(try api(self, "usergroups.create", args), "usergroup", out)
+			return out
+		}
+
+		// The workspace's user groups, with their members when asked.
+		// Fails as every call does.
+		def groups(disabled bool = false, members bool = false) !Usergroup[] {
+			let args = map<string, any>{"include_disabled": disabled, "include_users": members, "include_count": true}
+			return try listAt<Usergroup>(try api(self, "usergroups.list", args), "usergroups")
+		}
+
+		// Changes a user group; a "" argument (or channels left out) stays
+		// as it is. Fails as every call does.
+		def updateGroup(id string, name string = "", handle string = "", description string = "", channels ?string[] = none) !Usergroup {
+			let args = map<string, any>{"usergroup": id}
+			args.set("name", name) when name.len() > 0
+			args.set("handle", handle) when handle.len() > 0
+			args.set("description", description) when description.len() > 0
+			args.set("channels", channels.join(",")) unless channels is none
+			let out = Usergroup{}
+			try decodeAt(try api(self, "usergroups.update", args), "usergroup", out)
+			return out
+		}
+
+		// Disables a user group: `@handle` stops notifying. Fails as every
+		// call does.
+		def disableGroup(id string) !Usergroup {
+			let out = Usergroup{}
+			try decodeAt(try api(self, "usergroups.disable", map<string, any>{"usergroup": id}), "usergroup", out)
+			return out
+		}
+
+		// Enables a disabled user group. Fails as every call does.
+		def enableGroup(id string) !Usergroup {
+			let out = Usergroup{}
+			try decodeAt(try api(self, "usergroups.enable", map<string, any>{"usergroup": id}), "usergroup", out)
+			return out
+		}
+
+		// The ids of a user group's members. Fails as every call does.
+		def groupMembers(id string) !string[] {
+			return try listAt<string>(try api(self, "usergroups.users.list", map<string, any>{"usergroup": id}), "users")
+		}
+
+		// Replaces a user group's members. Fails as every call does.
+		def setGroupMembers(id string, users string[]) !Usergroup {
+			let out = Usergroup{}
+			try decodeAt(try api(self, "usergroups.users.update", map<string, any>{"usergroup": id, "users": users.join(",")}), "usergroup", out)
+			return out
+		}
+	}
+}

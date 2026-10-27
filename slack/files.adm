@@ -1,0 +1,144 @@
+partial module adm.notify.slack {
+	use (
+		std.os
+		std.net.http
+	)
+
+	// A file to upload: its name (the extension decides how Slack shows
+	// it), its bytes, and what Slack shows beside it.
+	struct Upload {
+		name    string
+		data    byte[]
+		title   string = ""
+		// The alt text of an image.
+		alt     string = ""
+		// A snippet's language (`python`, `diff`) for a text file.
+		snippet string = ""
+	}
+
+	// The file at `path`, named by its last element. Fails when it cannot be
+	// read.
+	def upload(path string, title string = "") !Upload {
+		let data = try os.readFile(path)
+		let parts = path.split("/")
+		return Upload{name: parts[parts.len() - 1], data: data, title: title}
+	}
+
+	partial type Client {
+		// Uploads `data` as `name` and shares it to `channel` (a thread
+		// with `thread`), with `comment` as the message; `channel` "" keeps
+		// it private to the token's user. Slack's two-step form: an upload
+		// address, the bytes, then the completion. Returns the file. Fails
+		// as every call does, and with Transport or Server when the bytes do
+		// not get through.
+		def upload(channel string, data byte[], name string, title string = "", comment string = "", thread string = "") !File {
+			let files = try upload(channel, [Upload{name: name, data: data, title: title}], comment, thread)
+			return files[0]
+		}
+
+		// Uploads several files and shares them in one message. Fails as
+		// `upload` does.
+		def upload(channel string, files Upload[], comment string = "", thread string = "") !File[] {
+			fail invalid("an upload takes 1 to 10 files, not {files.len()}") when files.len() == 0 || files.len() > 10
+			let done any[] = []
+			for let (_, f) in files {
+				let args = map<string, any>{"filename": f.name, "length": f.data.len()}
+				args.set("alt_txt", f.alt) when f.alt.len() > 0
+				args.set("snippet_type", f.snippet) when f.snippet.len() > 0
+				let reply = try api(self, "files.getUploadURLExternal", args)
+				try sendBytes(self, textAt(reply, "upload_url"), f.data)
+				let entry = map<string, any>{"id": textAt(reply, "file_id")}
+				entry.set("title", f.title) when f.title.len() > 0
+				done.push(entry)
+			}
+			let args = map<string, any>{"files": done}
+			args.set("channel_id", channel) when channel.len() > 0
+			args.set("initial_comment", comment) when comment.len() > 0
+			args.set("thread_ts", thread) when thread.len() > 0
+			return try listAt<File>(try api(self, "files.completeUploadExternal", args), "files")
+		}
+
+		// A file by id. Fails with NotFound for an unknown one, and as every
+		// call does.
+		def file(id string) !File {
+			let out = File{}
+			try decodeAt(try api(self, "files.info", map<string, any>{"file": id}), "file", out)
+			return out
+		}
+
+		// The files in a channel, or of a user, or every one the token
+		// sees, newest first.
+		def files(channel string = "", user string = "") Pages<File> {
+			let client = self
+			return new Pages<File>(def (cursor string) !(File[], string) {
+				let page = cursor.len() > 0 ?? (cursor.toInt<int>(), 1)
+				let args = map<string, any>{"count": 100, "page": page}
+				args.set("channel", channel) when channel.len() > 0
+				args.set("user", user) when user.len() > 0
+				let reply = try api(client, "files.list", args)
+				let paging = objectAt(reply, "paging")
+				let last = intAt(paging, "pages")
+				return (try listAt<File>(reply, "files"), page < last ?? ("{page + 1}", ""))
+			})
+		}
+
+		// Deletes a file. Fails as every call does.
+		def deleteFile(id string) !none {
+			try api(self, "files.delete", map<string, any>{"file": id})
+			return none
+		}
+
+		// Makes a file readable by anyone with its `permalinkPublic` (a
+		// user token). Fails as every call does.
+		def sharePublic(id string) !File {
+			let out = File{}
+			try decodeAt(try api(self, "files.sharedPublicURL", map<string, any>{"file": id}), "file", out)
+			return out
+		}
+
+		// Takes back a file's public link. Fails as every call does.
+		def revokePublic(id string) !File {
+			let out = File{}
+			try decodeAt(try api(self, "files.revokePublicURL", map<string, any>{"file": id}), "file", out)
+			return out
+		}
+
+		// A file's bytes, read with the token. Fails with Auth, NotFound,
+		// Transport or Server.
+		def download(file File) !byte[] {
+			let address = file.urlPrivateDownload.len() > 0 ?? (file.urlPrivateDownload, file.urlPrivate)
+			fail invalid("the file {file.id} has no address to download") when address.len() == 0
+			let req = try httpClient.request(http.Method.GET, address)
+			let key = token
+			req.headers.set("Authorization", "Bearer " + key.reveal()) unless key is none
+			let res = httpClient.do(req) onerror (err error) {
+				fail SlackError{message: "slack: download {file.id}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+			}
+			if !res.ok() {
+				res.close() onerror recover none
+				let kind = kindOfStatus(res.status)
+				fail SlackError{message: "slack: download {file.id}: {res.status}", code: kind.value, kind: kind, status: res.status}
+			}
+			return res.bytes() onerror (err error) {
+				fail SlackError{message: "slack: download {file.id}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport, status: res.status}
+			}
+		}
+	}
+
+	// Posts the bytes of an upload to the address Slack gave.
+	internal def sendBytes(client Client, address string, data byte[]) !none {
+		fail SlackError{message: "slack: no upload address came back", code: ErrorKind.Server.value, kind: ErrorKind.Server} when address.len() == 0
+		let req = try client.httpClient.request(http.Method.POST, address)
+		req.replaceBody(data)
+		req.headers.set("Content-Type", "application/octet-stream")
+		let res = client.httpClient.do(req) onerror (err error) {
+			fail SlackError{message: "slack: upload: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+		}
+		let text = res.text() onerror recover ""
+		if !res.ok() {
+			let kind = kindOfStatus(res.status)
+			fail SlackError{message: "slack: upload: {res.status} {text.trim()}", code: kind.value, kind: kind, status: res.status}
+		}
+		return none
+	}
+}

@@ -1,5 +1,5 @@
 // Slack Web API, webhooks and Socket Mode
-@manifest(version = "0.0.1")
+@manifest(version = "0.1.0")
 library adm.notify.slack {
 	use (
 		adm.notify.slack
