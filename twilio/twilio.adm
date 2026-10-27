@@ -1,3 +1,302 @@
+// A Twilio client over std.net.http: SMS, MMS and WhatsApp messages
+// (messaging services, scheduling, status callbacks, media), number lookups,
+// voice calls answered by TwiML built with typed builders, call control,
+// recordings and transcriptions, Verify (start and check over SMS, voice,
+// WhatsApp and email, rate limits), API keys, subaccounts, usage and the
+// regional edges; and a webhook handler that validates Twilio's request
+// signature, hands out typed events and answers with TwiML.
+//
+// ```
+// let tw = new twilio.Client(accountSid, authToken)   // TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+// let sms = try tw.messages.send("+15005550006", "+15551234567", "Your code is 482913")
+// print(sms.sid)
+//
+// let started = try tw.verify("VA...").start("+15551234567", channel = twilio.Channel.Sms)
+// let ok = try tw.verify("VA...").confirm("+15551234567", code)
+// ```
 partial module adm.notify.twilio {
-	// Twilio over std.net.http: SMS and MMS, WhatsApp, voice calls with TwiML, Verify, lookups, status callbacks and webhooks with request signature validation
+	use (
+		std.errors
+		std.time
+		std.net.http
+		std.net.url
+		std.services.runtime::(Runtime)
+		std.data.encoding::(JSON, json, base64encode)
+	)
+
+	// The library's version, in the User-Agent of every request.
+	const libraryVersion = "0.1.0"
+
+	// The version of the REST API messages, calls and accounts go to.
+	internal const restVersion = "2010-04-01"
+
+	// What went wrong, for the caller that acts on it.
+	enum ErrorKind {
+		// The credentials are missing or wrong, or lack the permission (401,
+		// 403).
+		Auth        = "auth",
+		// Twilio refused the pace or the concurrency (429).
+		RateLimited = "ratelimited",
+		// The request breaks a rule: a number that is not one, a parameter
+		// Twilio rejects (400, Twilio's `21xxx` errors).
+		Invalid     = "invalid",
+		// No message, call, verification or resource of that id (404).
+		NotFound    = "notfound",
+		// Twilio could not be reached, or the connection dropped.
+		Transport   = "transport",
+		// Twilio failed, or answered with something that is not its API.
+		Server      = "server",
+	}
+
+	// The failure of every call here. `errorCode` is Twilio's error code
+	// (`21211` invalid To number, `60200` invalid Verify parameter, ...),
+	// `moreInfo` the address of its documentation, `status` the HTTP status
+	// (0 when none came back) and `retryAfter` the pause a rate limit asked
+	// for.
+	struct TwilioError {
+		message    string
+		code       string
+		cause      ?error
+		stack      errors.StackTrace
+		kind       ErrorKind
+		status     int
+		errorCode  int
+		moreInfo   string
+		retryAfter ?duration
+	}
+
+	// How a Client reaches Twilio: the account its calls act for, where
+	// they go, and the HTTP client they go through. Its credentials stay
+	// inside.
+	type Connection {
+		// The account (`AC...`) whose resources the calls name: the
+		// credentials' own, or a subaccount of it.
+		accountSid       string
+		// A base for every product in place of Twilio's hosts:
+		// `<baseURL>/api`, `<baseURL>/verify`, `<baseURL>/lookups`. For a
+		// proxy or a test server; "" goes to Twilio.
+		baseURL          string          = ""
+		// The region (`ie1`, `au1`, `us1`) and edge (`dublin`, `sydney`,
+		// `ashburn`) of Twilio's regional hosts; "" for the default ones.
+		region           string          = ""
+		edge             string          = ""
+		// How often a call refused with 429 is sent again after a wait,
+		// before it fails with RateLimited.
+		rateLimitRetries int             = 5
+		// The HTTP client requests go through: timeouts, a transport.
+		httpClient       http.Client
+		internal user    string
+		internal secret  ?Secret<string>
+
+		def new(accountSid string, user string, secret ?Secret<string>) {
+			self.accountSid = accountSid
+			self.user = user
+			self.secret = secret
+			httpClient = new http.Client()
+			httpClient.userAgent = "adm.notify.twilio/{libraryVersion}"
+			httpClient.retry = http.RetryPolicy{attempts: 2, statuses: [502, 503, 504]}
+		}
+
+		// The base address of a product (`api`, `verify`, `lookups`).
+		def host(product string) string {
+			return "{baseURL.trimEnd("/")}/{product}" when baseURL.len() > 0
+			return "https://{product}.twilio.com" when region.len() == 0 && edge.len() == 0
+			let place = region.len() > 0 ?? (region, "us1")
+			return edge.len() > 0 ?? ("https://{product}.{edge}.{place}.twilio.com", "https://{product}.{place}.twilio.com")
+		}
+
+		// The path of the REST API's resources of the account.
+		def accountPath() string {
+			return "/{restVersion}/Accounts/{url.pathEscape(accountSid)}"
+		}
+	}
+
+	// A connection to Twilio as one account, with an auth token or an API
+	// key: `messages`, `calls`, `recordings`, `transcriptions`, `keys`,
+	// `accounts` and `usage` are its REST resources, `verify(sid)` a Verify
+	// service, `lookup` the Lookup API. Any number of tasks may share one;
+	// std.net.http keeps the connections.
+	//
+	// Calls fail with TwilioError: Auth for credentials Twilio refuses,
+	// NotFound for an unknown id, Invalid for a request Twilio refuses,
+	// RateLimited once `connection.rateLimitRetries` waits were spent,
+	// Server and Transport.
+	partial type Client {
+		connection     Connection
+		messages       Messages
+		calls          Calls
+		recordings     Recordings
+		transcriptions Transcriptions
+		keys           Keys
+		accounts       Accounts
+		usage          Usage
+
+		// A client of `accountSid` (else `TWILIO_ACCOUNT_SID`) signing in
+		// with `authToken` (else `TWILIO_AUTH_TOKEN`), or with an API key
+		// `apiKey` (`SK...`, else `TWILIO_API_KEY`) and its `apiSecret`
+		// (else `TWILIO_API_SECRET`) when one is given; at `baseURL`, or in
+		// `region` (else `TWILIO_REGION`) through `edge` (else
+		// `TWILIO_EDGE`).
+		def new(accountSid string = "", authToken ?Secret<string> = none, apiKey string = "", apiSecret ?Secret<string> = none, region string = "", edge string = "", baseURL string = "") {
+			let account = accountSid.len() > 0 ?? (accountSid, envOr("TWILIO_ACCOUNT_SID"))
+			let key = apiKey.len() > 0 ?? (apiKey, envOr("TWILIO_API_KEY"))
+			let token ?Secret<string> = authToken
+			if token is none {
+				let env = Runtime.getEnv("TWILIO_AUTH_TOKEN")
+				token = env unless env is none
+			}
+			let keySecret ?Secret<string> = apiSecret
+			if keySecret is none {
+				let env = Runtime.getEnv("TWILIO_API_SECRET")
+				keySecret = env unless env is none
+			}
+			let useKey = key.len() > 0 && !(keySecret is none)
+			let conn = new Connection(account, useKey ?? (key, account), useKey ?? (keySecret, token))
+			conn.baseURL = baseURL
+			conn.region = region.len() > 0 ?? (region, envOr("TWILIO_REGION"))
+			conn.edge = edge.len() > 0 ?? (edge, envOr("TWILIO_EDGE"))
+			connection = conn
+			messages = new Messages(conn)
+			calls = new Calls(conn)
+			recordings = new Recordings(conn)
+			transcriptions = new Transcriptions(conn)
+			keys = new Keys(conn)
+			accounts = new Accounts(conn)
+			usage = new Usage(conn)
+		}
+
+		// A client over `connection`.
+		def new(connection Connection) {
+			self.connection = connection
+			messages = new Messages(connection)
+			calls = new Calls(connection)
+			recordings = new Recordings(connection)
+			transcriptions = new Transcriptions(connection)
+			keys = new Keys(connection)
+			accounts = new Accounts(connection)
+			usage = new Usage(connection)
+		}
+
+		// A client acting for the subaccount `accountSid` with this one's
+		// credentials and settings.
+		def forAccount(accountSid string) Client {
+			let conn = new Connection(accountSid, connection.user, connection.secret)
+			conn.baseURL = connection.baseURL
+			conn.region = connection.region
+			conn.edge = connection.edge
+			conn.rateLimitRetries = connection.rateLimitRetries
+			conn.httpClient = connection.httpClient
+			return new Client(conn)
+		}
+	}
+
+	internal def envOr(name string) string {
+		let value = Runtime.getEnv(name)
+		return value is none ?? ("", value)
+	}
+
+	// Sends `method` to `path` of `product`, `form` as the form body of a
+	// POST or the query of another method, again after a wait for every
+	// 429 (up to `rateLimitRetries`). Returns the body of a 2xx reply.
+	// Fails with the TwilioError the reply describes otherwise.
+	internal def call(conn Connection, product string, method http.Method, path string, form ?url.Values = none) !byte[] {
+		let endpoint = method.value + " " + path.split("?")[0]
+		let secret = conn.secret
+		fail TwilioError{message: "twilio: {endpoint}: no credentials", code: ErrorKind.Auth.value, kind: ErrorKind.Auth} when secret is none || conn.user.len() == 0
+		let target = conn.host(product) + path
+		let values = form
+		let isPost = method == http.Method.POST
+		target += (path.contains("?") ?? ("&", "?")) + values.encode() when !isPost && !(values is none) && values.pairs().len() > 0
+		let attempt = 0
+		for {
+			let req = try conn.httpClient.request(method, target)
+			req.headers.set("Authorization", "Basic " + base64encode("{conn.user}:{secret.reveal()}".bytes()))
+			req.headers.set("Accept", "application/json")
+			if isPost {
+				req.replaceBody((values is none ?? ("", values.encode())).bytes())
+				req.headers.set("Content-Type", "application/x-www-form-urlencoded")
+			}
+			let res = conn.httpClient.do(req) onerror (err error) {
+				fail TwilioError{message: "twilio: {endpoint}: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport}
+			}
+			if res.status == 429 {
+				let asked = res.retryAfter()
+				let pause = asked is none ?? (1s * float(attempt + 1), asked)
+				res.close() onerror recover none
+				if attempt < conn.rateLimitRetries {
+					attempt++
+					time.sleep(pause)
+					continue
+				}
+				fail TwilioError{message: "twilio: {endpoint}: rate limited", code: ErrorKind.RateLimited.value, kind: ErrorKind.RateLimited, status: 429, errorCode: 20429, retryAfter: pause}
+			}
+			let data = res.bytes() onerror (err error) {
+				fail TwilioError{message: "twilio: {endpoint}: the reply was cut short: {err.message}", code: ErrorKind.Transport.value, cause: err, kind: ErrorKind.Transport, status: res.status}
+			}
+			fail failureOf(endpoint, res.status, res.reason, data) unless res.ok()
+			return data
+		}
+		fail "twilio: unreachable"
+	}
+
+	// The body of a refusal: `{"code": 21211, "message": "...",
+	// "more_info": "...", "status": 400}`.
+	internal struct Refusal {
+		code int
+		message string
+		@json("more_info")
+		moreInfo string
+	}
+
+	// The TwilioError of a reply that is not 2xx.
+	internal def failureOf(endpoint string, status int, reason string, data byte[]) TwilioError {
+		let refusal = Refusal{}
+		(new JSON()).decode(data, refusal) onerror recover none
+		let kind = kindOf(status)
+		let text = string(data).trim()
+		let detail = refusal.message.len() > 0 ?? (refusal.message, text.len() > 0 && text.len() <= 200 ?? (text, reason))
+		let numbered = refusal.code > 0 ?? (" ({refusal.code})", "")
+		return TwilioError{message: "twilio: {endpoint}: {status} {detail}{numbered}", code: kind.value, kind: kind, status: status, errorCode: refusal.code, moreInfo: refusal.moreInfo}
+	}
+
+	internal def kindOf(status int) ErrorKind {
+		return ErrorKind.Auth when status := 401 || 403
+		return ErrorKind.NotFound when status := 404 || 410
+		return ErrorKind.RateLimited when status == 429
+		return ErrorKind.Server when status >= 500
+		return ErrorKind.Invalid
+	}
+
+	// A failure raised before anything is sent: a rule the request breaks.
+	internal def invalid(message string) TwilioError {
+		return TwilioError{message: "twilio: {message}", code: ErrorKind.Invalid.value, kind: ErrorKind.Invalid}
+	}
+
+	// Binds the JSON of a reply onto `target`. Fails with TwilioError
+	// Server when it is not of that shape.
+	internal def decodeInto(data byte[], target any) !none {
+		(new JSON()).decode(data, target) onerror (err error) {
+			fail TwilioError{message: "twilio: the reply is not what the API sends: {err.message}", code: ErrorKind.Server.value, cause: err, kind: ErrorKind.Server}
+		}
+		return none
+	}
+
+	// `text` escaped for one segment of a path.
+	internal def segment(text string) string {
+		return url.pathEscape(text)
+	}
+
+	// A form or query of the pairs whose value is not "".
+	internal def formOf(pairs map<string, string>) url.Values {
+		let out = new url.Values()
+		for let (key, value) in pairs {
+			out.set(key, value) when value.len() > 0
+		}
+		return out
+	}
+
+	// A time as Twilio's parameters take it: RFC 3339 in UTC.
+	internal def stampOf(at time.Time) string {
+		return at.str(time.TimeFormat.RFC3339)
+	}
 }

@@ -1,0 +1,315 @@
+partial module adm.notify.twilio {
+	use (
+		std.time
+		std.net.http
+		std.net.url
+		std.data.encoding::(json)
+	)
+
+	// A voice call, placed or received. Times are RFC 2822 text as Twilio
+	// writes them.
+	struct Call {
+		sid string
+		@json("account_sid")
+		accountSid string
+		@json("parent_call_sid")
+		parentCallSid string
+		from string
+		to string
+		@json("from_formatted")
+		fromFormatted string
+		@json("to_formatted")
+		toFormatted string
+		// `queued`, `ringing`, `in-progress`, `completed`, `busy`,
+		// `failed`, `no-answer`, `canceled`.
+		status string
+		// `inbound`, `outbound-api`, `outbound-dial`.
+		direction string
+		// Seconds, as text.
+		duration string
+		@json("start_time")
+		startTime string
+		@json("end_time")
+		endTime string
+		price string
+		@json("price_unit")
+		priceUnit string
+		// `human`, `machine_start`, `fax`, ... with answering machine
+		// detection on.
+		@json("answered_by")
+		answeredBy string
+		@json("caller_name")
+		callerName string
+		@json("forwarded_from")
+		forwardedFrom string
+		@json("date_created")
+		dateCreated string
+		uri string
+	}
+
+	// The changes of a call's status its status callback is told of.
+	enum CallProgress {
+		Initiated = "initiated",
+		Ringing   = "ringing",
+		Answered  = "answered",
+		Completed = "completed",
+	}
+
+	// Which calls a listing keeps; empty fields keep all.
+	struct CallFilter {
+		to            string     = ""
+		from          string     = ""
+		status        string     = ""
+		parentCallSid string     = ""
+		startedAfter  ?time.Date = none
+		startedBefore ?time.Date = none
+	}
+
+	// A recording of a call or a conference.
+	struct Recording {
+		sid string
+		@json("account_sid")
+		accountSid string
+		@json("call_sid")
+		callSid string
+		@json("conference_sid")
+		conferenceSid string
+		// `in-progress`, `paused`, `stopped`, `processing`, `completed`,
+		// `absent`, `deleted`.
+		status string
+		// Seconds, as text.
+		duration string
+		channels int
+		// `DialVerb`, `RecordVerb`, `StartCallRecordingAPI`, ...
+		source string
+		@json("start_time")
+		startTime string
+		price string
+		@json("price_unit")
+		priceUnit string
+		@json("error_code")
+		errorCode int
+		@json("date_created")
+		dateCreated string
+		uri string
+	}
+
+	// Which recordings a listing keeps; empty fields keep all.
+	struct RecordingFilter {
+		callSid       string     = ""
+		conferenceSid string     = ""
+		createdAfter  ?time.Date = none
+		createdBefore ?time.Date = none
+	}
+
+	// The text of a recording.
+	struct Transcription {
+		sid string
+		@json("account_sid")
+		accountSid string
+		@json("recording_sid")
+		recordingSid string
+		// `in-progress`, `completed`, `failed`.
+		status string
+		@json("transcription_text")
+		text string
+		duration string
+		price string
+		@json("price_unit")
+		priceUnit string
+		@json("date_created")
+		dateCreated string
+		uri string
+	}
+
+	// The calls of an account.
+	type Calls {
+		internal conn Connection
+
+		def new(conn Connection) {
+			self.conn = conn
+		}
+
+		// Calls `to` from `from`; when answered, the call follows `twiml`,
+		// or the TwiML `url` answers (with `method`). `statusCallback` is
+		// told of the `progress` asked for; `timeout` is how long it rings;
+		// `record` records it from the start, `recordingStatusCallback`
+		// told when the recording is ready; `machineDetection` (`Enable`,
+		// `DetectMessageEnd`) tells a person from a machine; `sendDigits`
+		// are played once connected; `timeLimit` ends it. Fails with
+		// Invalid when it has neither `twiml` nor `url`, and as every call
+		// does.
+		def place(from string, to string, twiml ?VoiceResponse = none, url string = "", method string = "", statusCallback string = "", progress CallProgress[] = [], timeout ?duration = none, record bool = false, recordingStatusCallback string = "", machineDetection string = "", sendDigits string = "", timeLimit ?duration = none) !Call {
+			fail invalid("a call needs TwiML or the `url` of TwiML") when twiml is none && url.len() == 0
+			let form = formOf(map<string, string>{"To": to, "From": from, "Url": url, "Method": method, "StatusCallback": statusCallback, "RecordingStatusCallback": recordingStatusCallback, "MachineDetection": machineDetection, "SendDigits": sendDigits})
+			form.set("Twiml", twiml.str()) unless twiml is none
+			for let p in progress {
+				form.add("StatusCallbackEvent", p.value)
+			}
+			form.set("Timeout", "{int(timeout / 1s)}") unless timeout is none
+			form.set("TimeLimit", "{int(timeLimit / 1s)}") unless timeLimit is none
+			form.set("Record", "true") when record
+			let placed = Call{}
+			try decodeInto(try call(conn, "api", http.Method.POST, "{conn.accountPath()}/Calls.json", form), placed)
+			return placed
+		}
+
+		// The calls `filter` keeps, newest first.
+		def list(filter CallFilter = CallFilter{}) Pages<Call> {
+			let query = formOf(map<string, string>{"To": filter.to, "From": filter.from, "Status": filter.status, "ParentCallSid": filter.parentCallSid})
+			let after = filter.startedAfter
+			query.set("StartTime>", after.str()) unless after is none
+			let before = filter.startedBefore
+			query.set("StartTime<", before.str()) unless before is none
+			return pagesOf<Call>(conn, "api", "{conn.accountPath()}/Calls.json", query, "calls")
+		}
+
+		// The call `sid`. Fails with NotFound for an unknown one, and as
+		// every call does.
+		def get(sid string) !Call {
+			let found = Call{}
+			try decodeInto(try call(conn, "api", http.Method.GET, "{conn.accountPath()}/Calls/{segment(sid)}.json"), found)
+			return found
+		}
+
+		// Moves the live call `sid` on to `twiml`, or to the TwiML `url`
+		// answers. Fails with Invalid when it has neither, or the call is
+		// over, and as `get` does.
+		def redirect(sid string, twiml ?VoiceResponse = none, url string = "", method string = "") !Call {
+			fail invalid("a redirect needs TwiML or the `url` of TwiML") when twiml is none && url.len() == 0
+			let form = formOf(map<string, string>{"Url": url, "Method": method})
+			form.set("Twiml", twiml.str()) unless twiml is none
+			return try updateCall(conn, sid, form)
+		}
+
+		// Hangs up the call `sid` in progress. Fails as `get` does.
+		def hangUp(sid string) !Call {
+			return try updateCall(conn, sid, formOf(map<string, string>{"Status": "completed"}))
+		}
+
+		// Cancels the call `sid` that is queued or ringing. Fails as `get`
+		// does.
+		def cancel(sid string) !Call {
+			return try updateCall(conn, sid, formOf(map<string, string>{"Status": "canceled"}))
+		}
+
+		// Removes the call `sid` from the account's log. Fails as `get`
+		// does.
+		def delete(sid string) !none {
+			try call(conn, "api", http.Method.DELETE, "{conn.accountPath()}/Calls/{segment(sid)}.json")
+			return none
+		}
+
+		// Starts recording the live call `sid`; `statusCallback` is told
+		// when the recording is ready; `channels` is `mono` or `dual`. Fails
+		// as `get` does.
+		def record(sid string, statusCallback string = "", channels string = "", trim bool = false) !Recording {
+			let form = formOf(map<string, string>{"RecordingStatusCallback": statusCallback, "RecordingChannels": channels})
+			form.set("Trim", "trim-silence") when trim
+			let made = Recording{}
+			try decodeInto(try call(conn, "api", http.Method.POST, "{conn.accountPath()}/Calls/{segment(sid)}/Recordings.json", form), made)
+			return made
+		}
+	}
+
+	internal def updateCall(conn Connection, sid string, form url.Values) !Call {
+		let found = Call{}
+		try decodeInto(try call(conn, "api", http.Method.POST, "{conn.accountPath()}/Calls/{segment(sid)}.json", form), found)
+		return found
+	}
+
+	// The recordings of an account.
+	type Recordings {
+		internal conn Connection
+
+		def new(conn Connection) {
+			self.conn = conn
+		}
+
+		// The recordings `filter` keeps, newest first.
+		def list(filter RecordingFilter = RecordingFilter{}) Pages<Recording> {
+			let query = formOf(map<string, string>{"CallSid": filter.callSid, "ConferenceSid": filter.conferenceSid})
+			let after = filter.createdAfter
+			query.set("DateCreated>", after.str()) unless after is none
+			let before = filter.createdBefore
+			query.set("DateCreated<", before.str()) unless before is none
+			return pagesOf<Recording>(conn, "api", "{conn.accountPath()}/Recordings.json", query, "recordings")
+		}
+
+		// The recording `sid`. Fails with NotFound for an unknown one, and
+		// as every call does.
+		def get(sid string) !Recording {
+			let found = Recording{}
+			try decodeInto(try call(conn, "api", http.Method.GET, "{conn.accountPath()}/Recordings/{segment(sid)}.json"), found)
+			return found
+		}
+
+		// The audio of recording `sid`, as `mp3` or `wav`. Fails as `get`
+		// does.
+		def download(sid string, format string = "mp3") !byte[] {
+			return try call(conn, "api", http.Method.GET, "{conn.accountPath()}/Recordings/{segment(sid)}.{format}")
+		}
+
+		// Removes the recording `sid`. Fails as `get` does.
+		def delete(sid string) !none {
+			try call(conn, "api", http.Method.DELETE, "{conn.accountPath()}/Recordings/{segment(sid)}.json")
+			return none
+		}
+
+		// Pauses the recording `sid` of the live call `callSid`. Fails as
+		// `get` does.
+		def pause(callSid string, sid string) !Recording {
+			return try setRecording(conn, callSid, sid, "paused")
+		}
+
+		// Resumes the paused recording `sid` of call `callSid`. Fails as
+		// `get` does.
+		def resume(callSid string, sid string) !Recording {
+			return try setRecording(conn, callSid, sid, "in-progress")
+		}
+
+		// Stops the recording `sid` of call `callSid`. Fails as `get` does.
+		def stop(callSid string, sid string) !Recording {
+			return try setRecording(conn, callSid, sid, "stopped")
+		}
+
+		// The transcriptions of recording `sid`. Fails as `get` does.
+		def transcriptions(sid string) !Transcription[] {
+			return try pagesOf<Transcription>(conn, "api", "{conn.accountPath()}/Recordings/{segment(sid)}/Transcriptions.json", new url.Values(), "transcriptions").all()
+		}
+	}
+
+	internal def setRecording(conn Connection, callSid string, sid string, status string) !Recording {
+		let found = Recording{}
+		try decodeInto(try call(conn, "api", http.Method.POST, "{conn.accountPath()}/Calls/{segment(callSid)}/Recordings/{segment(sid)}.json", formOf(map<string, string>{"Status": status})), found)
+		return found
+	}
+
+	// The transcriptions of an account's recordings.
+	type Transcriptions {
+		internal conn Connection
+
+		def new(conn Connection) {
+			self.conn = conn
+		}
+
+		// Every transcription, newest first.
+		def list() Pages<Transcription> {
+			return pagesOf<Transcription>(conn, "api", "{conn.accountPath()}/Transcriptions.json", new url.Values(), "transcriptions")
+		}
+
+		// The transcription `sid`. Fails with NotFound for an unknown one,
+		// and as every call does.
+		def get(sid string) !Transcription {
+			let found = Transcription{}
+			try decodeInto(try call(conn, "api", http.Method.GET, "{conn.accountPath()}/Transcriptions/{segment(sid)}.json"), found)
+			return found
+		}
+
+		// Removes the transcription `sid`. Fails as `get` does.
+		def delete(sid string) !none {
+			try call(conn, "api", http.Method.DELETE, "{conn.accountPath()}/Transcriptions/{segment(sid)}.json")
+			return none
+		}
+	}
+}

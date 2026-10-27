@@ -1,0 +1,153 @@
+partial module adm.notify.twilio {
+	use (
+		std.net.http
+		std.net.url
+		std.data.encoding::(json)
+	)
+
+	// The number of items a list asks for a page.
+	internal const pageSize = 1000
+
+	// A list Twilio hands out a page at a time (messages, calls,
+	// recordings, keys, verifications, ...): `next` fetches the next page,
+	// `all` the rest in one array.
+	//
+	// ```
+	// let today = tw.messages.list(MessageFilter{to: "+15551234567"})
+	// let page = try today.next()                 // ?Message[]
+	// let calls = try tw.calls.list().all()
+	// ```
+	type Pages<T> {
+		internal fetch def (string) !(T[], string)
+		internal at    string
+		internal ended bool                        = false
+
+		// Pages that `fetch` returns for a cursor ("" for the first), each
+		// with the cursor of the next ("" after the last).
+		def new(fetch def (string) !(T[], string)) {
+			self.fetch = fetch
+			at = ""
+		}
+
+		// The next page; none after the last. Fails as the call behind the
+		// list does.
+		def next() !?T[] {
+			return none when ended
+			let (page, cursor) = try fetch(at)
+			at = cursor
+			ended = cursor.len() == 0
+			return none when page.len() == 0 && ended
+			return page
+		}
+
+		// Every item left, in one array. Fails as `next` does.
+		def all() !T[] {
+			let out T[] = []
+			for {
+				let page = try next()
+				break when page is none
+				out.push(...page)
+			}
+			return out
+		}
+	}
+
+	// A page of any list: Twilio names the array after the list, and the
+	// reply holds one of these, with the address of the next page
+	// (`next_page_uri` in the REST API, `meta.next_page_url` in the others).
+	internal type PageOf<T> {
+		messages T[]
+		calls T[]
+		recordings T[]
+		transcriptions T[]
+		@json("media_list")
+		media T[]
+		keys T[]
+		accounts T[]
+		@json("usage_records")
+		usageRecords T[]
+		services T[]
+		@json("rate_limits")
+		rateLimits T[]
+		buckets T[]
+		@json("usage_triggers")
+		triggers T[]
+		@json("next_page_uri")
+		nextPageUri string
+		@json("meta")
+		pageMeta PageMeta
+
+		def new() {}
+
+		// The array named `key`.
+		def items(key string) T[] {
+			switch key {
+				case "messages":
+					return messages
+				case "calls":
+					return calls
+				case "recordings":
+					return recordings
+				case "transcriptions":
+					return transcriptions
+				case "media_list":
+					return media
+				case "keys":
+					return keys
+				case "accounts":
+					return accounts
+				case "usage_records":
+					return usageRecords
+				case "services":
+					return services
+				case "rate_limits":
+					return rateLimits
+				case "buckets":
+					return buckets
+				default:
+					return triggers
+			}
+		}
+
+		// The path of the next page on its product's host; "" after the
+		// last.
+		def nextPath() string {
+			let next = nextPageUri.len() > 0 ?? (nextPageUri, pageMeta.nextPageUrl)
+			return pathOf(next)
+		}
+	}
+
+	internal struct PageMeta {
+		@json("next_page_url")
+		nextPageUrl string
+	}
+
+	// The path and query of an address, without its scheme and host.
+	internal def pathOf(address string) string {
+		return address unless address.startsWith("http")
+		let afterScheme = address.indexOf("//")
+		let slash = afterScheme < 0 ?? (-1, address.indexOf("/", afterScheme + 2))
+		return slash < 0 ?? ("", address[slash:])
+	}
+
+	// The pages of a list of `product` at `path`, filtered by `query`, its
+	// array under `key`.
+	internal def pagesOf<T>(conn Connection, product string, path string, query url.Values, key string) Pages<T> {
+		return new Pages<T>(def (cursor string) !(T[], string) {
+			let address = cursor.len() > 0 ?? (cursor, path)
+			let first = cursor.len() > 0 ?? (new url.Values(), firstPage(query))
+			let box = PageOf<T>{}
+			try decodeInto(try call(conn, product, http.Method.GET, address, first), box)
+			return (box.items(key), box.nextPath())
+		})
+	}
+
+	internal def firstPage(query url.Values) url.Values {
+		let out = new url.Values()
+		for let p in query.pairs() {
+			out.add(p.key, p.value)
+		}
+		out.set("PageSize", "{pageSize}") unless out.has("PageSize")
+		return out
+	}
+}

@@ -1,0 +1,339 @@
+partial module adm.notify.twilio {
+	use std.data.encoding::(XMLNode)
+
+	// What a caller may answer a Gather with.
+	enum Input {
+		Dtmf   = "dtmf",
+		Speech = "speech",
+	}
+
+	// TwiML that answers a call: verbs in the order the call follows them.
+	// Each verb method appends one and returns the response, except
+	// `gather` and `dial`, which return the verb to nest more in.
+	//
+	// ```
+	// let answer = new twilio.VoiceResponse()
+	// answer.say("Thanks for calling.", voice = "Polly.Joanna")
+	// let menu = answer.gather(input = [twilio.Input.Dtmf], numDigits = 1, action = "/menu")
+	// menu.say("Press 1 for sales.")
+	// answer.say("We did not get your choice.").hangup()
+	// ```
+	type VoiceResponse {
+		internal root XMLNode
+
+		def new() {
+			root = new XMLNode("Response")
+		}
+
+		// Reads `text` out, in `voice` (`man`, `woman`, `alice`,
+		// `Polly.Joanna`, ...) and `language`, `loop` times (0 forever).
+		def say(text string, voice string = "", language string = "", loop int = 1) VoiceResponse {
+			root.add(sayOf(text, voice, language, loop))
+			return self
+		}
+
+		// Plays the audio at `url` `loop` times (0 forever), or the DTMF
+		// tones `digits` (`w` waits half a second).
+		def play(url string = "", loop int = 1, digits string = "") VoiceResponse {
+			root.add(playOf(url, loop, digits))
+			return self
+		}
+
+		// Waits `length`.
+		def pause(length duration = 1s) VoiceResponse {
+			root.add(pauseOf(length))
+			return self
+		}
+
+		// Collects digits or speech, then posts them to `action`. Returns
+		// the Gather, which takes `say`, `play` and `pause` to prompt with.
+		def gather(input Input[] = [], action string = "", method string = "", numDigits int = 0, timeout ?duration = none, finishOnKey string = "", speechTimeout string = "", language string = "", hints string = "", actionOnEmptyResult bool = false) Gather {
+			let node = new XMLNode("Gather")
+			let kinds string[] = []
+			for let i in input {
+				kinds.push(i.value)
+			}
+			attribute(node, "input", kinds.join(" "))
+			attribute(node, "action", action)
+			attribute(node, "method", method)
+			attribute(node, "numDigits", numDigits > 0 ?? ("{numDigits}", ""))
+			attribute(node, "timeout", timeout is none ?? ("", "{int(timeout / 1s)}"))
+			attribute(node, "finishOnKey", finishOnKey)
+			attribute(node, "speechTimeout", speechTimeout)
+			attribute(node, "language", language)
+			attribute(node, "hints", hints)
+			attribute(node, "actionOnEmptyResult", actionOnEmptyResult ?? ("true", ""))
+			root.add(node)
+			return new Gather(node)
+		}
+
+		// Connects the call to `number` (with no number, to what the Dial
+		// is given: `number`, `client`, `sip`, `conference`, `queue`).
+		// `callerId` is the number shown, `action` gets the outcome,
+		// `timeout` is how long it rings, `record` (`record-from-answer`,
+		// `record-from-ringing`, ...) records it, `timeLimit` ends it.
+		def dial(number string = "", callerId string = "", action string = "", method string = "", timeout ?duration = none, record string = "", recordingStatusCallback string = "", timeLimit ?duration = none, hangupOnStar bool = false, answerOnBridge bool = false, ringTone string = "") Dial {
+			let node = new XMLNode("Dial")
+			attribute(node, "callerId", callerId)
+			attribute(node, "action", action)
+			attribute(node, "method", method)
+			attribute(node, "timeout", timeout is none ?? ("", "{int(timeout / 1s)}"))
+			attribute(node, "record", record)
+			attribute(node, "recordingStatusCallback", recordingStatusCallback)
+			attribute(node, "timeLimit", timeLimit is none ?? ("", "{int(timeLimit / 1s)}"))
+			attribute(node, "hangupOnStar", hangupOnStar ?? ("true", ""))
+			attribute(node, "answerOnBridge", answerOnBridge ?? ("true", ""))
+			attribute(node, "ringTone", ringTone)
+			node.add(number) when number.len() > 0
+			root.add(node)
+			return new Dial(node)
+		}
+
+		// Records the caller after a beep, up to `maxLength`, and posts the
+		// recording to `action`; `transcribe` has it transcribed too, the
+		// text posted to `transcribeCallback`.
+		def record(action string = "", method string = "", maxLength ?duration = none, timeout ?duration = none, finishOnKey string = "", playBeep bool = true, trim bool = true, transcribe bool = false, transcribeCallback string = "", recordingStatusCallback string = "") VoiceResponse {
+			let node = new XMLNode("Record")
+			attribute(node, "action", action)
+			attribute(node, "method", method)
+			attribute(node, "maxLength", maxLength is none ?? ("", "{int(maxLength / 1s)}"))
+			attribute(node, "timeout", timeout is none ?? ("", "{int(timeout / 1s)}"))
+			attribute(node, "finishOnKey", finishOnKey)
+			attribute(node, "playBeep", playBeep ?? ("", "false"))
+			attribute(node, "trim", trim ?? ("", "do-not-trim"))
+			attribute(node, "transcribe", transcribe ?? ("true", ""))
+			attribute(node, "transcribeCallback", transcribeCallback)
+			attribute(node, "recordingStatusCallback", recordingStatusCallback)
+			root.add(node)
+			return self
+		}
+
+		// Puts the caller in the queue `name`, `waitUrl` playing meanwhile.
+		def enqueue(name string, action string = "", waitUrl string = "") VoiceResponse {
+			let node = new XMLNode("Enqueue")
+			attribute(node, "action", action)
+			attribute(node, "waitUrl", waitUrl)
+			node.add(name)
+			root.add(node)
+			return self
+		}
+
+		// Moves the call on to the TwiML at `url`.
+		def redirect(url string, method string = "") VoiceResponse {
+			root.add(redirectOf(url, method))
+			return self
+		}
+
+		// Ends the call.
+		def hangup() VoiceResponse {
+			root.add(new XMLNode("Hangup"))
+			return self
+		}
+
+		// Refuses the incoming call unanswered, as `busy` or `rejected`.
+		def reject(reason string = "") VoiceResponse {
+			let node = new XMLNode("Reject")
+			attribute(node, "reason", reason)
+			root.add(node)
+			return self
+		}
+
+		// Takes the caller out of a queue.
+		def leave() VoiceResponse {
+			root.add(new XMLNode("Leave"))
+			return self
+		}
+
+		// The TwiML document.
+		def str() string {
+			return documentOf(root)
+		}
+	}
+
+	// A Gather verb: what prompts the caller while it listens.
+	type Gather {
+		internal node XMLNode
+
+		def new(node XMLNode) {
+			self.node = node
+		}
+
+		// Reads `text` out while listening; see VoiceResponse.say.
+		def say(text string, voice string = "", language string = "", loop int = 1) Gather {
+			node.add(sayOf(text, voice, language, loop))
+			return self
+		}
+
+		// Plays audio or tones while listening; see VoiceResponse.play.
+		def play(url string = "", loop int = 1, digits string = "") Gather {
+			node.add(playOf(url, loop, digits))
+			return self
+		}
+
+		// Waits `length` while listening.
+		def pause(length duration = 1s) Gather {
+			node.add(pauseOf(length))
+			return self
+		}
+	}
+
+	// A Dial verb: who the call connects to, the first to answer taking it.
+	type Dial {
+		internal node XMLNode
+
+		def new(node XMLNode) {
+			self.node = node
+		}
+
+		// A phone number; `sendDigits` are played once it answers, `url`
+		// is TwiML played to it first.
+		def number(number string, sendDigits string = "", url string = "", statusCallback string = "") Dial {
+			let child = new XMLNode("Number")
+			attribute(child, "sendDigits", sendDigits)
+			attribute(child, "url", url)
+			attribute(child, "statusCallback", statusCallback)
+			child.add(number)
+			node.add(child)
+			return self
+		}
+
+		// A client of the Voice SDK by its identity.
+		def client(identity string, url string = "") Dial {
+			let child = new XMLNode("Client")
+			attribute(child, "url", url)
+			child.add(identity)
+			node.add(child)
+			return self
+		}
+
+		// A SIP address, with credentials when it asks for them.
+		def sip(uri string, username string = "", password string = "") Dial {
+			let child = new XMLNode("Sip")
+			attribute(child, "username", username)
+			attribute(child, "password", password)
+			child.add(uri)
+			node.add(child)
+			return self
+		}
+
+		// The conference room `name`: it starts when a participant with
+		// `startOnEnter` joins and ends when one with `endOnExit` leaves;
+		// `waitUrl` plays while waiting, `record` (`record-from-start`)
+		// records it, `statusCallback` is told of `events` (`start`, `end`,
+		// `join`, `leave`, `mute`, `hold`, `speaker`).
+		def conference(name string, startOnEnter ?bool = none, endOnExit ?bool = none, muted bool = false, beep string = "", waitUrl string = "", record string = "", maxParticipants int = 0, statusCallback string = "", events string[] = [], coach string = "") Dial {
+			let child = new XMLNode("Conference")
+			attribute(child, "startConferenceOnEnter", startOnEnter is none ?? ("", "{startOnEnter}"))
+			attribute(child, "endConferenceOnExit", endOnExit is none ?? ("", "{endOnExit}"))
+			attribute(child, "muted", muted ?? ("true", ""))
+			attribute(child, "beep", beep)
+			attribute(child, "waitUrl", waitUrl)
+			attribute(child, "record", record)
+			attribute(child, "maxParticipants", maxParticipants > 0 ?? ("{maxParticipants}", ""))
+			attribute(child, "statusCallback", statusCallback)
+			attribute(child, "statusCallbackEvent", events.join(" "))
+			attribute(child, "coach", coach)
+			child.add(name)
+			node.add(child)
+			return self
+		}
+
+		// The caller first in the queue `name`.
+		def queue(name string, url string = "") Dial {
+			let child = new XMLNode("Queue")
+			attribute(child, "url", url)
+			child.add(name)
+			node.add(child)
+			return self
+		}
+	}
+
+	// TwiML that answers an incoming message: replies, or a redirect.
+	//
+	// ```
+	// let reply = new twilio.MessagingResponse()
+	// reply.message("Got it, thanks.")
+	// ```
+	type MessagingResponse {
+		internal root XMLNode
+
+		def new() {
+			root = new XMLNode("Response")
+		}
+
+		// Sends `body` (with `media` addresses) back, or to `to` from `from`
+		// when given; `action` is told of its status.
+		def message(body string = "", media string[] = [], to string = "", from string = "", action string = "") MessagingResponse {
+			let node = new XMLNode("Message")
+			attribute(node, "to", to)
+			attribute(node, "from", from)
+			attribute(node, "action", action)
+			if media.len() == 0 {
+				node.add(body) when body.len() > 0
+			} else {
+				let text = new XMLNode("Body")
+				text.add(body)
+				node.add(text) when body.len() > 0
+				for let address in media {
+					let item = new XMLNode("Media")
+					item.add(address)
+					node.add(item)
+				}
+			}
+			root.add(node)
+			return self
+		}
+
+		// Moves the answer on to the TwiML at `url`.
+		def redirect(url string, method string = "") MessagingResponse {
+			root.add(redirectOf(url, method))
+			return self
+		}
+
+		// The TwiML document.
+		def str() string {
+			return documentOf(root)
+		}
+	}
+
+	// TwiML of either kind, as a webhook answers with it.
+	type TwiML = VoiceResponse | MessagingResponse
+
+	internal def attribute(node XMLNode, name string, value string) {
+		node.set(name, value) when value.len() > 0
+	}
+
+	internal def sayOf(text string, voice string, language string, loop int) XMLNode {
+		let node = new XMLNode("Say")
+		attribute(node, "voice", voice)
+		attribute(node, "language", language)
+		attribute(node, "loop", loop != 1 ?? ("{loop}", ""))
+		node.add(text)
+		return node
+	}
+
+	internal def playOf(url string, loop int, digits string) XMLNode {
+		let node = new XMLNode("Play")
+		attribute(node, "loop", loop != 1 ?? ("{loop}", ""))
+		attribute(node, "digits", digits)
+		node.add(url) when url.len() > 0
+		return node
+	}
+
+	internal def pauseOf(length duration) XMLNode {
+		let node = new XMLNode("Pause")
+		attribute(node, "length", "{int(length / 1s)}")
+		return node
+	}
+
+	internal def redirectOf(url string, method string) XMLNode {
+		let node = new XMLNode("Redirect")
+		attribute(node, "method", method)
+		node.add(url)
+		return node
+	}
+
+	internal def documentOf(root XMLNode) string {
+		return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" + root.str()
+	}
+}

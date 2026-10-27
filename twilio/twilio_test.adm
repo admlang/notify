@@ -1,0 +1,470 @@
+partial module adm.notify.twilio {
+	use (
+		std.time
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.net.url
+		std.data.encoding::(JSON, base64encode)
+	)
+
+	// `sid:token` of the live test, usually the test credentials, with a
+	// sender and a recipient (Twilio's magic numbers when left out:
+	// `+15005550006` sends, anything valid receives).
+	@env("ADM_TEST_TWILIO")
+	internal const liveCredentials string
+
+	@env("ADM_TEST_TWILIO_FROM")
+	internal const liveFrom string
+
+	@env("ADM_TEST_TWILIO_TO")
+	internal const liveTo string
+
+	internal const testSid = "AC00000000000000000000000000000001"
+
+	// What the loopback server was asked, and what it answers.
+	internal type Seen {
+		// `METHOD /product/path?query` of each request.
+		calls    string[]
+		// The form of each request.
+		forms    map<string, string[]>[]
+		auth     string[]
+		// The reply of `METHOD /product/path` (no query): its JSON text.
+		replies  map<string, string>
+		// The status of `METHOD /product/path` when not 200.
+		statuses map<string, int>
+		// How many times `METHOD /product/path` answers 429 before it
+		// answers.
+		limited  map<string, int>
+		// Bytes answered at `GET /product/path` instead of JSON.
+		files    map<string, byte[]>
+		base     string                  = ""
+
+		def new() {}
+	}
+
+	internal def json(value ?any) string {
+		return value is none ?? ("null", string((new JSON()).encode(value)))
+	}
+
+	// A server that answers as Twilio's products under /api, /verify and
+	// /lookups: a reply set for the request's method and path, else `{}`
+	// (204 for DELETE).
+	internal def apiServer(seen Seen) !httptest.Server {
+		let mux = new http.ServeMux()
+		try mux.handle("/", def (ctx http.Context) !none {
+			let method = ctx.method().value
+			let address = ctx.url()
+			let path = address.rawPath.len() > 0 ?? (address.rawPath, ctx.path())
+			seen.calls.push("{method} {path}" + (address.rawQuery.len() > 0 ?? ("?" + address.rawQuery, "")))
+			let form = try url.parseQuery(try ctx.text())
+			let fields = new map<string, string[]>()
+			for let p in form.pairs() {
+				let list = fields.get(p.key)
+				if list is none {
+					fields.set(p.key, [p.value])
+				} else {
+					list.push(p.value)
+				}
+			}
+			seen.forms.push(fields)
+			seen.auth.push(ctx.header("Authorization"))
+			let key = "{method} {ctx.path()}"
+			let left = seen.limited.get(key)
+			if !(left is none) && left > 0 {
+				seen.limited.set(key, left - 1)
+				ctx.setHeader("Retry-After", "0")
+				return try ctx.text(429, json(map<string, any>{"code": 20429, "message": "Too Many Requests"}))
+			}
+			let file = seen.files.get(key)
+			return try ctx.blob(200, "audio/mpeg", file) unless file is none
+			let status = seen.statuses.get(key)
+			let reply = seen.replies.get(key)
+			return try ctx.noContent(204) when method == "DELETE" && reply is none && status is none
+			ctx.setHeader("Content-Type", "application/json")
+			return try ctx.text(status is none ?? (200, status), reply is none ?? ("\{}", reply))
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		seen.base = "http://{server.address().str()}"
+		return server
+	}
+
+	internal def clientOf(seen Seen) Client {
+		return new Client(testSid, "auth-token", baseURL = seen.base)
+	}
+
+	// The first value of form field `key` of request `at`.
+	internal def field(seen Seen, at int, key string) string {
+		let values = seen.forms[at].get(key)
+		return values is none || values.len() == 0 ?? ("", values[0])
+	}
+
+	internal def fields(seen Seen, at int, key string) string[] {
+		let values = seen.forms[at].get(key)
+		return values is none ?? ([], values)
+	}
+
+	// The TwilioError `call` fails with; none when it succeeds or fails
+	// otherwise.
+	internal def caught(call def () !none) ?TwilioError {
+		let found ?TwilioError = none
+		call() onerror (err error) {
+			found = err when err is TwilioError
+			recover none
+		}
+		return found
+	}
+
+	internal const accountPath = "/api/2010-04-01/Accounts/AC00000000000000000000000000000001"
+
+	check "Twilio messages" {
+		// Messages go as forms with Basic credentials: SMS, MMS media,
+		// WhatsApp templates, scheduling through a messaging service.
+		@test()
+		def TestSend() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let tw = clientOf(seen)
+			seen.replies.set("POST {accountPath}/Messages.json", json(map<string, any>{"sid": "SM1", "status": "queued", "num_segments": "1", "num_media": "0", "price": none, "error_code": none, "messaging_service_sid": "MG1", "date_created": "Mon, 26 Oct 2026 10:00:00 +0000"}))
+			let sms = try tw.messages.send("+15005550006", "+15551234567", "Your code is 482913", statusCallback = "https://example.com/status", validity = 10m, shortenUrls = true)
+			assert sms.sid == "SM1" && sms.status == "queued" && sms.segments == "1" && sms.errorCode == 0 && sms.price == "" && sms.messagingServiceSid == "MG1"
+			assert seen.calls[0] == "POST {accountPath}/Messages.json"
+			assert seen.auth[0] == "Basic " + base64encode("{testSid}:auth-token".bytes())
+			assert field(seen, 0, "To") == "+15551234567" && field(seen, 0, "From") == "+15005550006" && field(seen, 0, "Body") == "Your code is 482913"
+			assert field(seen, 0, "StatusCallback") == "https://example.com/status" && field(seen, 0, "ValidityPeriod") == "600" && field(seen, 0, "ShortenUrls") == "true"
+			assert field(seen, 0, "MessagingServiceSid") == "" && field(seen, 0, "SendAt") == ""
+			try tw.messages.send("+15005550006", "+15551234567", media = ["https://example.com/a.png", "https://example.com/b.png"])
+			assert fields(seen, 1, "MediaUrl").join(",") == "https://example.com/a.png,https://example.com/b.png" && field(seen, 1, "Body") == ""
+			try tw.messages.send(whatsapp("+14155238886"), whatsapp("+15551234567"), content = "HX123", variables = {"1": "Ana", "2": "7"})
+			assert field(seen, 2, "From") == "whatsapp:+14155238886" && field(seen, 2, "ContentSid") == "HX123" && field(seen, 2, "ContentVariables") == "\{\"1\":\"Ana\",\"2\":\"7\"}"
+			let at = time.now() + 2h
+			try tw.messages.send("", "+15551234567", "Later", messagingService = "MG1", sendAt = at)
+			assert field(seen, 3, "MessagingServiceSid") == "MG1" && field(seen, 3, "ScheduleType") == "fixed" && field(seen, 3, "SendAt") == at.str(time.TimeFormat.RFC3339)
+			let many string[] = []
+			for let i in 0..11 {
+				many.push("https://example.com/{i}.png")
+			}
+			let cases = [
+				caught(def () !none { try tw.messages.send("", "+1555", "x"); return none }),
+				caught(def () !none { try tw.messages.send("+1500", "+1555"); return none }),
+				caught(def () !none { try tw.messages.send("+1500", "+1555", media = many); return none }),
+				caught(def () !none { try tw.messages.send("+1500", "+1555", "x" * 1601); return none }),
+				caught(def () !none { try tw.messages.send("+1500", "+1555", "x", sendAt = time.now() + 2h); return none }),
+				caught(def () !none { try tw.messages.send("+1500", "+1555", "x", messagingService = "MG1", sendAt = time.now() + 1m); return none }),
+				caught(def () !none { try tw.messages.send("+1500", "+1555", "x", messagingService = "MG1", sendAt = time.now() + 900h); return none }),
+			]
+			for let (i, failure) in cases {
+				fail "case {i} did not fail with Invalid" unless !(failure is none) && failure.kind == ErrorKind.Invalid
+			}
+			assert seen.calls.len() == 4
+			let keyed = new Client(testSid, apiKey = "SK1", apiSecret = "key-secret", baseURL = seen.base)
+			try keyed.messages.send("+1500", "+1555", "x")
+			assert seen.auth[4] == "Basic " + base64encode("SK1:key-secret".bytes())
+			try server.close()
+			return none
+		}
+
+		// Messages are listed page by page, read, cancelled, redacted and
+		// deleted; their media listed and downloaded.
+		@test()
+		def TestMessageResources() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let tw = clientOf(seen)
+			seen.replies.set("GET {accountPath}/Messages.json", json(map<string, any>{"messages": [map<string, any>{"sid": "SM1"}, map<string, any>{"sid": "SM2"}], "next_page_uri": "/2010-04-01/Accounts/{testSid}/Messages/Page2.json?PageSize=2&PageToken=PA2"}))
+			seen.replies.set("GET {accountPath}/Messages/Page2.json", json(map<string, any>{"messages": [map<string, any>{"sid": "SM3"}], "next_page_uri": none}))
+			let listed = try tw.messages.list(MessageFilter{to: "+15551234567", sentAfter: new time.Date(2026, 10, 1)}).all()
+			assert listed.len() == 3 && listed[2].sid == "SM3"
+			assert seen.calls[0] == "GET {accountPath}/Messages.json?DateSent%3E=2026-10-01&PageSize=1000&To=%2B15551234567"
+			assert seen.calls[1] == "GET {accountPath}/Messages/Page2.json?PageSize=2&PageToken=PA2"
+			seen.replies.set("GET {accountPath}/Messages/SM1.json", json(map<string, any>{"sid": "SM1", "body": "hi", "direction": "inbound"}))
+			seen.replies.set("POST {accountPath}/Messages/SM1.json", json(map<string, any>{"sid": "SM1", "status": "canceled"}))
+			assert (try tw.messages.get("SM1")).direction == "inbound"
+			assert (try tw.messages.cancel("SM1")).status == "canceled"
+			try tw.messages.redact("SM1")
+			try tw.messages.delete("SM1")
+			assert field(seen, 3, "Status") == "canceled" && seen.forms[4].hasKey("Body") && field(seen, 4, "Body") == ""
+			seen.replies.set("GET {accountPath}/Messages/SM1/Media.json", json(map<string, any>{"media_list": [map<string, any>{"sid": "ME1", "parent_sid": "SM1", "content_type": "image/png", "uri": "/2010-04-01/Accounts/{testSid}/Messages/SM1/Media/ME1.json"}], "next_page_uri": none}))
+			seen.files.set("GET {accountPath}/Messages/SM1/Media/ME1", byte[137, 80, 78, 71])
+			let media = try tw.messages.media("SM1")
+			assert media.len() == 1 && media[0].contentType == "image/png" && media[0].messageSid == "SM1"
+			let data = try tw.messages.download(media[0])
+			assert data.len() == 4 && data[1] == 80
+			try tw.messages.deleteMedia(media[0])
+			assert seen.calls[seen.calls.len() - 1] == "DELETE {accountPath}/Messages/SM1/Media/ME1.json"
+			try server.close()
+			return none
+		}
+
+		// A lookup goes to the Lookup API with its fields.
+		@test()
+		def TestLookup() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let tw = clientOf(seen)
+			seen.replies.set("GET /lookups/v2/PhoneNumbers/+15551234567", json(map<string, any>{"phone_number": "+15551234567", "national_format": "(555) 123-4567", "country_code": "US", "calling_country_code": "1", "valid": true, "validation_errors": [], "line_type_intelligence": map<string, any>{"type": "mobile", "carrier_name": "Carrier", "mobile_country_code": "310", "mobile_network_code": "456", "error_code": none}, "caller_name": map<string, any>{"caller_name": "ANA", "caller_type": "CONSUMER"}}))
+			let found = try tw.lookup("+15551234567", fields = [LookupField.LineType, LookupField.CallerName])
+			assert found.valid && found.nationalFormat == "(555) 123-4567" && found.lineType.kind == "mobile" && found.lineType.carrier == "Carrier" && found.callerName.kind == "CONSUMER"
+			assert seen.calls[0] == "GET /lookups/v2/PhoneNumbers/+15551234567?Fields=line_type_intelligence%2Ccaller_name"
+			try server.close()
+			return none
+		}
+
+		// Twilio's refusals map to their kinds with the code and its
+		// documentation kept; 429 is waited out until the retries are
+		// spent; a client without credentials fails before sending.
+		@test()
+		def TestErrors() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let tw = clientOf(seen)
+			let key = "POST {accountPath}/Messages.json"
+			seen.statuses.set(key, 400)
+			seen.replies.set(key, json(map<string, any>{"code": 21211, "message": "The 'To' number +1555 is not a valid phone number.", "more_info": "https://www.twilio.com/docs/errors/21211", "status": 400}))
+			let refused = caught(def () !none { try tw.messages.send("+1500", "+1555", "x"); return none })
+			fail "the refusal did not fail" when refused is none
+			assert refused.kind == ErrorKind.Invalid && refused.errorCode == 21211 && refused.moreInfo.endsWith("21211") && refused.message.contains("not a valid phone number")
+			let kinds = map<int, ErrorKind>{401: ErrorKind.Auth, 403: ErrorKind.Auth, 404: ErrorKind.NotFound, 500: ErrorKind.Server}
+			for let (status, kind) in kinds {
+				seen.statuses.set("GET {accountPath}/Calls/CA1.json", status)
+				let failure = caught(def () !none { try tw.calls.get("CA1"); return none })
+				fail "status {status} gave no {kind.value}" unless !(failure is none) && failure.kind == kind && failure.status == status
+			}
+			seen.statuses.set("GET {accountPath}/Calls/CA1.json", 200)
+			seen.replies.set("GET {accountPath}/Calls/CA1.json", "not json")
+			let garbled = caught(def () !none { try tw.calls.get("CA1"); return none })
+			assert !(garbled is none) && garbled.kind == ErrorKind.Server
+			seen.limited.set("GET {accountPath}/Calls/CA2.json", 2)
+			let from = seen.calls.len()
+			try tw.calls.get("CA2")
+			assert seen.calls.len() - from == 3
+			tw.connection.rateLimitRetries = 0
+			seen.limited.set("GET {accountPath}/Calls/CA2.json", 1)
+			let limited = caught(def () !none { try tw.calls.get("CA2"); return none })
+			assert !(limited is none) && limited.kind == ErrorKind.RateLimited && limited.errorCode == 20429
+			let calls = seen.calls.len()
+			let bare = new Connection(testSid, "", none)
+			bare.baseURL = seen.base
+			let anonymous = caught(def () !none { try (new Client(bare)).calls.get("CA1"); return none })
+			assert !(anonymous is none) && anonymous.kind == ErrorKind.Auth && seen.calls.len() == calls
+			let unreachable = caught(def () !none { try (new Client(testSid, "t", baseURL = "http://127.0.0.1:1")).calls.get("CA1"); return none })
+			assert !(unreachable is none) && unreachable.kind == ErrorKind.Transport
+			let regional = new Client(testSid, "t", region = "ie1", edge = "dublin")
+			assert regional.connection.host("api") == "https://api.dublin.ie1.twilio.com" && regional.connection.host("verify") == "https://verify.dublin.ie1.twilio.com"
+			assert (new Client(testSid, "t")).connection.host("lookups") == "https://lookups.twilio.com"
+			assert (new Client(testSid, "t", region = "au1")).connection.host("api") == "https://api.au1.twilio.com"
+			try server.close()
+			return none
+		}
+
+		// Against Twilio itself, when credentials are given: a message and
+		// a call, which the test credentials accept without sending.
+		@test()
+		def TestLive() !none {
+			return none when liveCredentials.len() == 0
+			let parts = liveCredentials.split(":")
+			fail "ADM_TEST_TWILIO is sid:token" unless parts.len() == 2
+			let tw = new Client(parts[0], parts[1])
+			let from = liveFrom.len() > 0 ?? (liveFrom, "+15005550006")
+			let to = liveTo.len() > 0 ?? (liveTo, "+15551234567")
+			let sms = try tw.messages.send(from, to, "adm.notify.twilio test")
+			assert sms.sid.startsWith("SM")
+			let invalid = caught(def () !none { try tw.messages.send(from, "+15005550001", "x"); return none })
+			assert !(invalid is none) && invalid.kind == ErrorKind.Invalid && invalid.errorCode == 21211
+			let call = try tw.calls.place(from, to, twiml = new VoiceResponse().say("adm test").hangup())
+			assert call.sid.startsWith("CA")
+			return none
+		}
+	}
+
+	check "Twilio voice" {
+		// Calls are placed with TwiML or a URL and their progress events,
+		// listed, redirected, hung up, cancelled, recorded; recordings and
+		// transcriptions read, downloaded, controlled and removed.
+		@test()
+		def TestCalls() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let tw = clientOf(seen)
+			let callReply = json(map<string, any>{"sid": "CA1", "status": "queued", "direction": "outbound-api", "duration": none, "answered_by": none})
+			seen.replies.set("POST {accountPath}/Calls.json", callReply)
+			seen.replies.set("POST {accountPath}/Calls/CA1.json", callReply)
+			let answer = new VoiceResponse().say("Hello").hangup()
+			let placed = try tw.calls.place("+15005550006", "+15551234567", twiml = answer, statusCallback = "https://example.com/cs", progress = [CallProgress.Ringing, CallProgress.Completed], timeout = 20s, record = true, machineDetection = "Enable", timeLimit = 1h)
+			assert placed.sid == "CA1" && placed.direction == "outbound-api"
+			assert field(seen, 0, "Twiml") == answer.str() && fields(seen, 0, "StatusCallbackEvent").join(" ") == "ringing completed"
+			assert field(seen, 0, "Timeout") == "20" && field(seen, 0, "Record") == "true" && field(seen, 0, "MachineDetection") == "Enable" && field(seen, 0, "TimeLimit") == "3600"
+			try tw.calls.place("+15005550006", "+15551234567", url = "https://example.com/answer", method = "GET")
+			assert field(seen, 1, "Url") == "https://example.com/answer" && field(seen, 1, "Method") == "GET" && field(seen, 1, "Twiml") == ""
+			let missing = caught(def () !none { try tw.calls.place("+1", "+2"); return none })
+			assert !(missing is none) && missing.kind == ErrorKind.Invalid
+			seen.replies.set("GET {accountPath}/Calls.json", json(map<string, any>{"calls": [map<string, any>{"sid": "CA1", "status": "completed", "duration": "42"}]}))
+			let listed = try tw.calls.list(CallFilter{status: "completed", startedAfter: new time.Date(2026, 10, 1)}).all()
+			assert listed.len() == 1 && listed[0].duration == "42"
+			assert seen.calls[2] == "GET {accountPath}/Calls.json?PageSize=1000&StartTime%3E=2026-10-01&Status=completed"
+			try tw.calls.redirect("CA1", url = "https://example.com/next")
+			try tw.calls.hangUp("CA1")
+			try tw.calls.cancel("CA1")
+			try tw.calls.delete("CA1")
+			assert field(seen, 3, "Url") == "https://example.com/next" && field(seen, 4, "Status") == "completed" && field(seen, 5, "Status") == "canceled"
+			assert seen.calls[6] == "DELETE {accountPath}/Calls/CA1.json"
+			seen.replies.set("POST {accountPath}/Calls/CA1/Recordings.json", json(map<string, any>{"sid": "RE1", "call_sid": "CA1", "status": "in-progress", "channels": 2}))
+			let recording = try tw.calls.record("CA1", statusCallback = "https://example.com/rec", channels = "dual", trim = true)
+			assert recording.sid == "RE1" && recording.channels == 2 && field(seen, 7, "RecordingChannels") == "dual" && field(seen, 7, "Trim") == "trim-silence"
+			seen.replies.set("POST {accountPath}/Calls/CA1/Recordings/RE1.json", json(map<string, any>{"sid": "RE1", "status": "paused"}))
+			assert (try tw.recordings.pause("CA1", "RE1")).status == "paused"
+			try tw.recordings.resume("CA1", "RE1")
+			try tw.recordings.stop("CA1", "RE1")
+			assert field(seen, 8, "Status") == "paused" && field(seen, 9, "Status") == "in-progress" && field(seen, 10, "Status") == "stopped"
+			seen.replies.set("GET {accountPath}/Recordings.json", json(map<string, any>{"recordings": [map<string, any>{"sid": "RE1", "duration": "12", "source": "RecordVerb"}]}))
+			seen.replies.set("GET {accountPath}/Recordings/RE1.json", json(map<string, any>{"sid": "RE1", "status": "completed"}))
+			seen.files.set("GET {accountPath}/Recordings/RE1.mp3", byte[73, 68, 51])
+			seen.replies.set("GET {accountPath}/Recordings/RE1/Transcriptions.json", json(map<string, any>{"transcriptions": [map<string, any>{"sid": "TR1", "transcription_text": "hello there", "recording_sid": "RE1"}]}))
+			assert (try tw.recordings.list(RecordingFilter{callSid: "CA1"}).all())[0].source == "RecordVerb"
+			assert (try tw.recordings.get("RE1")).status == "completed"
+			assert string(try tw.recordings.download("RE1")) == "ID3"
+			assert (try tw.recordings.transcriptions("RE1"))[0].text == "hello there"
+			try tw.recordings.delete("RE1")
+			seen.replies.set("GET {accountPath}/Transcriptions.json", json(map<string, any>{"transcriptions": [map<string, any>{"sid": "TR1", "status": "completed"}]}))
+			seen.replies.set("GET {accountPath}/Transcriptions/TR1.json", json(map<string, any>{"sid": "TR1", "transcription_text": "hi"}))
+			assert (try tw.transcriptions.list().all())[0].status == "completed"
+			assert (try tw.transcriptions.get("TR1")).text == "hi"
+			try tw.transcriptions.delete("TR1")
+			assert seen.calls[11:].join(",") == "GET {accountPath}/Recordings.json?CallSid=CA1&PageSize=1000,GET {accountPath}/Recordings/RE1.json,GET {accountPath}/Recordings/RE1.mp3,GET {accountPath}/Recordings/RE1/Transcriptions.json?PageSize=1000,DELETE {accountPath}/Recordings/RE1.json,GET {accountPath}/Transcriptions.json?PageSize=1000,GET {accountPath}/Transcriptions/TR1.json,DELETE {accountPath}/Transcriptions/TR1.json"
+			try server.close()
+			return none
+		}
+
+		// The builders write TwiML as Twilio reads it, text escaped.
+		@test()
+		def TestTwiML() !none {
+			let answer = new VoiceResponse()
+			answer.say("Thanks for calling <Shop> & co.", voice = "Polly.Joanna", language = "en-US")
+			let menu = answer.gather(input = [Input.Dtmf, Input.Speech], action = "/menu", numDigits = 1, timeout = 5s, hints = "sales, support")
+			menu.say("Press 1 for sales.").pause(2s).play("https://example.com/beep.mp3")
+			answer.play(digits = "ww1234", loop = 2)
+			answer.dial(callerId = "+15005550006", timeout = 20s, record = "record-from-answer").number("+15551234567", sendDigits = "wwww1928").client("ana").conference("Room 7", startOnEnter = true, endOnExit = false, beep = "false", events = ["start", "end", "join"])
+			answer.record(action = "/voicemail", maxLength = 2m, playBeep = false, transcribe = true, transcribeCallback = "/text")
+			answer.enqueue("support", waitUrl = "/hold").redirect("/again", method = "POST").reject("busy").leave().hangup()
+			let expected = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say voice=\"Polly.Joanna\" language=\"en-US\">Thanks for calling &lt;Shop&gt; &amp; co.</Say><Gather input=\"dtmf speech\" action=\"/menu\" numDigits=\"1\" timeout=\"5\" hints=\"sales, support\"><Say>Press 1 for sales.</Say><Pause length=\"2\"/><Play>https://example.com/beep.mp3</Play></Gather><Play loop=\"2\" digits=\"ww1234\"/><Dial callerId=\"+15005550006\" timeout=\"20\" record=\"record-from-answer\"><Number sendDigits=\"wwww1928\">+15551234567</Number><Client>ana</Client><Conference startConferenceOnEnter=\"true\" endConferenceOnExit=\"false\" beep=\"false\" statusCallbackEvent=\"start end join\">Room 7</Conference></Dial><Record action=\"/voicemail\" maxLength=\"120\" playBeep=\"false\" transcribe=\"true\" transcribeCallback=\"/text\"/><Enqueue waitUrl=\"/hold\">support</Enqueue><Redirect method=\"POST\">/again</Redirect><Reject reason=\"busy\"/><Leave/><Hangup/></Response>"
+			fail "voice TwiML differs:\n{answer.str()}" unless answer.str() == expected
+			let reply = new MessagingResponse().message("Got it.").message("See this", media = ["https://example.com/a.png"], to = "+15551234567")
+			assert reply.str() == "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Message>Got it.</Message><Message to=\"+15551234567\"><Body>See this</Body><Media>https://example.com/a.png</Media></Message></Response>"
+			assert (new VoiceResponse()).str() == "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response/>"
+			let transfer = new VoiceResponse()
+			transfer.dial().sip("sip:ana@example.com", username = "ana", password = "pw").queue("support", url = "/whisper")
+			assert transfer.str() == "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Dial><Sip username=\"ana\" password=\"pw\">sip:ana@example.com</Sip><Queue url=\"/whisper\">support</Queue></Dial></Response>"
+			return none
+		}
+	}
+
+	check "Twilio Verify and accounts" {
+		// Verifications start with their channel settings, are confirmed,
+		// approved and cancelled; services, rate limits and buckets are
+		// managed, paged by the next page's address.
+		@test()
+		def TestVerify() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let tw = clientOf(seen)
+			let verify = tw.verify("VA1")
+			seen.replies.set("POST /verify/v2/Services/VA1/Verifications", json(map<string, any>{"sid": "VE1", "to": "+15551234567", "channel": "sms", "status": "pending", "valid": false}))
+			let started = try verify.start("+15551234567", channel = Channel.Sms, locale = "fr", rateLimits = {"end_user_ip": "10.0.0.1"})
+			assert started.status == "pending" && started.sid == "VE1"
+			assert field(seen, 0, "To") == "+15551234567" && field(seen, 0, "Channel") == "sms" && field(seen, 0, "Locale") == "fr" && field(seen, 0, "RateLimits") == "\{\"end_user_ip\":\"10.0.0.1\"}"
+			try verify.start("ana@example.net", channel = Channel.Email, template = "d-1", substitutions = {"name": "Ana"}, emailFrom = "no-reply@example.com")
+			assert field(seen, 1, "Channel") == "email" && field(seen, 1, "ChannelConfiguration") == "\{\"template_id\":\"d-1\",\"substitutions\":\{\"name\":\"Ana\"},\"from\":\"no-reply@example.com\"}"
+			seen.replies.set("POST /verify/v2/Services/VA1/VerificationCheck", json(map<string, any>{"sid": "VE1", "status": "approved", "valid": true}))
+			assert try verify.confirm("+15551234567", "123456")
+			assert field(seen, 2, "Code") == "123456"
+			seen.replies.set("POST /verify/v2/Services/VA1/VerificationCheck", json(map<string, any>{"sid": "VE1", "status": "pending", "valid": false}))
+			assert !(try verify.confirm("+15551234567", "000000"))
+			seen.statuses.set("POST /verify/v2/Services/VA1/VerificationCheck", 404)
+			seen.replies.set("POST /verify/v2/Services/VA1/VerificationCheck", json(map<string, any>{"code": 20404, "message": "The requested resource was not found"}))
+			let expired = caught(def () !none { try verify.confirm("+15551234567", "1"); return none })
+			assert !(expired is none) && expired.kind == ErrorKind.NotFound && expired.errorCode == 20404
+			seen.replies.set("POST /verify/v2/Services/VA1/Verifications/VE1", json(map<string, any>{"sid": "VE1", "status": "approved"}))
+			seen.replies.set("GET /verify/v2/Services/VA1/Verifications/VE1", json(map<string, any>{"sid": "VE1", "status": "pending"}))
+			assert (try verify.approve("VE1")).status == "approved"
+			try verify.cancel("VE1")
+			assert (try verify.get("VE1")).status == "pending"
+			assert field(seen, 5, "Status") == "approved" && field(seen, 6, "Status") == "canceled"
+			seen.replies.set("POST /verify/v2/Services/VA1/RateLimits", json(map<string, any>{"sid": "RK1", "unique_name": "end_user_ip"}))
+			seen.replies.set("GET /verify/v2/Services/VA1/RateLimits", json(map<string, any>{"rate_limits": [map<string, any>{"sid": "RK1", "unique_name": "end_user_ip"}], "meta": map<string, any>{"next_page_url": "https://verify.twilio.com/v2/Services/VA1/RateLimits/Next?PageToken=P2"}}))
+			seen.replies.set("GET /verify/v2/Services/VA1/RateLimits/Next", json(map<string, any>{"rate_limits": [map<string, any>{"sid": "RK2"}], "meta": map<string, any>{"next_page_url": none}}))
+			seen.replies.set("POST /verify/v2/Services/VA1/RateLimits/RK1/Buckets", json(map<string, any>{"sid": "BL1", "max": 5, "interval": 60}))
+			seen.replies.set("GET /verify/v2/Services/VA1/RateLimits/RK1/Buckets", json(map<string, any>{"buckets": [map<string, any>{"sid": "BL1", "max": 5, "interval": 60}], "meta": map<string, any>{}}))
+			let limit = try verify.createRateLimit("end_user_ip", "per IP")
+			assert limit.uniqueName == "end_user_ip"
+			let limits = try verify.rateLimits().all()
+			assert limits.len() == 2 && limits[1].sid == "RK2"
+			let bucket = try verify.addBucket("RK1", 5, 1m)
+			assert bucket.max == 5 && field(seen, seen.calls.len() - 1, "Interval") == "60"
+			assert (try verify.buckets("RK1").all())[0].interval == 60
+			try verify.deleteBucket("RK1", "BL1")
+			try verify.deleteRateLimit("RK1")
+			seen.replies.set("POST /verify/v2/Services", json(map<string, any>{"sid": "VA2", "friendly_name": "Shop", "code_length": 8}))
+			seen.replies.set("GET /verify/v2/Services", json(map<string, any>{"services": [map<string, any>{"sid": "VA2", "friendly_name": "Shop"}], "meta": map<string, any>{}}))
+			assert (try tw.createVerifyService("Shop", codeLength = 8)).codeLength == 8
+			assert (try tw.verifyServices().all())[0].name == "Shop"
+			try tw.deleteVerifyService("VA2")
+			assert seen.calls[seen.calls.len() - 3:].join(",") == "POST /verify/v2/Services,GET /verify/v2/Services?PageSize=1000,DELETE /verify/v2/Services/VA2"
+			assert seen.calls.indexOf("GET /verify/v2/Services/VA1/RateLimits/Next?PageToken=P2") >= 0
+			try server.close()
+			return none
+		}
+
+		// API keys, subaccounts (and acting for one), usage records by
+		// period, and usage triggers.
+		@test()
+		def TestAccounts() !none {
+			let seen = new Seen()
+			let server = try apiServer(seen)
+			let tw = clientOf(seen)
+			seen.replies.set("POST {accountPath}/Keys.json", json(map<string, any>{"sid": "SK1", "friendly_name": "ci", "secret": "s3cret"}))
+			seen.replies.set("GET {accountPath}/Keys.json", json(map<string, any>{"keys": [map<string, any>{"sid": "SK1", "friendly_name": "ci"}]}))
+			seen.replies.set("GET {accountPath}/Keys/SK1.json", json(map<string, any>{"sid": "SK1"}))
+			seen.replies.set("POST {accountPath}/Keys/SK1.json", json(map<string, any>{"sid": "SK1", "friendly_name": "deploy"}))
+			let key = try tw.keys.create("ci")
+			assert key.secret == "s3cret" && key.name == "ci"
+			assert (try tw.keys.list().all()).len() == 1
+			try tw.keys.get("SK1")
+			assert (try tw.keys.rename("SK1", "deploy")).name == "deploy"
+			try tw.keys.delete("SK1")
+			let sub = "AC00000000000000000000000000000002"
+			let subReply = json(map<string, any>{"sid": sub, "friendly_name": "eu", "status": "active", "type": "Full", "owner_account_sid": testSid, "auth_token": "sub-token"})
+			seen.replies.set("POST /api/2010-04-01/Accounts.json", subReply)
+			seen.replies.set("GET /api/2010-04-01/Accounts.json", json(map<string, any>{"accounts": [map<string, any>{"sid": testSid}, map<string, any>{"sid": sub}]}))
+			seen.replies.set("GET /api/2010-04-01/Accounts/{sub}.json", subReply)
+			seen.replies.set("POST /api/2010-04-01/Accounts/{sub}.json", subReply)
+			let made = try tw.accounts.create("eu")
+			assert made.ownerAccountSid == testSid && made.kind == "Full" && made.authToken == "sub-token"
+			assert (try tw.accounts.list(status = "active").all()).len() == 2
+			try tw.accounts.get(sub)
+			try tw.accounts.rename(sub, "europe")
+			try tw.accounts.suspend(sub)
+			try tw.accounts.activate(sub)
+			try tw.accounts.close(sub)
+			let statuses = [field(seen, 8, "FriendlyName"), field(seen, 9, "Status"), field(seen, 10, "Status"), field(seen, 11, "Status")]
+			fail "account changes: {statuses.join(",")}" unless statuses.join(",") == "europe,suspended,active,closed"
+			let forSub = tw.forAccount(sub)
+			try forSub.messages.list().next()
+			assert seen.calls[seen.calls.len() - 1].startsWith("GET /api/2010-04-01/Accounts/{sub}/Messages.json") && seen.auth[seen.auth.len() - 1] == seen.auth[0]
+			seen.replies.set("GET {accountPath}/Usage/Records/Daily.json", json(map<string, any>{"usage_records": [map<string, any>{"category": "sms", "count": "12", "price": "0.09", "price_unit": "usd", "start_date": "2026-10-01"}]}))
+			let usage = try tw.usage.records(category = "sms", from = new time.Date(2026, 10, 1), until = new time.Date(2026, 10, 7), period = UsagePeriod.Daily).all()
+			assert usage.len() == 1 && usage[0].count == "12" && usage[0].priceUnit == "usd"
+			assert seen.calls[seen.calls.len() - 1] == "GET {accountPath}/Usage/Records/Daily.json?Category=sms&EndDate=2026-10-07&PageSize=1000&StartDate=2026-10-01"
+			try tw.usage.records().next()
+			assert seen.calls[seen.calls.len() - 1] == "GET {accountPath}/Usage/Records.json?PageSize=1000"
+			seen.replies.set("POST {accountPath}/Usage/Triggers.json", json(map<string, any>{"sid": "UT1", "usage_category": "sms", "trigger_value": "100", "trigger_by": "count", "recurring": "monthly", "callback_url": "https://example.com/usage"}))
+			seen.replies.set("GET {accountPath}/Usage/Triggers.json", json(map<string, any>{"usage_triggers": [map<string, any>{"sid": "UT1"}]}))
+			let trigger = try tw.usage.createTrigger("sms", "100", "https://example.com/usage", triggerBy = "count", recurring = "monthly")
+			assert trigger.category == "sms" && trigger.recurring == "monthly"
+			assert (try tw.usage.triggers().all()).len() == 1
+			try tw.usage.deleteTrigger("UT1")
+			try server.close()
+			return none
+		}
+	}
+}

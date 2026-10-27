@@ -1,0 +1,242 @@
+partial module adm.notify.twilio {
+	use (
+		std.time
+		std.net.http
+		std.net.url
+		std.data.encoding::(json)
+	)
+
+	// An API key: a sid (`SK...`) and a secret that sign in for the
+	// account in place of its auth token. The secret is only in the reply
+	// that created the key.
+	struct Key {
+		sid string
+		@json("friendly_name")
+		name string
+		secret string
+		@json("date_created")
+		dateCreated string
+		@json("date_updated")
+		dateUpdated string
+	}
+
+	// An account or a subaccount, with its auth token.
+	struct Account {
+		sid string
+		@json("friendly_name")
+		name string
+		// `active`, `suspended`, `closed`.
+		status string
+		// `Trial` or `Full`.
+		@json("type")
+		kind string
+		@json("owner_account_sid")
+		ownerAccountSid string
+		@json("auth_token")
+		authToken string
+		@json("date_created")
+		dateCreated string
+		uri string
+	}
+
+	// Which span usage records sum over.
+	enum UsagePeriod {
+		// One record per category over the dates asked for.
+		All       = "",
+		Daily     = "Daily",
+		Monthly   = "Monthly",
+		Yearly    = "Yearly",
+		Today     = "Today",
+		Yesterday = "Yesterday",
+		ThisMonth = "ThisMonth",
+		LastMonth = "LastMonth",
+		AllTime   = "AllTime",
+	}
+
+	// What one category of usage (`sms`, `calls`, `totalprice`, ...) came
+	// to over a span. Counts and prices are text as Twilio writes them.
+	struct UsageRecord {
+		category string
+		description string
+		@json("account_sid")
+		accountSid string
+		@json("start_date")
+		startDate string
+		@json("end_date")
+		endDate string
+		count string
+		@json("count_unit")
+		countUnit string
+		usage string
+		@json("usage_unit")
+		usageUnit string
+		price string
+		@json("price_unit")
+		priceUnit string
+	}
+
+	// A usage trigger: Twilio posts to `callbackUrl` when a category's
+	// usage reaches a value.
+	struct UsageTrigger {
+		sid string
+		@json("friendly_name")
+		name string
+		@json("usage_category")
+		category string
+		@json("trigger_value")
+		value string
+		// `count`, `usage` or `price`.
+		@json("trigger_by")
+		triggerBy string
+		// `daily`, `monthly`, `yearly`, or "" for once.
+		recurring string
+		@json("callback_url")
+		callbackUrl string
+		@json("current_value")
+		currentValue string
+		@json("date_fired")
+		dateFired string
+	}
+
+	// The API keys of an account.
+	type Keys {
+		internal conn Connection
+
+		def new(conn Connection) {
+			self.conn = conn
+		}
+
+		// Creates a key named `name`; its `secret` is in the reply only.
+		// Fails as every call does.
+		def create(name string) !Key {
+			let made = Key{}
+			try decodeInto(try call(conn, "api", http.Method.POST, "{conn.accountPath()}/Keys.json", formOf(map<string, string>{"FriendlyName": name})), made)
+			return made
+		}
+
+		// The keys of the account.
+		def list() Pages<Key> {
+			return pagesOf<Key>(conn, "api", "{conn.accountPath()}/Keys.json", new url.Values(), "keys")
+		}
+
+		// The key `sid`. Fails with NotFound for an unknown one, and as
+		// every call does.
+		def get(sid string) !Key {
+			let found = Key{}
+			try decodeInto(try call(conn, "api", http.Method.GET, "{conn.accountPath()}/Keys/{segment(sid)}.json"), found)
+			return found
+		}
+
+		// Renames the key `sid`. Fails as `get` does.
+		def rename(sid string, name string) !Key {
+			let found = Key{}
+			try decodeInto(try call(conn, "api", http.Method.POST, "{conn.accountPath()}/Keys/{segment(sid)}.json", formOf(map<string, string>{"FriendlyName": name})), found)
+			return found
+		}
+
+		// Revokes the key `sid`. Fails as `get` does.
+		def delete(sid string) !none {
+			try call(conn, "api", http.Method.DELETE, "{conn.accountPath()}/Keys/{segment(sid)}.json")
+			return none
+		}
+	}
+
+	// The account and its subaccounts. `Client.forAccount` acts for one.
+	type Accounts {
+		internal conn Connection
+
+		def new(conn Connection) {
+			self.conn = conn
+		}
+
+		// Creates a subaccount named `name`. Fails as every call does.
+		def create(name string = "") !Account {
+			let made = Account{}
+			try decodeInto(try call(conn, "api", http.Method.POST, "/{restVersion}/Accounts.json", formOf(map<string, string>{"FriendlyName": name})), made)
+			return made
+		}
+
+		// The account and its subaccounts, those named `name` or in `status`
+		// when given.
+		def list(name string = "", status string = "") Pages<Account> {
+			return pagesOf<Account>(conn, "api", "/{restVersion}/Accounts.json", formOf(map<string, string>{"FriendlyName": name, "Status": status}), "accounts")
+		}
+
+		// The account `sid`. Fails with NotFound for an unknown one, and as
+		// every call does.
+		def get(sid string) !Account {
+			let found = Account{}
+			try decodeInto(try call(conn, "api", http.Method.GET, "/{restVersion}/Accounts/{segment(sid)}.json"), found)
+			return found
+		}
+
+		// Renames the account `sid`. Fails as `get` does.
+		def rename(sid string, name string) !Account {
+			return try changeAccount(conn, sid, "FriendlyName", name)
+		}
+
+		// Suspends the subaccount `sid`: its calls and messages stop. Fails
+		// as `get` does.
+		def suspend(sid string) !Account {
+			return try changeAccount(conn, sid, "Status", "suspended")
+		}
+
+		// Activates the suspended subaccount `sid`. Fails as `get` does.
+		def activate(sid string) !Account {
+			return try changeAccount(conn, sid, "Status", "active")
+		}
+
+		// Closes the subaccount `sid` for good. Fails as `get` does.
+		def close(sid string) !Account {
+			return try changeAccount(conn, sid, "Status", "closed")
+		}
+	}
+
+	internal def changeAccount(conn Connection, sid string, key string, value string) !Account {
+		let found = Account{}
+		try decodeInto(try call(conn, "api", http.Method.POST, "/{restVersion}/Accounts/{segment(sid)}.json", formOf(map<string, string>{key: value})), found)
+		return found
+	}
+
+	// The usage of an account, and the triggers on it.
+	type Usage {
+		internal conn Connection
+
+		def new(conn Connection) {
+			self.conn = conn
+		}
+
+		// The usage of `category` ("" for every one) from `from` to `until`
+		// (none: Twilio's default span), summed per `period`.
+		def records(category string = "", from ?time.Date = none, until ?time.Date = none, period UsagePeriod = UsagePeriod.All) Pages<UsageRecord> {
+			let query = formOf(map<string, string>{"Category": category})
+			query.set("StartDate", from.str()) unless from is none
+			query.set("EndDate", until.str()) unless until is none
+			let span = period.value.len() > 0 ?? ("/" + period.value, "")
+			return pagesOf<UsageRecord>(conn, "api", "{conn.accountPath()}/Usage/Records{span}.json", query, "usage_records")
+		}
+
+		// Has Twilio post to `callbackUrl` when the usage of `category`
+		// reaches `value` (by `triggerBy`: `count`, `usage` or `price`),
+		// each day, month or year with `recurring`. Fails as every call
+		// does.
+		def createTrigger(category string, value string, callbackUrl string, triggerBy string = "usage", recurring string = "", name string = "") !UsageTrigger {
+			let form = formOf(map<string, string>{"UsageCategory": category, "TriggerValue": value, "CallbackUrl": callbackUrl, "TriggerBy": triggerBy, "Recurring": recurring, "FriendlyName": name})
+			let made = UsageTrigger{}
+			try decodeInto(try call(conn, "api", http.Method.POST, "{conn.accountPath()}/Usage/Triggers.json", form), made)
+			return made
+		}
+
+		// The usage triggers of the account.
+		def triggers() Pages<UsageTrigger> {
+			return pagesOf<UsageTrigger>(conn, "api", "{conn.accountPath()}/Usage/Triggers.json", new url.Values(), "usage_triggers")
+		}
+
+		// Removes the usage trigger `sid`. Fails with NotFound for an
+		// unknown one, and as every call does.
+		def deleteTrigger(sid string) !none {
+			try call(conn, "api", http.Method.DELETE, "{conn.accountPath()}/Usage/Triggers/{segment(sid)}.json")
+			return none
+		}
+	}
+}

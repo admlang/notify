@@ -1,0 +1,187 @@
+partial module adm.notify.twilio {
+	use (
+		std.testing
+		std.net.http
+		std.net.http.httptest
+		std.net.url
+	)
+
+	// Twilio's documented example: the auth token, the address and form,
+	// and their signature; the same with the default port written; and a
+	// JSON body signed through its `bodySHA256` (computed apart with
+	// Python's hmac and hashlib).
+	internal const docToken = "12345"
+	internal const docSignature = "0/KCTR6DLpKmkAf8muzZqo1nDgQ="
+	internal const docPortSignature = "EpDEmp1PyjDYp77YxYU3GILBWzE="
+	internal const docBody = "\{\"property\": \"value\", \"boolean\": true}"
+	internal const docBodyHash = "0a1ff7634d9ab3b95db5c9a2dfe9416e41502b283a80c7cf19632632f96e6620"
+	internal const docBodySignature = "a9nBmqA0ju/hNViExpshrM61xv4="
+
+	internal def docParams() map<string, string> {
+		return map<string, string>{"CallSid": "CA1234567890ABCDE", "Caller": "+12349013030", "Digits": "1234", "From": "+12349013030", "To": "+18005551212"}
+	}
+
+	// Serves `handler` at /hook and /myapp.php and returns the base
+	// address.
+	internal def hookServer(handler WebhookHandler) !(httptest.Server, string) {
+		let mux = new http.ServeMux()
+		try mux.handle("/hook", handler)
+		try mux.handle("/myapp.php", handler)
+		let server = new httptest.Server(mux)
+		try server.start()
+		return (server, "http://{server.address().str()}")
+	}
+
+	// Posts `params` as a form to `target` with `signature` (left out
+	// when "").
+	internal def postForm(target string, params map<string, string>, signature string, headers map<string, string> = new map<string, string>()) !http.Response {
+		let form = new url.Values()
+		for let (k, v) in params {
+			form.set(k, v)
+		}
+		let client = new http.Client()
+		let req = try client.request(http.Method.POST, target)
+		req.headers.set("Content-Type", "application/x-www-form-urlencoded")
+		req.headers.set(signatureHeader, signature) when signature.len() > 0
+		for let (k, v) in headers {
+			req.headers.set(k, v)
+		}
+		req.replaceBody(form.encode().bytes())
+		return try client.do(req)
+	}
+
+	check "Twilio webhooks" {
+		// The signature of Twilio's documented example.
+		@test()
+		def TestSignature() !none {
+			assert signature(docToken, "https://mycompany.com/myapp.php?foo=1&bar=2", docParams()) == docSignature
+			assert signatureMatches(docToken, "https://mycompany.com/myapp.php?foo=1&bar=2", docParams(), docPortSignature)
+			assert signatureMatches(docToken, "https://mycompany.com:443/myapp.php?foo=1&bar=2", docParams(), docSignature)
+			assert !signatureMatches(docToken, "https://mycompany.com/myapp.php?foo=1&bar=3", docParams(), docSignature)
+			assert !signatureMatches("54321", "https://mycompany.com/myapp.php?foo=1&bar=2", docParams(), docSignature)
+			assert !signatureMatches(docToken, "https://mycompany.com/myapp.php?foo=1&bar=2", docParams(), "")
+			return none
+		}
+
+		// Requests are checked against the address Twilio called (on
+		// `baseURL`, or the request's own, or the proxy's), form or JSON
+		// body; a wrong one is refused 403.
+		@test()
+		def TestValidation() !none {
+			let got Event[] = []
+			let handle = def (event Event) !?TwiML {
+				got.push(event)
+				return none
+			}
+			let (server, base) = try hookServer(webhook(docToken, handle, baseURL = "https://mycompany.com"))
+			let res = try postForm("{base}/myapp.php?foo=1&bar=2", docParams(), docSignature)
+			assert res.status == 200 && got.len() == 1 && res.header("Content-Type").startsWith("text/xml")
+			assert (try res.text()) == "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response/>"
+			assert (try postForm("{base}/myapp.php?foo=1&bar=2", docParams(), docPortSignature)).status == 200
+			assert (try postForm("{base}/myapp.php?foo=1&bar=3", docParams(), docSignature)).status == 403
+			assert (try postForm("{base}/myapp.php?foo=1&bar=2", docParams(), "")).status == 403
+			let changed = docParams()
+			changed.set("Digits", "9")
+			assert (try postForm("{base}/myapp.php?foo=1&bar=2", changed, docSignature)).status == 403
+			let client = new http.Client()
+			let req = try client.request(http.Method.POST, "{base}/myapp.php?foo=1&bar=2&bodySHA256={docBodyHash}")
+			req.headers.set("Content-Type", "application/json")
+			req.headers.set(signatureHeader, docBodySignature)
+			req.replaceBody(docBody.bytes())
+			assert (try client.do(req)).status == 200
+			let tampered = try client.request(http.Method.POST, "{base}/myapp.php?foo=1&bar=2&bodySHA256={docBodyHash}")
+			tampered.headers.set("Content-Type", "application/json")
+			tampered.headers.set(signatureHeader, docBodySignature)
+			tampered.replaceBody("\{\"property\": \"other\"}".bytes())
+			assert (try client.do(tampered)).status == 403
+			assert got.len() == 3
+			try server.close()
+			let (own, ownBase) = try hookServer(webhook("tok", handle))
+			let params = map<string, string>{"MessageSid": "SM1", "Body": "hi", "From": "+1", "To": "+2"}
+			let address = "{ownBase}/hook?id=7"
+			assert (try postForm(address, params, signature("tok", address, params))).status == 200
+			try own.close()
+			let (proxied, proxiedBase) = try hookServer(webhook("tok", handle, trustProxy = true))
+			let public = "https://hooks.example.com/hook"
+			assert (try postForm("{proxiedBase}/hook", params, signature("tok", public, params), {"X-Forwarded-Proto": "https", "X-Forwarded-Host": "hooks.example.com"})).status == 200
+			assert (try postForm("{proxiedBase}/hook", params, signature("tok", public, params))).status == 403
+			let get = try client.request(http.Method.GET, "{proxiedBase}/hook?CallSid=CA9&CallStatus=ringing")
+			get.headers.set(signatureHeader, signature("tok", "{proxiedBase}/hook?CallSid=CA9&CallStatus=ringing"))
+			assert (try client.do(get)).status == 200
+			let last = got[got.len() - 1]
+			match last {
+				case CallEvent:
+					assert last.callSid == "CA9" && last.status == "ringing"
+				default:
+					fail "a GET webhook gave no call event"
+			}
+			try proxied.close()
+			return none
+		}
+
+		// Each kind of webhook comes out as its struct; the TwiML `handle`
+		// returns is the answer.
+		@test()
+		def TestEvents() !none {
+			let got Event[] = []
+			let handler = webhook(none, def (event Event) !?TwiML {
+				got.push(event)
+				match event {
+					case IncomingMessage:
+						return new MessagingResponse().message("Got: {event.body}")
+					case CallEvent:
+						fail "refused" when event.digits == "0"
+						return new VoiceResponse().say("You pressed {event.digits}")
+					default:
+						return none
+				}
+			})
+			let (server, base) = try hookServer(handler)
+			let target = "{base}/hook"
+			let incoming = try postForm(target, map<string, string>{"MessageSid": "SM1", "SmsStatus": "received", "AccountSid": "AC1", "From": "whatsapp:+15551234567", "To": "whatsapp:+14155238886", "Body": "Hello", "NumMedia": "2", "MediaUrl0": "https://api.twilio.com/m0", "MediaContentType0": "image/jpeg", "MediaUrl1": "https://api.twilio.com/m1", "MediaContentType1": "audio/ogg", "ProfileName": "Ana", "WaId": "15551234567", "NumSegments": "1", "FromCountry": "US"}, "")
+			assert (try incoming.text()).contains("<Message>Got: Hello</Message>")
+			try postForm(target, map<string, string>{"MessageSid": "SM2", "MessageStatus": "undelivered", "ErrorCode": "30003", "To": "+1"}, "")
+			let pressed = try postForm(target, map<string, string>{"CallSid": "CA1", "CallStatus": "in-progress", "Digits": "1", "From": "+1", "To": "+2", "Direction": "inbound", "SpeechResult": "sales", "Confidence": "0.92"}, "")
+			assert (try pressed.text()).contains("<Say>You pressed 1</Say>")
+			try postForm(target, map<string, string>{"CallSid": "CA1", "CallStatus": "completed", "CallDuration": "42", "CallbackSource": "call-progress-events", "SequenceNumber": "3"}, "")
+			try postForm(target, map<string, string>{"RecordingSid": "RE1", "RecordingStatus": "completed", "RecordingUrl": "https://api.twilio.com/RE1", "RecordingDuration": "12", "RecordingChannels": "2", "CallSid": "CA1"}, "")
+			try postForm(target, map<string, string>{"TranscriptionSid": "TR1", "TranscriptionText": "hello there", "TranscriptionStatus": "completed", "RecordingSid": "RE1", "CallSid": "CA1"}, "")
+			try postForm(target, map<string, string>{"ConferenceSid": "CF1", "FriendlyName": "Room 7", "StatusCallbackEvent": "participant-join", "CallSid": "CA1", "Muted": "false", "Hold": "true", "SequenceNumber": "2"}, "")
+			try postForm(target, map<string, string>{"Something": "new"}, "")
+			assert got.len() == 8
+			let kinds string[] = []
+			for let event in got {
+				match event {
+					case IncomingMessage:
+						assert event.body == "Hello" && event.media.len() == 2 && event.media[1].contentType == "audio/ogg" && event.profileName == "Ana" && event.waId == "15551234567" && event.segments == 1 && event.fromCountry == "US"
+						kinds.push("in")
+					case MessageStatus:
+						assert event.status == "undelivered" && event.errorCode == 30003
+						kinds.push("status")
+					case CallEvent:
+						assert event.status == "completed" || (event.confidence > 0.91 && event.confidence < 0.93)
+						kinds.push(event.status == "completed" ?? ("done {event.duration} {event.sequenceNumber}", "call {event.digits} {event.speechResult}"))
+					case RecordingStatus:
+						assert event.duration == 12 && event.channels == 2 && event.callSid == "CA1"
+						kinds.push("recording")
+					case TranscriptionEvent:
+						assert event.text == "hello there" && event.recordingSid == "RE1"
+						kinds.push("transcription")
+					case ConferenceEvent:
+						assert event.name == "Room 7" && event.event == "participant-join" && event.hold && !event.muted && event.sequenceNumber == 2
+						kinds.push("conference")
+					case OtherEvent:
+						assert "{event.params.get("Something")}" == "new"
+						kinds.push("other")
+				}
+			}
+			fail "events: {kinds.join(",")}" unless kinds.join(",") == "in,status,call 1 sales,done 42 3,recording,transcription,conference,other"
+			assert (try postForm(target, map<string, string>{"CallSid": "CA1", "Digits": "0"}, "")).status == 500
+			let recorder = new httptest.ResponseRecorder()
+			try handler.serve(recorder.context(try httptest.newRequest(http.Method.PUT, "/hook")))
+			assert recorder.result().status == 405
+			try server.close()
+			return none
+		}
+	}
+}

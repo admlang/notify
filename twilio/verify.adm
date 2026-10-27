@@ -1,0 +1,211 @@
+partial module adm.notify.twilio {
+	use (
+		std.net.http
+		std.net.url
+		std.data.encoding::(JSON, json)
+	)
+
+	// How a verification code reaches the user.
+	enum Channel {
+		Sms      = "sms",
+		Call     = "call",
+		Email    = "email",
+		WhatsApp = "whatsapp",
+		// Silent network authentication: the carrier confirms the number,
+		// no code.
+		Sna      = "sna",
+		// Twilio picks.
+		Auto     = "auto",
+	}
+
+	// A Verify service: the name, code length and settings verifications
+	// share.
+	struct VerifyService {
+		sid string
+		@json("friendly_name")
+		name string
+		@json("code_length")
+		codeLength int
+		@json("lookup_enabled")
+		lookupEnabled bool
+		@json("date_created")
+		dateCreated string
+	}
+
+	// A verification: the code sent to `to` over `channel`, and whether
+	// it was confirmed (`status` `approved`).
+	struct Verification {
+		sid string
+		@json("service_sid")
+		serviceSid string
+		to string
+		channel string
+		// `pending`, `approved`, `canceled`, `max_attempts_reached`,
+		// `deleted`, `failed`, `expired`.
+		status string
+		valid bool
+		@json("date_created")
+		dateCreated string
+		@json("date_updated")
+		dateUpdated string
+	}
+
+	// A rate limit of a Verify service: verifications are counted per
+	// value of `uniqueName` given to `start` (`end_user_ip`, ...), each
+	// bucket allowing `max` in its interval.
+	struct RateLimit {
+		sid string
+		@json("unique_name")
+		uniqueName string
+		description string
+	}
+
+	// A bucket of a rate limit: at most `max` verifications in `interval`
+	// seconds.
+	struct Bucket {
+		sid      string
+		max      int
+		interval int
+	}
+
+	// Verify services.
+	partial type Client {
+		// The Verify service `sid` (`VA...`).
+		def verify(sid string) Verify {
+			return new Verify(sid, connection)
+		}
+
+		// The Verify services of the account.
+		def verifyServices() Pages<VerifyService> {
+			return pagesOf<VerifyService>(connection, "verify", "/v2/Services", new url.Values(), "services")
+		}
+
+		// Creates a Verify service named `name` (the name the messages
+		// show), with codes of `codeLength` digits (4 to 10; 0 keeps
+		// Twilio's 6). Fails as every call does.
+		def createVerifyService(name string, codeLength int = 0) !VerifyService {
+			let form = formOf(map<string, string>{"FriendlyName": name, "CodeLength": codeLength > 0 ?? ("{codeLength}", "")})
+			let made = VerifyService{}
+			try decodeInto(try call(connection, "verify", http.Method.POST, "/v2/Services", form), made)
+			return made
+		}
+
+		// Removes the Verify service `sid`. Fails with NotFound for an
+		// unknown one, and as every call does.
+		def deleteVerifyService(sid string) !none {
+			try call(connection, "verify", http.Method.DELETE, "/v2/Services/{segment(sid)}")
+			return none
+		}
+	}
+
+	// One Verify service: starts verifications, confirms their codes, and
+	// holds its rate limits.
+	type Verify {
+		sid           string
+		internal conn Connection
+
+		def new(sid string, conn Connection) {
+			self.sid = sid
+			self.conn = conn
+		}
+
+		// Sends a code to `to` (a number, or an address for Email) over
+		// `channel`, in `locale` (`en`, `fr`, ...). `customCode` sends that
+		// code instead of a random one; `rateLimits` gives the values the
+		// service's rate limits count by (`end_user_ip` → an address).
+		// Email takes its SendGrid `template` with `substitutions`, from
+		// `emailFrom` named `emailFromName`. Fails as every call does:
+		// Invalid for a number Twilio cannot send to, RateLimited for a
+		// limit reached.
+		def start(to string, channel Channel = Channel.Sms, locale string = "", customCode string = "", customName string = "", rateLimits map<string, string> = new map<string, string>(), template string = "", substitutions map<string, any> = new map<string, any>(), emailFrom string = "", emailFromName string = "") !Verification {
+			let form = formOf(map<string, string>{"To": to, "Channel": channel.value, "Locale": locale, "CustomCode": customCode, "CustomFriendlyName": customName})
+			let codec = new JSON()
+			form.set("RateLimits", string(codec.encode(rateLimits))) when rateLimits.len() > 0
+			let config = new map<string, any>()
+			config.set("template_id", template) when template.len() > 0
+			config.set("substitutions", substitutions) when substitutions.len() > 0
+			config.set("from", emailFrom) when emailFrom.len() > 0
+			config.set("from_name", emailFromName) when emailFromName.len() > 0
+			form.set("ChannelConfiguration", string(codec.encode(config))) when config.len() > 0
+			let made = Verification{}
+			try decodeInto(try call(conn, "verify", http.Method.POST, "/v2/Services/{segment(sid)}/Verifications", form), made)
+			return made
+		}
+
+		// Whether `code` is the one sent to `to`: true approves the
+		// verification. Fails with NotFound when `to` has no pending
+		// verification (expired, approved, or too many tries), and as every
+		// call does.
+		def confirm(to string, code string) !bool {
+			let found = Verification{}
+			try decodeInto(try call(conn, "verify", http.Method.POST, "/v2/Services/{segment(sid)}/VerificationCheck", formOf(map<string, string>{"To": to, "Code": code})), found)
+			return found.status == "approved"
+		}
+
+		// The verification `verificationSid`. Fails with NotFound for an
+		// unknown one, and as every call does.
+		def get(verificationSid string) !Verification {
+			let found = Verification{}
+			try decodeInto(try call(conn, "verify", http.Method.GET, "/v2/Services/{segment(sid)}/Verifications/{segment(verificationSid)}"), found)
+			return found
+		}
+
+		// Approves the verification `verificationSid` without a code (after
+		// the user was verified another way). Fails as `get` does.
+		def approve(verificationSid string) !Verification {
+			return try setVerification(self, verificationSid, "approved")
+		}
+
+		// Cancels the verification `verificationSid`: its code no longer
+		// works. Fails as `get` does.
+		def cancel(verificationSid string) !Verification {
+			return try setVerification(self, verificationSid, "canceled")
+		}
+
+		// The rate limits of the service.
+		def rateLimits() Pages<RateLimit> {
+			return pagesOf<RateLimit>(conn, "verify", "/v2/Services/{segment(sid)}/RateLimits", new url.Values(), "rate_limits")
+		}
+
+		// Adds a rate limit counting verifications per value of
+		// `uniqueName`. Fails as every call does.
+		def createRateLimit(uniqueName string, description string = "") !RateLimit {
+			let made = RateLimit{}
+			try decodeInto(try call(conn, "verify", http.Method.POST, "/v2/Services/{segment(sid)}/RateLimits", formOf(map<string, string>{"UniqueName": uniqueName, "Description": description})), made)
+			return made
+		}
+
+		// Removes the rate limit `rateLimit`. Fails with NotFound for an
+		// unknown one, and as every call does.
+		def deleteRateLimit(rateLimit string) !none {
+			try call(conn, "verify", http.Method.DELETE, "/v2/Services/{segment(sid)}/RateLimits/{segment(rateLimit)}")
+			return none
+		}
+
+		// Allows at most `max` verifications per value in `interval` under
+		// the rate limit `rateLimit`. Fails as `deleteRateLimit` does.
+		def addBucket(rateLimit string, max int, interval duration) !Bucket {
+			let made = Bucket{}
+			try decodeInto(try call(conn, "verify", http.Method.POST, "/v2/Services/{segment(sid)}/RateLimits/{segment(rateLimit)}/Buckets", formOf(map<string, string>{"Max": "{max}", "Interval": "{int(interval / 1s)}"})), made)
+			return made
+		}
+
+		// The buckets of the rate limit `rateLimit`.
+		def buckets(rateLimit string) Pages<Bucket> {
+			return pagesOf<Bucket>(conn, "verify", "/v2/Services/{segment(sid)}/RateLimits/{segment(rateLimit)}/Buckets", new url.Values(), "buckets")
+		}
+
+		// Removes the bucket `bucket` of `rateLimit`. Fails as
+		// `deleteRateLimit` does.
+		def deleteBucket(rateLimit string, bucket string) !none {
+			try call(conn, "verify", http.Method.DELETE, "/v2/Services/{segment(sid)}/RateLimits/{segment(rateLimit)}/Buckets/{segment(bucket)}")
+			return none
+		}
+	}
+
+	internal def setVerification(verify Verify, verificationSid string, status string) !Verification {
+		let found = Verification{}
+		try decodeInto(try call(verify.conn, "verify", http.Method.POST, "/v2/Services/{segment(verify.sid)}/Verifications/{segment(verificationSid)}", formOf(map<string, string>{"Status": status})), found)
+		return found
+	}
+}

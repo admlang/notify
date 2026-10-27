@@ -1,0 +1,326 @@
+partial module adm.notify.twilio {
+	use (
+		std.crypto
+		std.crypto.hash::(Hash, hmac, digest)
+		std.net.http
+		std.net.url
+		std.data.encoding::(base64encode, hexencode)
+	)
+
+	// The header holding Twilio's signature of a webhook request.
+	const signatureHeader = "X-Twilio-Signature"
+
+	// A file of an incoming MMS or WhatsApp message, on Twilio's servers
+	// (`Messages.download` needs the credentials for it).
+	struct IncomingMedia {
+		url         string
+		contentType string
+	}
+
+	// A message to one of the account's numbers or WhatsApp senders.
+	// `params` holds every field Twilio posted.
+	struct IncomingMessage {
+		messageSid          string
+		accountSid          string
+		messagingServiceSid string
+		from                string
+		to                  string
+		body                string
+		media               IncomingMedia[]
+		segments            int
+		// WhatsApp: the sender's profile name and WhatsApp id, and the
+		// button of a template they pressed.
+		profileName         string
+		waId                string
+		buttonText          string
+		buttonPayload       string
+		// A WhatsApp location.
+		latitude            string
+		longitude           string
+		fromCity            string
+		fromState           string
+		fromZip             string
+		fromCountry         string
+		params              map<string, string>
+	}
+
+	// A change of a sent message's status, at its status callback.
+	struct MessageStatus {
+		messageSid          string
+		accountSid          string
+		messagingServiceSid string
+		from                string
+		to                  string
+		// `queued`, `sent`, `delivered`, `read`, `undelivered`, `failed`,
+		// `canceled`, ...
+		status              string
+		errorCode           int
+		params              map<string, string>
+	}
+
+	// A step of a call: the incoming call, a status callback, a Gather's
+	// digits or speech, a Dial's or Record's outcome. Fields that do not
+	// belong to the step are empty.
+	struct CallEvent {
+		callSid           string
+		accountSid        string
+		parentCallSid     string
+		from              string
+		to                string
+		// `queued`, `ringing`, `in-progress`, `completed`, `busy`,
+		// `failed`, `no-answer`, `canceled`.
+		status            string
+		direction         string
+		callerName        string
+		forwardedFrom     string
+		// Seconds, once the call is over.
+		duration          int
+		// Gather: the keys pressed, or the speech and how sure Twilio is.
+		digits            string
+		speechResult      string
+		confidence        float
+		// Answering machine detection: `human`, `machine_start`, ...
+		answeredBy        string
+		// Record: the recording.
+		recordingSid      string
+		recordingUrl      string
+		recordingDuration int
+		// Dial: how the dialled leg ended.
+		dialCallSid       string
+		dialCallStatus    string
+		dialCallDuration  int
+		// Status callbacks: what sent it, in which order, and when.
+		callbackSource    string
+		sequenceNumber    int
+		timestamp         string
+		params            map<string, string>
+	}
+
+	// A recording's status, at its status callback.
+	struct RecordingStatus {
+		recordingSid  string
+		recordingUrl  string
+		// `in-progress`, `completed`, `absent`, `failed`.
+		status        string
+		duration      int
+		channels      int
+		source        string
+		callSid       string
+		conferenceSid string
+		errorCode     int
+		params        map<string, string>
+	}
+
+	// A transcription of a Record verb, at its callback.
+	struct TranscriptionEvent {
+		transcriptionSid string
+		text             string
+		// `completed` or `failed`.
+		status           string
+		url              string
+		recordingSid     string
+		recordingUrl     string
+		callSid          string
+		params           map<string, string>
+	}
+
+	// A change in a conference room, at its status callback.
+	struct ConferenceEvent {
+		conferenceSid  string
+		name           string
+		// `conference-start`, `conference-end`, `participant-join`,
+		// `participant-leave`, `participant-mute`, ...
+		event          string
+		callSid        string
+		muted          bool
+		hold           bool
+		coaching       bool
+		sequenceNumber int
+		timestamp      string
+		params         map<string, string>
+	}
+
+	// A request of a kind this version has no struct for.
+	struct OtherEvent {
+		params map<string, string>
+	}
+
+	// What a Twilio webhook posts.
+	type Event = IncomingMessage | MessageStatus | CallEvent | RecordingStatus | TranscriptionEvent | ConferenceEvent | OtherEvent
+
+	// The webhook receiver, an http.Handler for every webhook of an
+	// account (incoming messages and calls, status callbacks, Gather and
+	// Record actions, conference events): it checks the request's
+	// signature with `authToken`, hands the event to `handle` and answers
+	// with the TwiML `handle` returns, an empty response when none. A
+	// request whose signature does not match is answered 403, a body that
+	// is not a form 400, an event `handle` fails on 500.
+	//
+	// The signature covers the address Twilio called: `baseURL` (scheme,
+	// host and any path prefix in front of this server) replaces the
+	// request's own scheme and host when set; else `trustProxy` takes them
+	// from `X-Forwarded-Proto` and `X-Forwarded-Host`.
+	//
+	// ```
+	// try server.handle("/twilio", twilio.webhook(authToken, def (event twilio.Event) !?twilio.TwiML {
+	//     match event {
+	//         case twilio.IncomingMessage:
+	//             return new twilio.MessagingResponse().message("Got it.")
+	//         case twilio.CallEvent:
+	//             return new twilio.VoiceResponse().say("Hello").hangup()
+	//         default:
+	//             return none
+	//     }
+	// }, baseURL = "https://example.com"))
+	// ```
+	type WebhookHandler {
+		authToken       ?Secret<string>
+		baseURL         string             = ""
+		trustProxy      bool               = false
+		internal handle def(Event) !?TwiML
+
+		def new(authToken ?Secret<string>, handle def(Event) !?TwiML, baseURL string = "", trustProxy bool = false) {
+			self.authToken = authToken
+			self.handle = handle
+			self.baseURL = baseURL
+			self.trustProxy = trustProxy
+		}
+
+		// Implements http.Handler. Fails when the body cannot be read, the
+		// answer cannot be written, or `handle` fails on the event.
+		def serve(ctx http.Context) !none {
+			let method = ctx.method()
+			return ctx.text(405, "twilio webhooks come by POST or GET") unless method == http.Method.POST || method == http.Method.GET
+			let body = try ctx.bytes()
+			let address = addressOf(ctx)
+			let params = new map<string, string>()
+			let isJSON = ctx.header("Content-Type").lower().startsWith("application/json")
+			if method == http.Method.POST && !isJSON {
+				let form = url.parseQuery(string(body)) onerror (err error) {
+					return ctx.text(400, "not a form: {err.message}")
+				}
+				for let p in form.pairs() {
+					params.set(p.key, p.value)
+				}
+			} else {
+				let query = ctx.url().query()
+				for let p in query.pairs() {
+					params.set(p.key, p.value)
+				}
+			}
+			let token = authToken
+			if !(token is none) {
+				let signed = ctx.header(signatureHeader)
+				let form = method == http.Method.POST && !isJSON ?? (params, new map<string, string>())
+				return ctx.text(403, "signature does not match") unless signatureMatches(token.reveal(), address, form, signed)
+				return ctx.text(403, "body does not match bodySHA256") unless !isJSON || bodyMatches(body, params.get("bodySHA256"))
+			}
+			let answer = try handle(eventOf(params))
+			ctx.setHeader("Content-Type", "text/xml; charset=utf-8")
+			return ctx.text(200, answer is none ?? ((new VoiceResponse()).str(), twimlText(answer)))
+		}
+
+		// The address Twilio called: the request's path and query on its
+		// own scheme and host, or on `baseURL`.
+		internal def addressOf(ctx http.Context) string {
+			let target = ctx.url()
+			let path = target.rawPath.len() > 0 ?? (target.rawPath, target.path)
+			let query = target.rawQuery.len() > 0 ?? ("?" + target.rawQuery, "")
+			return baseURL.trimEnd("/") + path + query when baseURL.len() > 0
+			let forwardedHost = trustProxy ?? (ctx.header("X-Forwarded-Host"), "")
+			let host = forwardedHost.len() > 0 ?? (forwardedHost.split(",")[0].trim(), ctx.request.host)
+			return "{ctx.request.scheme(trustProxy)}://{host}{path}{query}"
+		}
+	}
+
+	// A receiver of every webhook of an account; see WebhookHandler. With
+	// `authToken` none nothing is checked, which lets anyone who finds the
+	// address post events.
+	def webhook(authToken ?Secret<string>, handle def(Event) !?TwiML, baseURL string = "", trustProxy bool = false) WebhookHandler {
+		return new WebhookHandler(authToken, handle, baseURL, trustProxy)
+	}
+
+	// Twilio's signature of a request to `address` with the form `params`:
+	// base64 of HMAC-SHA1 under the auth token, over the address followed
+	// by each parameter's name and value, sorted by name.
+	def signature(authToken string, address string, params map<string, string> = new map<string, string>()) string {
+		let names = params.keys().sort((a, b) => a.compare(b) < 0)
+		let text = address
+		for let name in names {
+			text += name + "{params.get(name)}"
+		}
+		return base64encode(hmac(Hash.SHA1, authToken.bytes(), text.bytes()))
+	}
+
+	// Whether `signed` is the signature of the request to `address`, with
+	// the address's default port written or left out, as Twilio signs
+	// either way.
+	internal def signatureMatches(authToken string, address string, params map<string, string>, signed string) bool {
+		return false when signed.len() == 0
+		for let candidate in portForms(address) {
+			return true when crypto.constantTimeEqual(signature(authToken, candidate, params).bytes(), signed.bytes())
+		}
+		return false
+	}
+
+	// `address` as given, and with its default port added or removed.
+	internal def portForms(address string) string[] {
+		let out = [address]
+		let parsed = url.parse(address) onerror (err error) {
+			return out
+		}
+		let port = parsed.scheme == "https" ?? ("443", "80")
+		let host = parsed.host
+		let rest = address[address.indexOf(host) + host.len():]
+		if host.endsWith(":" + port) {
+			out.push("{parsed.scheme}://{host.trimSuffix(":" + port)}{rest}")
+		} else if !host.contains(":") {
+			out.push("{parsed.scheme}://{host}:{port}{rest}")
+		}
+		return out
+	}
+
+	// Whether a JSON body hashes to the `bodySHA256` its address carries.
+	internal def bodyMatches(body byte[], expected ?string) bool {
+		return false when expected is none
+		return crypto.constantTimeEqual(hexencode(digest(Hash.SHA256, body)).bytes(), expected.lower().bytes())
+	}
+
+	internal def twimlText(answer TwiML) string {
+		match answer {
+			case VoiceResponse:
+				return answer.str()
+			case MessagingResponse:
+				return answer.str()
+		}
+	}
+
+	// The event of a webhook's parameters, by the ids they carry.
+	internal def eventOf(params map<string, string>) Event {
+		let p = def (key string) string {
+			let v = params.get(key)
+			return v is none ?? ("", v)
+		}
+		return TranscriptionEvent{transcriptionSid: p("TranscriptionSid"), text: p("TranscriptionText"), status: p("TranscriptionStatus"), url: p("TranscriptionUrl"), recordingSid: p("RecordingSid"), recordingUrl: p("RecordingUrl"), callSid: p("CallSid"), params: params} when p("TranscriptionSid").len() > 0
+		return ConferenceEvent{conferenceSid: p("ConferenceSid"), name: p("FriendlyName"), event: p("StatusCallbackEvent"), callSid: p("CallSid"), muted: p("Muted") == "true", hold: p("Hold") == "true", coaching: p("Coaching") == "true", sequenceNumber: number(p("SequenceNumber")), timestamp: p("Timestamp"), params: params} when p("ConferenceSid").len() > 0 && p("StatusCallbackEvent").len() > 0
+		return RecordingStatus{recordingSid: p("RecordingSid"), recordingUrl: p("RecordingUrl"), status: p("RecordingStatus"), duration: number(p("RecordingDuration")), channels: number(p("RecordingChannels")), source: p("RecordingSource"), callSid: p("CallSid"), conferenceSid: p("ConferenceSid"), errorCode: number(p("ErrorCode")), params: params} when p("RecordingSid").len() > 0 && p("RecordingStatus").len() > 0
+		let messageSid = p("MessageSid").len() > 0 ?? (p("MessageSid"), p("SmsSid"))
+		if messageSid.len() > 0 {
+			let status = p("MessageStatus").len() > 0 ?? (p("MessageStatus"), p("SmsStatus"))
+			return MessageStatus{messageSid: messageSid, accountSid: p("AccountSid"), messagingServiceSid: p("MessagingServiceSid"), from: p("From"), to: p("To"), status: status, errorCode: number(p("ErrorCode")), params: params} when status.len() > 0 && status != "received"
+			let incoming = IncomingMessage{messageSid: messageSid, accountSid: p("AccountSid"), messagingServiceSid: p("MessagingServiceSid"), from: p("From"), to: p("To"), body: p("Body"), segments: number(p("NumSegments")), profileName: p("ProfileName"), waId: p("WaId"), buttonText: p("ButtonText"), buttonPayload: p("ButtonPayload"), latitude: p("Latitude"), longitude: p("Longitude"), fromCity: p("FromCity"), fromState: p("FromState"), fromZip: p("FromZip"), fromCountry: p("FromCountry"), params: params}
+			for let i in 0..number(p("NumMedia")) {
+				incoming.media.push(IncomingMedia{url: p("MediaUrl{i}"), contentType: p("MediaContentType{i}")})
+			}
+			return incoming
+		}
+		return CallEvent{callSid: p("CallSid"), accountSid: p("AccountSid"), parentCallSid: p("ParentCallSid"), from: p("From"), to: p("To"), status: p("CallStatus"), direction: p("Direction"), callerName: p("CallerName"), forwardedFrom: p("ForwardedFrom"), duration: number(p("CallDuration")), digits: p("Digits"), speechResult: p("SpeechResult"), confidence: p("Confidence").isNumeric() ?? (parseFloat<float>(p("Confidence")), 0.0), answeredBy: p("AnsweredBy"), recordingSid: p("RecordingSid"), recordingUrl: p("RecordingUrl"), recordingDuration: number(p("RecordingDuration")), dialCallSid: p("DialCallSid"), dialCallStatus: p("DialCallStatus"), dialCallDuration: number(p("DialCallDuration")), callbackSource: p("CallbackSource"), sequenceNumber: number(p("SequenceNumber")), timestamp: p("Timestamp"), params: params} when p("CallSid").len() > 0
+		return OtherEvent{params: params}
+	}
+
+	// A whole number Twilio posted as text; 0 when absent or not one.
+	internal def number(text string) int {
+		let t = text.trim()
+		return t.len() > 0 && t.isNumeric() && !t.contains(".") ?? (t.toInt<int>(), 0)
+	}
+}

@@ -11,4 +11,4 @@ repo_salt = "base64:/b4tnRkcEtEzGgn4nGyC4xHe0uBVzhyT4fPWBuwG1bI="
 
 # The line `adm search` shows for the library; `adm publish` files it.
 [apps."adm.notify.twilio"]
-description = "Twilio SMS, WhatsApp, voice and verify"
+description = "Twilio messages, WhatsApp, voice with TwiML, Verify, lookups and webhooks"

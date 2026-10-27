@@ -1,5 +1,5 @@
-// Twilio SMS, WhatsApp, voice and verify
-@manifest(version = "0.0.1")
+// Twilio messages, WhatsApp, voice with TwiML, Verify, lookups and webhooks
+@manifest(version = "0.1.0")
 library adm.notify.twilio {
 	use (
 		adm.notify.twilio

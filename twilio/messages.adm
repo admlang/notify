@@ -1,0 +1,257 @@
+partial module adm.notify.twilio {
+	use (
+		std.time
+		std.net.http
+		std.net.url
+		std.data.encoding::(JSON, json)
+	)
+
+	// The most media a message carries, and the longest body.
+	internal const maxMedia = 10
+	internal const maxBody = 1600
+
+	// How soon and how late a message may be scheduled.
+	internal const minSchedule = 15m
+	internal const maxSchedule = 840h
+
+	// An SMS, MMS or WhatsApp message, sent or received. Numbers are E.164
+	// (`+15551234567`), WhatsApp ones `whatsapp:+15551234567`. Times are
+	// RFC 2822 text as Twilio writes them.
+	struct Message {
+		sid string
+		@json("account_sid")
+		accountSid string
+		@json("messaging_service_sid")
+		messagingServiceSid string
+		from string
+		to string
+		body string
+		// `queued`, `scheduled`, `sending`, `sent`, `delivered`, `read`,
+		// `undelivered`, `failed`, `canceled`, `received`, ...
+		status string
+		// `outbound-api`, `outbound-reply`, `inbound`, ...
+		direction string
+		@json("num_segments")
+		segments string
+		@json("num_media")
+		media string
+		price string
+		@json("price_unit")
+		priceUnit string
+		@json("error_code")
+		errorCode int
+		@json("error_message")
+		errorMessage string
+		@json("date_created")
+		dateCreated string
+		@json("date_sent")
+		dateSent string
+		@json("date_updated")
+		dateUpdated string
+		uri string
+	}
+
+	// A media file of an MMS or WhatsApp message.
+	struct Media {
+		sid string
+		@json("parent_sid")
+		messageSid string
+		@json("content_type")
+		contentType string
+		@json("date_created")
+		dateCreated string
+		uri string
+	}
+
+	// Which messages a listing keeps; empty fields keep all.
+	struct MessageFilter {
+		to         string     = ""
+		from       string     = ""
+		// Sent on that day, or from and until those days.
+		sentOn     ?time.Date = none
+		sentAfter  ?time.Date = none
+		sentBefore ?time.Date = none
+	}
+
+	// The messages of an account.
+	type Messages {
+		internal conn Connection
+
+		def new(conn Connection) {
+			self.conn = conn
+		}
+
+		// Sends `body` from `from` to `to`. `media` are the addresses of up
+		// to ten files (an MMS, or WhatsApp media); `messagingService` a
+		// messaging service (`MG...`) that picks the sender when `from` is ""; `sendAt`
+		// schedules the message 15 minutes to 35 days ahead (a service is
+		// needed); `statusCallback` gets each change of its status;
+		// `content` is a content template (`HX...`, WhatsApp templates)
+		// filled with `variables`; `validity` how long it may wait in the
+		// queue. Fails with Invalid when it has no sender, no body, media
+		// or template, more than ten media, a body over 1600 characters or a
+		// schedule out of range, and as every call does.
+		def send(from string, to string, body string = "", media string[] = [], messagingService string = "", sendAt ?time.Time = none, statusCallback string = "", content string = "", variables map<string, string> = new map<string, string>(), validity ?duration = none, shortenUrls bool = false) !Message {
+			fail invalid("a message needs `from` or a `messagingService`") when from.len() == 0 && messagingService.len() == 0
+			fail invalid("a message needs a body, media or a content template") when body.len() == 0 && media.len() == 0 && content.len() == 0
+			fail invalid("{media.len()} media, more than the {maxMedia} Twilio takes") when media.len() > maxMedia
+			fail invalid("the body is {body.len()} characters, more than the {maxBody} Twilio takes") when body.len() > maxBody
+			let form = formOf(map<string, string>{"To": to, "From": from, "MessagingServiceSid": messagingService, "Body": body, "StatusCallback": statusCallback, "ContentSid": content})
+			for let address in media {
+				form.add("MediaUrl", address)
+			}
+			form.set("ContentVariables", string((new JSON()).encode(variables))) when variables.len() > 0
+			if !(sendAt is none) {
+				fail invalid("a scheduled message needs a `messagingService`") when messagingService.len() == 0
+				let ahead = sendAt.since(time.now())
+				fail invalid("a message is scheduled 15 minutes to 35 days ahead") when ahead < minSchedule || ahead > maxSchedule
+				form.set("ScheduleType", "fixed")
+				form.set("SendAt", stampOf(sendAt))
+			}
+			form.set("ValidityPeriod", "{int(validity / 1s)}") unless validity is none
+			form.set("ShortenUrls", "true") when shortenUrls
+			let sent = Message{}
+			try decodeInto(try call(conn, "api", http.Method.POST, "{conn.accountPath()}/Messages.json", form), sent)
+			return sent
+		}
+
+		// The messages `filter` keeps, newest first.
+		def list(filter MessageFilter = MessageFilter{}) Pages<Message> {
+			let query = formOf(map<string, string>{"To": filter.to, "From": filter.from})
+			let on = filter.sentOn
+			query.set("DateSent", on.str()) unless on is none
+			let after = filter.sentAfter
+			query.set("DateSent>", after.str()) unless after is none
+			let before = filter.sentBefore
+			query.set("DateSent<", before.str()) unless before is none
+			return pagesOf<Message>(conn, "api", "{conn.accountPath()}/Messages.json", query, "messages")
+		}
+
+		// The message `sid`. Fails with NotFound for an unknown one, and as
+		// every call does.
+		def get(sid string) !Message {
+			let found = Message{}
+			try decodeInto(try call(conn, "api", http.Method.GET, "{conn.accountPath()}/Messages/{segment(sid)}.json"), found)
+			return found
+		}
+
+		// Cancels the scheduled message `sid`. Fails with Invalid when it is
+		// no longer scheduled, and as `get` does.
+		def cancel(sid string) !Message {
+			return try update(self, sid, "Status", "canceled")
+		}
+
+		// Blanks the body of message `sid` on Twilio. Fails as `get` does.
+		def redact(sid string) !Message {
+			return try update(self, sid, "Body", "")
+		}
+
+		// Removes the message `sid` from the account's log. Fails as `get`
+		// does.
+		def delete(sid string) !none {
+			try call(conn, "api", http.Method.DELETE, "{conn.accountPath()}/Messages/{segment(sid)}.json")
+			return none
+		}
+
+		// The media of message `sid`. Fails as `get` does.
+		def media(sid string) !Media[] {
+			return try pagesOf<Media>(conn, "api", "{conn.accountPath()}/Messages/{segment(sid)}/Media.json", new url.Values(), "media_list").all()
+		}
+
+		// The content of `media`. Fails as `get` does.
+		def download(media Media) !byte[] {
+			return try call(conn, "api", http.Method.GET, media.uri.trimSuffix(".json"))
+		}
+
+		// Removes `media` from Twilio. Fails as `get` does.
+		def deleteMedia(media Media) !none {
+			try call(conn, "api", http.Method.DELETE, media.uri)
+			return none
+		}
+	}
+
+	internal def update(messages Messages, sid string, key string, value string) !Message {
+		let form = new url.Values()
+		form.set(key, value)
+		let found = Message{}
+		try decodeInto(try call(messages.conn, "api", http.Method.POST, "{messages.conn.accountPath()}/Messages/{segment(sid)}.json", form), found)
+		return found
+	}
+
+	// The WhatsApp address of an E.164 number: `whatsapp:+15551234567`.
+	def whatsapp(number string) string {
+		return number.startsWith("whatsapp:") ?? (number, "whatsapp:" + number)
+	}
+
+	// What a number lookup adds besides the number's form.
+	enum LookupField {
+		// The carrier and the kind of line (mobile, landline, VoIP, ...).
+		LineType   = "line_type_intelligence",
+		// The registered caller name (United States numbers).
+		CallerName = "caller_name",
+	}
+
+	// What Twilio knows of a number: its forms, whether it is valid, and
+	// the fields asked for.
+	struct Lookup {
+		@json("phone_number")
+		phoneNumber string
+		@json("national_format")
+		nationalFormat string
+		@json("country_code")
+		countryCode string
+		@json("calling_country_code")
+		callingCountryCode string
+		valid bool
+		@json("validation_errors")
+		validationErrors string[]
+		@json("line_type_intelligence")
+		lineType LineType
+		@json("caller_name")
+		callerName CallerName
+	}
+
+	// The carrier of a number and its kind of line: `mobile`, `landline`,
+	// `fixedVoip`, `nonFixedVoip`, `tollFree`, `premium`, ...
+	struct LineType {
+		@json("type")
+		kind string
+		@json("carrier_name")
+		carrier string
+		@json("mobile_country_code")
+		mobileCountryCode string
+		@json("mobile_network_code")
+		mobileNetworkCode string
+		@json("error_code")
+		errorCode int
+	}
+
+	// The registered name of a number and whether it is a person's or a
+	// business's.
+	struct CallerName {
+		@json("caller_name")
+		name string
+		// `CONSUMER` or `BUSINESS`.
+		@json("caller_type")
+		kind string
+		@json("error_code")
+		errorCode int
+	}
+
+	// Lookups.
+	partial type Client {
+		// Looks `number` up (E.164, or national with `country`, `US`, `GB`)
+		// with `fields`. Fails with NotFound for a number that is not one,
+		// and as every call does.
+		def lookup(number string, fields LookupField[] = [LookupField.LineType], country string = "") !Lookup {
+			let names string[] = []
+			for let f in fields {
+				names.push(f.value)
+			}
+			let query = formOf(map<string, string>{"Fields": names.join(","), "CountryCode": country})
+			let found = Lookup{}
+			try decodeInto(try call(connection, "lookups", http.Method.GET, "/v2/PhoneNumbers/{segment(number)}", query), found)
+			return found
+		}
+	}
+}
